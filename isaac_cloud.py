@@ -750,7 +750,7 @@ EOF
         sudo -u "$APP_USER" -H env VIEWER_DIR="$VIEWER_DIR" bash -lc '
             set -euo pipefail
             cd "$VIEWER_DIR"
-            perl -0pi -e "s/signalingServer: '\\''127\\\\.0\\\\.0\\\\.1'\\'',/signalingServer: window.location.hostname,\\n            signalingPort: ${DEFAULT_ISAAC_SIGNAL_PORT},/" src/main.ts
+            perl -0pi -e "s/signalingServer: '\\''127[.]0[.]0[.]1'\\'',/signalingServer: window.location.hostname,\\n            signalingPort: ${DEFAULT_ISAAC_SIGNAL_PORT},/" src/main.ts
             npm install
             npm run build
         '
@@ -782,7 +782,7 @@ def build_isaac_runtime_script(config: AppConfig) -> str:
                 "https://ifconfig.me" \
                 "https://ipv4.icanhazip.com"; do
                 candidate="$(curl -fsSL --max-time 10 "$endpoint" 2>/dev/null | tr -d '[:space:]')" || true
-                if [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                if [[ "$candidate" =~ ^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$ ]]; then
                     printf '%s\n' "$candidate"
                     return 0
                 fi
