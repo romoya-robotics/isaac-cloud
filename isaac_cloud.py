@@ -390,6 +390,8 @@ class TensorDockClient:
 
     def list_instances(self) -> list[dict[str, Any]]:
         payload = self._request("GET", "/instances")
+        if isinstance(payload.get("data"), list):
+            return payload["data"]
         return extract_list(payload, ("data", "instances"), ("data", "attributes", "instances"))
 
     def get_instance(self, instance_id: str) -> dict[str, Any]:
