@@ -52,6 +52,11 @@ storage_gb = 0
 instance_name_prefix = "isaac-cloud"
 viewer_port = 8210
 isaac_version = "5.1.0"
+
+[mcp]
+enabled = false
+repo_url = "https://github.com/omni-mcp/isaac-sim-mcp"
+extension_port = 8766
 ```
 
 You can still override individual settings with environment variables when needed:
@@ -95,6 +100,7 @@ export ISAAC_CLOUD_STORAGE_GB=0
 uv run python isaac_cloud.py catalog
 uv run python isaac_cloud.py instances
 uv run python isaac_cloud.py launch
+uv run python isaac_cloud.py launch --mcp
 uv run python isaac_cloud.py status
 uv run python isaac_cloud.py viewer
 uv run python isaac_cloud.py stop
@@ -103,6 +109,83 @@ uv run python isaac_cloud.py destroy --yes
 ```
 
 The last launched instance is stored in `~/.config/isaac-cloud/state.json`.
+
+## MCP Workflow
+
+This repo can launch Isaac Sim with the community `omni-mcp/isaac-sim-mcp` extension enabled inside the Isaac container.
+
+The MCP extension runs on the VM inside Isaac Sim. The Python MCP server from the community repo should run on your local machine and connect through an SSH tunnel to the VM.
+
+1. Launch a VM with MCP enabled.
+
+```bash
+UV_CACHE=/home/keenb/projects/gpu-orchestrator/.venv uv run python isaac_cloud.py launch --mcp
+```
+
+You can combine `--mcp` with your usual launch filters, for example:
+
+```bash
+UV_CACHE=/home/keenb/projects/gpu-orchestrator/.venv uv run python isaac_cloud.py launch --mcp --region delaware
+```
+
+When launch succeeds, the CLI prints the SSH command, viewer URL, and MCP tunnel command.
+
+2. Wait for bootstrap to finish.
+
+The first boot may take a while because cloud-init installs Docker, validates the NVIDIA runtime, builds the web viewer, clones the MCP repo on the VM, and pulls `nvcr.io/nvidia/isaac-sim:5.1.0`.
+
+To check progress:
+
+```bash
+UV_CACHE=/home/keenb/projects/gpu-orchestrator/.venv uv run python isaac_cloud.py status --instance-id <INSTANCE_ID> --verbose
+```
+
+The VM is ready for MCP when:
+- `cloud-init` reports `done`
+- `isaac-cloud-isaac.service` is active
+- the Isaac log shows `Isaac Sim MCP server started on localhost:8766`
+
+3. Open an SSH tunnel from your machine to the VM.
+
+Use the tunnel command printed by `launch`. It will look like:
+
+```bash
+ssh -i /home/you/.ssh/id_ed25519_tensordock -N -L 8766:127.0.0.1:8766 user@<VM_IP>
+```
+
+Keep that terminal open while using MCP.
+
+4. Clone the community MCP repo locally.
+
+```bash
+git clone https://github.com/omni-mcp/isaac-sim-mcp
+cd isaac-sim-mcp
+```
+
+5. Create a local Python environment and install the community server dependencies.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+6. Run the community MCP server locally.
+
+```bash
+python isaac_mcp/server.py
+```
+
+That local MCP server should connect to `localhost:8766`, which is forwarded through the SSH tunnel to the Isaac Sim MCP extension running on the VM.
+
+7. Point your MCP client at the local server.
+
+The exact config depends on your MCP client, but the shape is:
+- command: your local Python executable
+- args: `isaac_mcp/server.py`
+- working directory: your local clone of `isaac-sim-mcp`
+
+The important point is that your MCP client talks to a local stdio server, and that local server talks through the SSH tunnel to the VM.
 
 ## Notes
 
@@ -116,6 +199,8 @@ The last launched instance is stored in `~/.config/isaac-cloud/state.json`.
 - Browser viewer access is not SSH-tunneled. The browser loads the viewer over TCP `8210`, then WebRTC uses TCP `49100` and UDP `47998`.
 - `viewer` prints the public access details.
 - The bootstrap now runs a direct `nvcr.io/nvidia/isaac-sim:5.1.0` container and a generated Omniverse Web SDK `local-sample` viewer app instead of cloning the public `IsaacSim` repo for Compose.
+- When MCP is enabled, bootstrap clones the configured `omni-mcp/isaac-sim-mcp` repo onto the VM, mounts that repo into the Isaac container as an extension source, and enables `isaac.sim.mcp_extension`.
+- The Python MCP server from the community repo is not run inside the Isaac container. For the current prototype flow, launch with `--mcp`, open an SSH tunnel to the configured MCP port, and run the community `isaac_mcp/server.py` separately against the tunneled localhost port.
 - For cloud-init debugging on the VM, inspect `/var/log/cloud-init-output.log`, `/var/log/isaac-cloud-bootstrap.log`, `/var/log/isaac-cloud-isaac.log`, `/var/log/isaac-cloud-viewer.log`, or run `/usr/local/bin/isaac-cloud-debug-report`.
 - The bootstrap now waits and retries when `apt` is locked by `unattended-upgrades`, which was blocking the NVIDIA container toolkit install on Ubuntu 24 images.
 - `sync pull` and `sync push` are still placeholders; Phase 1 only covers discovery and lifecycle basics.

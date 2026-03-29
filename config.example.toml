@@ -18,3 +18,8 @@ user = "user"
 instance_name_prefix = "isaac-cloud"
 viewer_port = 8210
 isaac_version = "5.1.0"
+
+[mcp]
+enabled = false
+repo_url = "https://github.com/omni-mcp/isaac-sim-mcp"
+extension_port = 8766

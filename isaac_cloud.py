@@ -5,7 +5,7 @@ import socket
 import subprocess
 import textwrap
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,9 @@ DEFAULT_ISAAC_STREAM_PORT = 47998
 DEFAULT_REMOTE_ROOT = "/opt/gpu-orchestrator"
 DEFAULT_RUNTIME_DIR = f"{DEFAULT_REMOTE_ROOT}/runtime/docker/isaac-sim"
 DEFAULT_VIEWER_APP_DIR = f"{DEFAULT_REMOTE_ROOT}/web-viewer"
+DEFAULT_MCP_REPO_URL = "https://github.com/omni-mcp/isaac-sim-mcp"
+DEFAULT_MCP_EXTENSION_PORT = 8766
+DEFAULT_MCP_REPO_DIR = f"{DEFAULT_REMOTE_ROOT}/isaac-sim-mcp"
 DEFAULT_AUTO_VCPU = 4
 DEFAULT_AUTO_RAM_GB = 16
 MIN_STORAGE_GB = 100
@@ -106,6 +109,9 @@ class AppConfig:
     instance_name_prefix: str
     viewer_port: int
     isaac_version: str
+    mcp_enabled: bool
+    mcp_repo_url: str
+    mcp_extension_port: int
 
 
 @dataclass
@@ -186,6 +192,19 @@ def int_or_default(value: Any, default: int) -> int:
     return int(value)
 
 
+def bool_or_default(value: Any, default: bool) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    _raise(f"Invalid boolean value: {value!r}")
+
+
 def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
     config_data = load_toml(config_path)
 
@@ -237,6 +256,12 @@ def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             config_data, "ISAAC_CLOUD_ISAAC_VERSION", "defaults", "isaac_version"
         )
         or DEFAULT_ISAAC_VERSION,
+        mcp_enabled=bool_or_default(nested_get(config_data, "mcp", "enabled"), False),
+        mcp_repo_url=nested_get(config_data, "mcp", "repo_url") or DEFAULT_MCP_REPO_URL,
+        mcp_extension_port=int_or_default(
+            nested_get(config_data, "mcp", "extension_port"),
+            DEFAULT_MCP_EXTENSION_PORT,
+        ),
     )
 
 
@@ -620,8 +645,12 @@ def build_bootstrap_script(config: AppConfig) -> str:
     remote_root = shell_quote(DEFAULT_REMOTE_ROOT)
     runtime_dir = shell_quote(DEFAULT_RUNTIME_DIR)
     viewer_dir = shell_quote(DEFAULT_VIEWER_APP_DIR)
+    mcp_repo_dir = shell_quote(DEFAULT_MCP_REPO_DIR)
     app_user = shell_quote(config.ssh_user)
     viewer_port = config.viewer_port
+    mcp_enabled = "1" if config.mcp_enabled else "0"
+    mcp_repo_url = shell_quote(config.mcp_repo_url)
+    mcp_extension_port = config.mcp_extension_port
 
     return dedent_script(
         f"""\
@@ -636,6 +665,10 @@ def build_bootstrap_script(config: AppConfig) -> str:
         export APP_USER={app_user}
         export ISAAC_SIM_IMAGE={shell_quote(isaac_image)}
         export WEB_VIEWER_PORT={viewer_port}
+        export MCP_ENABLED={mcp_enabled}
+        export MCP_REPO_DIR={mcp_repo_dir}
+        export MCP_REPO_URL={mcp_repo_url}
+        export ISAACSIM_MCP_EXTENSION_PORT={mcp_extension_port}
         export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
         export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
 
@@ -697,7 +730,7 @@ def build_bootstrap_script(config: AppConfig) -> str:
 
             mkdir -p /etc/apt/keyrings
             curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
-                gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+                gpg --batch --yes --dearmor -o /etc/apt/keyrings/nodesource.gpg
             cat >/etc/apt/sources.list.d/nodesource.list <<'EOF'
 deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main
 EOF
@@ -706,14 +739,14 @@ EOF
         }}
 
         apt_get_retry update
-        apt_get_retry install -y ca-certificates curl gnupg
+        apt_get_retry install -y ca-certificates curl git gnupg
 
         curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
         sh /tmp/get-docker.sh
         systemctl enable --now docker
 
         curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
-            gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+            gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
         curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
             sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
             > /etc/apt/sources.list.d/nvidia-container-toolkit.list
@@ -739,6 +772,28 @@ EOF
                 cd "$REMOTE_ROOT"
                 npx @nvidia/create-ov-web-rtc-app --name "$(basename "$VIEWER_DIR")" --sample local-sample
             '
+        fi
+
+        if [ "$MCP_ENABLED" = "1" ]; then
+            if [ -d "$MCP_REPO_DIR/.git" ]; then
+                sudo -u "$APP_USER" -H env MCP_REPO_DIR="$MCP_REPO_DIR" bash -lc '
+                    set -euo pipefail
+                    cd "$MCP_REPO_DIR"
+                    git checkout main
+                    git pull --ff-only origin main
+                '
+            else
+                rm -rf "$MCP_REPO_DIR"
+                sudo -u "$APP_USER" -H env REMOTE_ROOT="$REMOTE_ROOT" MCP_REPO_DIR="$MCP_REPO_DIR" MCP_REPO_URL="$MCP_REPO_URL" bash -lc '
+                    set -euo pipefail
+                    mkdir -p "$REMOTE_ROOT"
+                    cd "$REMOTE_ROOT"
+                    git clone --depth=1 "$MCP_REPO_URL" "$(basename "$MCP_REPO_DIR")"
+                '
+            fi
+
+            sed -i -E "s/server[.]socket\\s*=\\s*[0-9]+/server.socket = $ISAACSIM_MCP_EXTENSION_PORT/" \
+                "$MCP_REPO_DIR/isaac.sim.mcp_extension/config/extension.toml"
         fi
 
         mkdir -p "$RUNTIME_DIR"/cache/main/ov
@@ -772,6 +827,16 @@ EOF
 
 
 def build_isaac_runtime_script(config: AppConfig) -> str:
+    mcp_mount_args = ""
+    mcp_launch_args = ""
+    if config.mcp_enabled:
+        mcp_mount_args = (
+            f' \\\n            -v "{DEFAULT_MCP_REPO_DIR}:/isaac-sim-mcp:ro"'
+        )
+        mcp_launch_args = (
+            f" --ext-folder /isaac-sim-mcp --enable isaac.sim.mcp_extension"
+        )
+
     return dedent_script(
         f"""\
         #!/usr/bin/env bash
@@ -811,9 +876,10 @@ def build_isaac_runtime_script(config: AppConfig) -> str:
             -v "$RUNTIME_DIR/config:/isaac-sim/.nvidia-omniverse/config:rw" \
             -v "$RUNTIME_DIR/data:/isaac-sim/.local/share/ov/data:rw" \
             -v "$RUNTIME_DIR/pkg:/isaac-sim/.local/share/ov/pkg:rw" \
+            -v "$RUNTIME_DIR/data/Kit:/isaac-sim/.local/share/ov/data/Kit:rw"{mcp_mount_args} \
             -u 1234:1234 \
             "$ISAAC_SIM_IMAGE" \
-            -lc "/isaac-sim/isaac-sim.streaming.sh --merge-config=/isaac-sim/config/open_endpoint.toml --allow-root -v --/exts/omni.kit.livestream.app/primaryStream/publicIp=$PUBLIC_IP --/exts/omni.kit.livestream.app/primaryStream/signalPort=$ISAACSIM_SIGNAL_PORT --/exts/omni.kit.livestream.app/primaryStream/streamPort=$ISAACSIM_STREAM_PORT"
+            -lc "/isaac-sim/isaac-sim.streaming.sh --merge-config=/isaac-sim/config/open_endpoint.toml --allow-root -v --/exts/omni.kit.livestream.app/primaryStream/publicIp=$PUBLIC_IP --/exts/omni.kit.livestream.app/primaryStream/signalPort=$ISAACSIM_SIGNAL_PORT --/exts/omni.kit.livestream.app/primaryStream/streamPort=$ISAACSIM_STREAM_PORT{mcp_launch_args}"
         """
     )
 
@@ -1199,6 +1265,32 @@ def format_viewer_ports() -> str:
     )
 
 
+def format_mcp_tunnel_command(config: AppConfig, summary: InstanceSummary) -> str:
+    if not summary.network.ssh_host:
+        _raise("Instance does not have a public IP yet, so an MCP tunnel command cannot be built.")
+    key_flag = ""
+    if config.ssh_private_key_path:
+        key_flag = f" -i {config.ssh_private_key_path}"
+    port_flag = ""
+    if summary.network.ssh_port and summary.network.ssh_port != 22:
+        port_flag = f" -p {summary.network.ssh_port}"
+    return (
+        f"ssh{key_flag}{port_flag} -N -L "
+        f"{config.mcp_extension_port}:127.0.0.1:{config.mcp_extension_port} "
+        f"{config.ssh_user}@{summary.network.ssh_host}"
+    )
+
+
+def print_mcp_access(summary: InstanceSummary, *, config: AppConfig) -> None:
+    if not config.mcp_enabled:
+        return
+    typer.echo("MCP: enabled via isaac.sim.mcp_extension")
+    typer.echo(f"MCP Extension Port: {config.mcp_extension_port}")
+    if summary.public_ip:
+        typer.echo(f"MCP Tunnel: {format_mcp_tunnel_command(config, summary)}")
+    typer.echo("MCP Server: run the community server separately against the tunneled localhost port.")
+
+
 def print_instance_summary(
     summary: InstanceSummary,
     *,
@@ -1365,6 +1457,11 @@ def launch(
     ram_gb: int = typer.Option(None, help="Requested RAM in GB."),
     storage_gb: int = typer.Option(None, help="Requested storage in GB."),
     instance_name: str = typer.Option(None, help="Explicit instance name."),
+    mcp: bool | None = typer.Option(
+        None,
+        "--mcp/--no-mcp",
+        help="Enable or disable the omni-mcp Isaac Sim extension for this launch.",
+    ),
     timeout_seconds: int = typer.Option(900, help="How long to wait for the instance to reach running."),
     ssh_timeout_seconds: int = typer.Option(120, help="How long to wait for SSH reachability after the instance is running."),
 ) -> None:
@@ -1377,6 +1474,7 @@ def launch(
             "ram_gb",
             "storage_gb",
             "instance_name",
+            "mcp",
             "timeout_seconds",
             "ssh_timeout_seconds",
         )
@@ -1399,6 +1497,8 @@ def launch(
         effective_vcpu = vcpu or config.default_vcpu
         effective_ram_gb = ram_gb or config.default_ram_gb
         effective_storage_gb = storage_gb or config.default_storage_gb
+        effective_mcp_enabled = mcp if mcp is not None else config.mcp_enabled
+        effective_config = replace(config, mcp_enabled=effective_mcp_enabled)
 
         try:
             locations = client.list_locations()
@@ -1470,10 +1570,10 @@ def launch(
                 try:
                     created = client.create_instance(
                         build_launch_payload(
-                            config=config,
+                            config=effective_config,
                             candidate=candidate,
                             instance_name=resolved_name,
-                            ssh_key=config.ssh_key,
+                            ssh_key=effective_config.ssh_key,
                             vcpu=requested_vcpu,
                             ram_gb=requested_ram_gb,
                             storage_gb=requested_storage_gb,
@@ -1507,7 +1607,7 @@ def launch(
             summary = wait_for_instance_state(
                 client,
                 instance_id,
-                viewer_port=config.viewer_port,
+                viewer_port=effective_config.viewer_port,
                 target_states=RUNNING_STATES,
                 timeout_seconds=timeout_seconds,
                 poll_interval_seconds=5,
@@ -1529,7 +1629,8 @@ def launch(
                         "The instance may still be finishing boot."
                     )
 
-            print_instance_summary(summary, config=config)
+            print_instance_summary(summary, config=effective_config)
+            print_mcp_access(summary, config=effective_config)
         finally:
             client.close()
     except IsaacCloudError as exc:
