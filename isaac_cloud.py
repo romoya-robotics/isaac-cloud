@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 import textwrap
 import time
 from dataclasses import dataclass, field
@@ -602,6 +603,10 @@ def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def dedent_script(script: str) -> str:
+    return textwrap.dedent(script).lstrip()
+
+
 def build_isaac_image_ref(version: str) -> str:
     return f"nvcr.io/nvidia/isaac-sim:{version}"
 
@@ -618,7 +623,7 @@ def build_bootstrap_script(config: AppConfig) -> str:
     app_user = shell_quote(config.ssh_user)
     viewer_port = config.viewer_port
 
-    return textwrap.dedent(
+    return dedent_script(
         f"""\
         #!/usr/bin/env bash
         set -euxo pipefail
@@ -753,7 +758,7 @@ EOF
         sudo -u "$APP_USER" -H env VIEWER_DIR="$VIEWER_DIR" bash -lc '
             set -euo pipefail
             cd "$VIEWER_DIR"
-            perl -0pi -e "s/signalingServer: '\\''127[.]0[.]0[.]1'\\'',/signalingServer: window.location.hostname,\\n            signalingPort: ${DEFAULT_ISAAC_SIGNAL_PORT},/" src/main.ts
+            perl -0pi -e "s/signalingServer: '\\''127[.]0[.]0[.]1'\\'',/signalingServer: window.location.hostname,\\n            signalingPort: {DEFAULT_ISAAC_SIGNAL_PORT},/" src/main.ts
             npm install
             npm run build
         '
@@ -767,7 +772,7 @@ EOF
 
 
 def build_isaac_runtime_script(config: AppConfig) -> str:
-    return textwrap.dedent(
+    return dedent_script(
         f"""\
         #!/usr/bin/env bash
         set -euxo pipefail
@@ -814,7 +819,7 @@ def build_isaac_runtime_script(config: AppConfig) -> str:
 
 
 def build_viewer_runtime_script(config: AppConfig) -> str:
-    return textwrap.dedent(
+    return dedent_script(
         f"""\
         #!/usr/bin/env bash
         set -euxo pipefail
@@ -1044,6 +1049,140 @@ def format_ssh_target(config: AppConfig, summary: InstanceSummary) -> str:
     if config.ssh_private_key_path:
         key_flag = f" -i {config.ssh_private_key_path}"
     return f"ssh{key_flag}{port_flag} {config.ssh_user}@{summary.network.ssh_host}"
+
+
+def build_ssh_command(config: AppConfig, summary: InstanceSummary, remote_command: str) -> list[str]:
+    if not summary.network.ssh_host:
+        _raise("Instance does not have a public IP yet, so SSH inspection is unavailable.")
+    if not config.ssh_private_key_path:
+        _raise(
+            "Verbose status requires ssh.private_key_path or ISAAC_CLOUD_SSH_PRIVATE_KEY to be set."
+        )
+    command = [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "ConnectTimeout=10",
+        "-i",
+        config.ssh_private_key_path,
+    ]
+    if summary.network.ssh_port and summary.network.ssh_port != 22:
+        command.extend(["-p", str(summary.network.ssh_port)])
+    command.append(f"{config.ssh_user}@{summary.network.ssh_host}")
+    command.append(remote_command)
+    return command
+
+
+def run_remote_command(
+    config: AppConfig,
+    summary: InstanceSummary,
+    remote_command: str,
+    *,
+    timeout_seconds: int = 30,
+) -> tuple[int, str]:
+    completed = subprocess.run(
+        build_ssh_command(config, summary, remote_command),
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+    output = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    if stderr:
+        output = f"{output}\n{stderr}".strip()
+    return completed.returncode, output
+
+
+def print_verbose_status(summary: InstanceSummary, *, config: AppConfig) -> None:
+    typer.echo("")
+    typer.echo("Bootstrap Status")
+
+    if not summary.network.ssh_host or not summary.network.ssh_port:
+        typer.echo("")
+        typer.echo("SSH Reachability: unavailable (instance did not report SSH host/port)")
+        typer.echo("Remote bootstrap inspection skipped.")
+        return
+
+    ssh_reachable = check_tcp_connectivity(
+        summary.network.ssh_host,
+        summary.network.ssh_port,
+        timeout_seconds=5.0,
+    )
+    typer.echo("")
+    typer.echo(f"SSH Reachability: {'reachable' if ssh_reachable else 'unreachable'}")
+    if not ssh_reachable:
+        typer.echo("Remote bootstrap inspection skipped because SSH is unreachable.")
+        return
+
+    sections = [
+        (
+            "Cloud-Init",
+            "cloud-init status --long || true",
+            30,
+        ),
+        (
+            "Docker",
+            "sudo docker ps -a --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}' || true",
+            30,
+        ),
+        (
+            "Isaac Service",
+            "sudo systemctl status isaac-cloud-isaac.service --no-pager || true",
+            30,
+        ),
+        (
+            "Viewer Service",
+            "sudo systemctl status isaac-cloud-viewer.service --no-pager || true",
+            30,
+        ),
+        (
+            "Bootstrap Log",
+            "sudo tail -n 40 /var/log/isaac-cloud-bootstrap.log || true",
+            30,
+        ),
+        (
+            "Isaac Log",
+            "sudo tail -n 40 /var/log/isaac-cloud-isaac.log || true",
+            30,
+        ),
+        (
+            "Viewer Log",
+            "sudo tail -n 40 /var/log/isaac-cloud-viewer.log || true",
+            30,
+        ),
+    ]
+
+    for label, remote_command, timeout_seconds in sections:
+        typer.echo("")
+        typer.echo(f"{label}:")
+        try:
+            returncode, output = run_remote_command(
+                config,
+                summary,
+                remote_command,
+                timeout_seconds=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            typer.echo("Timed out while fetching remote output.")
+            continue
+        except IsaacCloudError as exc:
+            typer.echo(f"Unavailable: {exc}")
+            return
+
+        if output:
+            typer.echo(output)
+        elif returncode == 0:
+            typer.echo("(no output)")
+        else:
+            typer.echo(f"Command exited with status {returncode}.")
 
 
 def format_viewer_url(summary: InstanceSummary) -> str:
@@ -1411,6 +1550,7 @@ def launch(
 def status(
     ctx: typer.Context,
     instance_id: str = typer.Option(None, help="TensorDock instance id to inspect."),
+    verbose: bool = typer.Option(False, "--verbose", help="Also inspect bootstrap and runtime health over SSH."),
 ) -> None:
     try:
         if ctx.get_parameter_source("instance_id") == ParameterSource.DEFAULT:
@@ -1420,6 +1560,8 @@ def status(
         try:
             summary = parse_instance_summary(client.get_instance(instance_id), config.viewer_port)
             print_instance_summary(summary, config=config)
+            if verbose:
+                print_verbose_status(summary, config=config)
         finally:
             client.close()
     except IsaacCloudError as exc:
