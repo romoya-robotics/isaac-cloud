@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+# Local tool state
+.env
+.env.*
+*.local
+config.toml

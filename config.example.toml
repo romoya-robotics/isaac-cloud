@@ -1,0 +1,20 @@
+[tensordock]
+api_token = "td_your_api_token"
+ssh_key = "ssh-ed25519 AAAA... you@example.com"
+
+[ngc]
+api_key = "nvapi-your-ngc-api-key"
+
+[ssh]
+private_key_path = "/home/you/.ssh/id_ed25519"
+user = "user"
+
+[defaults]
+gpu_class = "rtx4080"
+region = "seattle"
+vcpu = 0
+ram_gb = 0
+storage_gb = 0
+instance_name_prefix = "isaac-cloud"
+viewer_port = 8210
+isaac_version = "5.1.0"
