@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import socket
 import textwrap
@@ -22,7 +21,6 @@ except ModuleNotFoundError:  # pragma: no cover
 APP_NAME = "isaac-cloud"
 API_BASE_URL = "https://dashboard.tensordock.com/api/v2"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
-DEFAULT_STATE_PATH = Path.home() / ".config" / APP_NAME / "state.json"
 DEFAULT_IMAGE = "ubuntu2404_nvidia_570"
 DEFAULT_VIEWER_PORT = 8210
 DEFAULT_SSH_USER = "user"
@@ -65,6 +63,13 @@ GPU_COMPATIBILITY: dict[str, tuple[str, ...]] = {
     "rtxa4000": ("rtxa4000-pcie-16gb",),
 }
 
+ISAAC_MINIMUM_GPU_CLASSES = {"rtx4080", "rtx4090", "l40", "l40s"}
+ISAAC_MINIMUM_GPU_NAMES = {
+    gpu_name
+    for gpu_class in ISAAC_MINIMUM_GPU_CLASSES
+    for gpu_name in GPU_COMPATIBILITY[gpu_class]
+}
+
 RUNNING_STATES = {"running"}
 STOPPED_STATES = {"stopped", "stoppeddisassociated"}
 
@@ -92,7 +97,7 @@ class AppConfig:
     ngc_api_key: str | None
     ssh_private_key_path: str | None
     ssh_user: str
-    default_gpu_class: str
+    default_gpu_class: str | None
     default_region: str | None
     default_vcpu: int
     default_ram_gb: int
@@ -206,8 +211,9 @@ def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         ),
         ssh_user=env_or_config(config_data, "ISAAC_CLOUD_SSH_USER", "ssh", "user")
         or DEFAULT_SSH_USER,
-        default_gpu_class=env_or_config(config_data, "ISAAC_CLOUD_GPU_CLASS", "defaults", "gpu_class")
-        or "rtx4080",
+        default_gpu_class=env_or_config(
+            config_data, "ISAAC_CLOUD_GPU_CLASS", "defaults", "gpu_class"
+        ),
         default_region=env_or_config(config_data, "ISAAC_CLOUD_REGION", "defaults", "region"),
         default_vcpu=int_or_default(
             env_or_config(config_data, "ISAAC_CLOUD_VCPU", "defaults", "vcpu"), 0
@@ -231,26 +237,6 @@ def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         )
         or DEFAULT_ISAAC_VERSION,
     )
-
-
-def ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-
-def load_state(state_path: Path = DEFAULT_STATE_PATH) -> dict[str, Any]:
-    if not state_path.exists():
-        return {}
-    return json.loads(state_path.read_text())
-
-
-def save_state(state: dict[str, Any], state_path: Path = DEFAULT_STATE_PATH) -> None:
-    ensure_parent(state_path)
-    state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-
-
-def clear_state(state_path: Path = DEFAULT_STATE_PATH) -> None:
-    if state_path.exists():
-        state_path.unlink()
 
 
 def normalize_status(status: str | None) -> str:
@@ -487,14 +473,14 @@ def total_cost(gpu_price_per_hr: float, vcpu: int, ram_gb: int, storage_gb: int,
 def filter_candidates(
     locations: list[dict[str, Any]],
     *,
-    gpu_class: str,
+    gpu_class: str | None,
     region: str | None,
     vcpu: int,
     ram_gb: int,
     storage_gb: int,
 ) -> list[Candidate]:
-    accepted_gpu_names = GPU_COMPATIBILITY.get(gpu_class)
-    if not accepted_gpu_names:
+    accepted_gpu_names = GPU_COMPATIBILITY.get(gpu_class) if gpu_class else None
+    if gpu_class and not accepted_gpu_names:
         _raise(
             f"Unsupported gpu class '{gpu_class}'. Supported values: "
             f"{', '.join(sorted(GPU_COMPATIBILITY))}."
@@ -517,7 +503,7 @@ def filter_candidates(
 
         for gpu_info in location.get("gpus", []):
             gpu_name = str(gpu_info.get("v0Name", ""))
-            if gpu_name not in accepted_gpu_names:
+            if accepted_gpu_names is not None and gpu_name not in accepted_gpu_names:
                 continue
 
             resources = gpu_info.get("resources", {})
@@ -565,7 +551,7 @@ def filter_candidates(
     return sorted(
         candidates,
         key=lambda candidate: (
-            accepted_gpu_names.index(candidate.gpu_v0_name),
+            accepted_gpu_names.index(candidate.gpu_v0_name) if accepted_gpu_names else 0,
             0 if candidate.dedicated_ip_available else 1,
             0 if candidate.port_forwarding_available else 1,
             candidate.estimated_hourly_cost,
@@ -577,6 +563,21 @@ def filter_candidates(
 
 def build_instance_name(prefix: str) -> str:
     return f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}"
+
+
+def candidate_matches_gpu_class(candidate: Candidate, gpu_class: str) -> bool:
+    accepted_gpu_names = GPU_COMPATIBILITY.get(gpu_class)
+    if not accepted_gpu_names:
+        return False
+    return candidate.gpu_v0_name in accepted_gpu_names
+
+
+def gpu_class_meets_isaac_minimum(gpu_class: str) -> bool:
+    return gpu_class in ISAAC_MINIMUM_GPU_CLASSES
+
+
+def candidate_meets_isaac_minimum(candidate: Candidate) -> bool:
+    return candidate.gpu_v0_name in ISAAC_MINIMUM_GPU_NAMES
 
 
 def resolve_requested_resources(candidate: Candidate, *, vcpu: int, ram_gb: int, storage_gb: int) -> tuple[int, int, int]:
@@ -1059,58 +1060,11 @@ def format_viewer_ports() -> str:
     )
 
 
-def instance_ref_from_state(state: dict[str, Any]) -> str:
-    instance_id = nested_get(state, "last_instance", "id")
-    if not instance_id:
-        _raise("No tracked instance found in local state. Launch an instance first.")
-    return str(instance_id)
-
-
-def record_instance_state(
-    summary: InstanceSummary,
-    *,
-    provider: str,
-    gpu_class: str,
-    region: str | None,
-    vcpu: int,
-    ram_gb: int,
-    storage_gb: int,
-    selected_candidate: Candidate | None,
-    state_path: Path = DEFAULT_STATE_PATH,
-) -> None:
-    state = load_state(state_path)
-    state["last_instance"] = {
-        "provider": provider,
-        "id": summary.id,
-        "name": summary.name,
-        "status": summary.status,
-        "public_ip": summary.public_ip,
-        "ssh_port": summary.ssh_port,
-        "gpu_class": gpu_class,
-        "region": region,
-        "vcpu": vcpu,
-        "ram_gb": ram_gb,
-        "storage_gb": storage_gb,
-        "viewer_port": summary.network.viewer_port,
-    }
-    if selected_candidate is not None:
-        state["last_instance"]["selection"] = {
-            "location_id": selected_candidate.location_id,
-            "location_label": parse_location_label(selected_candidate),
-            "gpu_v0_name": selected_candidate.gpu_v0_name,
-            "gpu_display_name": selected_candidate.gpu_display_name,
-            "estimated_hourly_cost": selected_candidate.estimated_hourly_cost,
-            "dedicated_ip_available": selected_candidate.dedicated_ip_available,
-            "port_forwarding_available": selected_candidate.port_forwarding_available,
-        }
-    save_state(state, state_path)
-
-
 def print_instance_summary(
     summary: InstanceSummary,
     *,
     config: AppConfig,
-) -> None:
+    ) -> None:
     typer.echo(f"Instance: {summary.name}")
     typer.echo(f"ID: {summary.id}")
     typer.echo(f"Status: {summary.status}")
@@ -1125,13 +1079,21 @@ def print_instance_summary(
         typer.echo("Viewer Access: Browser client loads over TCP 8210 and then connects to Isaac Sim over WebRTC.")
 
 
-def print_catalog(candidates: list[Candidate], *, gpu_class: str, vcpu: int, ram_gb: int, storage_gb: int) -> None:
+def print_catalog(
+    candidates: list[Candidate],
+    *,
+    gpu_class: str | None,
+    vcpu: int,
+    ram_gb: int,
+    storage_gb: int,
+) -> None:
+    gpu_label = gpu_class or "any"
     vcpu_label = str(vcpu) if vcpu > 0 else "any"
     ram_label = str(ram_gb) if ram_gb > 0 else "any"
     storage_label = str(storage_gb) if storage_gb > 0 else f"provider-min ({MIN_STORAGE_GB}+)"
     typer.echo(
         "Launchable TensorDock offerings "
-        f"for gpu_class={gpu_class}, vcpu>={vcpu_label}, ram_gb>={ram_label}, storage_gb>={storage_label}"
+        f"for gpu_class={gpu_label}, vcpu>={vcpu_label}, ram_gb>={ram_label}, storage_gb>={storage_label}"
     )
     typer.echo("")
     for candidate in candidates:
@@ -1168,7 +1130,7 @@ def get_client_and_config() -> tuple[TensorDockClient, AppConfig]:
 
 @app.command()
 def catalog(
-    gpu_class: str = typer.Option(None, help="Minimum GPU class to request."),
+    gpu_class: str = typer.Option(None, help="Filter by GPU compatibility class."),
     region: str = typer.Option(None, help="Substring match against location id/city/state/country."),
     vcpu: int = typer.Option(None, help="Minimum vCPU capacity required."),
     ram_gb: int = typer.Option(None, help="Minimum RAM capacity in GB."),
@@ -1176,11 +1138,11 @@ def catalog(
 ) -> None:
     try:
         client, config = get_client_and_config()
-        effective_gpu_class = gpu_class or config.default_gpu_class
-        effective_region = region if region is not None else config.default_region
-        effective_vcpu = vcpu or config.default_vcpu
-        effective_ram_gb = ram_gb or config.default_ram_gb
-        effective_storage_gb = storage_gb or config.default_storage_gb
+        effective_gpu_class = gpu_class
+        effective_region = region
+        effective_vcpu = vcpu or 0
+        effective_ram_gb = ram_gb or 0
+        effective_storage_gb = storage_gb or 0
 
         try:
             locations = client.list_locations()
@@ -1194,7 +1156,7 @@ def catalog(
             )
             if not candidates:
                 _raise(
-                    "No compatible TensorDock catalog entries matched the requested constraints. "
+                    "No TensorDock catalog entries matched the requested constraints. "
                     "Try a different region or smaller resource request."
                 )
             print_catalog(
@@ -1287,7 +1249,13 @@ def launch(
         client, config = get_client_and_config()
         if not config.ngc_api_key:
             _raise("Missing NGC API key. Set NGC_API_KEY or configure [ngc].api_key before launch.")
-        effective_gpu_class = gpu_class or config.default_gpu_class
+        explicit_gpu_class = ctx.get_parameter_source("gpu_class") != ParameterSource.DEFAULT
+        effective_gpu_class = gpu_class if gpu_class is not None else config.default_gpu_class
+        if effective_gpu_class and not gpu_class_meets_isaac_minimum(effective_gpu_class):
+            typer.echo(
+                f"WARNING: Requested GPU class {effective_gpu_class} may not meet NVIDIA Isaac "
+                "minimum requirements."
+            )
         effective_region = region if region is not None else config.default_region
         effective_vcpu = vcpu or config.default_vcpu
         effective_ram_gb = ram_gb or config.default_ram_gb
@@ -1297,7 +1265,7 @@ def launch(
             locations = client.list_locations()
             candidates = filter_candidates(
                 locations,
-                gpu_class=effective_gpu_class,
+                gpu_class=None,
                 region=effective_region,
                 vcpu=effective_vcpu,
                 ram_gb=effective_ram_gb,
@@ -1305,9 +1273,40 @@ def launch(
             )
             if not candidates:
                 _raise(
-                    "No compatible TensorDock location with dedicated IP support matched the requested constraints. "
+                    "No TensorDock location with dedicated IP support matched the requested constraints. "
                     "Try a different region or smaller resource request."
                 )
+            if effective_gpu_class:
+                preferred_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if candidate_matches_gpu_class(candidate, effective_gpu_class)
+                ]
+                if preferred_candidates:
+                    candidates = preferred_candidates
+                else:
+                    if explicit_gpu_class:
+                        _raise(
+                            f"No TensorDock offer matched requested GPU class {effective_gpu_class} "
+                            "for the requested filters."
+                        )
+                    typer.echo(
+                        f"WARNING: Configured GPU class {effective_gpu_class} did not match any "
+                        "launchable offer for the requested filters. Launch is selecting from any "
+                        "available launchable GPU."
+                    )
+            else:
+                compatible_candidates = [
+                    candidate for candidate in candidates if candidate_meets_isaac_minimum(candidate)
+                ]
+                if compatible_candidates:
+                    candidates = compatible_candidates
+                else:
+                    typer.echo(
+                        "WARNING: No offer matching NVIDIA Isaac minimum requirements was found "
+                        "for the requested filters. Launch is falling back to any available "
+                        "launchable GPU."
+                    )
             resolved_name = instance_name or build_instance_name(config.instance_name_prefix)
             selected: Candidate | None = None
             instance_id: str | None = None
@@ -1391,16 +1390,6 @@ def launch(
                         "The instance may still be finishing boot."
                     )
 
-            record_instance_state(
-                summary,
-                provider="tensordock",
-                gpu_class=effective_gpu_class,
-                region=effective_region,
-                vcpu=requested_vcpu,
-                ram_gb=requested_ram_gb,
-                storage_gb=requested_storage_gb,
-                selected_candidate=selected,
-            )
             print_instance_summary(summary, config=config)
         finally:
             client.close()
@@ -1420,26 +1409,16 @@ def launch(
 
 @app.command()
 def status(
-    instance_id: str = typer.Option(None, help="Override the instance id instead of using local state."),
+    ctx: typer.Context,
+    instance_id: str = typer.Option(None, help="TensorDock instance id to inspect."),
 ) -> None:
     try:
+        if ctx.get_parameter_source("instance_id") == ParameterSource.DEFAULT:
+            typer.echo(ctx.get_help())
+            _raise("Pass --instance-id.")
         client, config = get_client_and_config()
         try:
-            state = load_state()
-            resolved_instance_id = instance_id or instance_ref_from_state(state)
-            summary = parse_instance_summary(client.get_instance(resolved_instance_id), config.viewer_port)
-            record_instance_state(
-                summary,
-                provider="tensordock",
-                gpu_class=nested_get(state, "last_instance", "gpu_class") or config.default_gpu_class,
-                region=nested_get(state, "last_instance", "region"),
-                vcpu=int(nested_get(state, "last_instance", "vcpu") or config.default_vcpu),
-                ram_gb=int(nested_get(state, "last_instance", "ram_gb") or config.default_ram_gb),
-                storage_gb=int(
-                    nested_get(state, "last_instance", "storage_gb") or config.default_storage_gb
-                ),
-                selected_candidate=None,
-            )
+            summary = parse_instance_summary(client.get_instance(instance_id), config.viewer_port)
             print_instance_summary(summary, config=config)
         finally:
             client.close()
@@ -1459,13 +1438,16 @@ def status(
 
 @app.command("viewer")
 def viewer(
-    instance_id: str = typer.Option(None, help="Override the instance id instead of using local state."),
+    ctx: typer.Context,
+    instance_id: str = typer.Option(None, help="TensorDock instance id to inspect."),
 ) -> None:
     try:
+        if ctx.get_parameter_source("instance_id") == ParameterSource.DEFAULT:
+            typer.echo(ctx.get_help())
+            _raise("Pass --instance-id.")
         client, config = get_client_and_config()
         try:
-            resolved_instance_id = instance_id or instance_ref_from_state(load_state())
-            summary = parse_instance_summary(client.get_instance(resolved_instance_id), config.viewer_port)
+            summary = parse_instance_summary(client.get_instance(instance_id), config.viewer_port)
             typer.echo(f"Viewer URL: {format_viewer_url(summary)}")
             typer.echo(f"Viewer Ports: {format_viewer_ports()}")
             typer.echo("Notes: The browser loads the viewer on TCP 8210, then connects over WebRTC on TCP 49100 and UDP 47998.")
@@ -1484,45 +1466,32 @@ def viewer(
         typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
-def mutate_instance_state(action: str, instance_id: str | None) -> None:
+def mutate_instance_state(action: str, instance_id: str) -> None:
     client, config = get_client_and_config()
     try:
-        state = load_state()
-        resolved_instance_id = instance_id or instance_ref_from_state(state)
         if action == "stop":
-            client.stop_instance(resolved_instance_id)
+            client.stop_instance(instance_id)
             target_states = STOPPED_STATES
         elif action == "resume":
-            client.start_instance(resolved_instance_id)
+            client.start_instance(instance_id)
             target_states = RUNNING_STATES
         elif action == "destroy":
-            client.delete_instance(resolved_instance_id)
-            clear_state()
-            typer.echo(f"Destroyed instance {resolved_instance_id}.")
+            client.delete_instance(instance_id)
+            typer.echo(f"Destroyed instance {instance_id}.")
             return
         else:
             _raise(f"Unsupported action: {action}")
 
-        typer.echo(f"Requested {action} for instance {resolved_instance_id}. Waiting for state change...")
+        typer.echo(f"Requested {action} for instance {instance_id}. Waiting for state change...")
         summary = wait_for_instance_state(
             client,
-            resolved_instance_id,
+            instance_id,
             viewer_port=config.viewer_port,
             target_states=target_states,
             timeout_seconds=600,
             poll_interval_seconds=5,
         )
-        record_instance_state(
-            summary,
-            provider="tensordock",
-            gpu_class=nested_get(state, "last_instance", "gpu_class") or config.default_gpu_class,
-            region=nested_get(state, "last_instance", "region"),
-            vcpu=int(nested_get(state, "last_instance", "vcpu") or config.default_vcpu),
-            ram_gb=int(nested_get(state, "last_instance", "ram_gb") or config.default_ram_gb),
-            storage_gb=int(nested_get(state, "last_instance", "storage_gb") or config.default_storage_gb),
-            selected_candidate=None,
-        )
-        typer.echo(f"Instance {resolved_instance_id} is now {summary.status}.")
+        typer.echo(f"Instance {instance_id} is now {summary.status}.")
     finally:
         client.close()
 
@@ -1600,7 +1569,6 @@ def destroy(
                 ]
                 if not summaries:
                     typer.echo("No TensorDock instances found.")
-                    clear_state()
                     return
 
                 if not yes:
@@ -1614,21 +1582,16 @@ def destroy(
                 for summary in summaries:
                     client.delete_instance(summary.id)
                     typer.echo(f"Destroyed instance {summary.id} ({summary.name}).")
-                clear_state()
             finally:
                 client.close()
             return
 
-        resolved_instance_id = instance_id
-        if resolved_instance_id is None:
-            resolved_instance_id = instance_ref_from_state(load_state())
-
         if not yes:
-            confirmed = typer.confirm(f"Destroy TensorDock instance {resolved_instance_id}?", default=False)
+            confirmed = typer.confirm(f"Destroy TensorDock instance {instance_id}?", default=False)
             if not confirmed:
                 raise typer.Exit(code=1)
 
-        mutate_instance_state("destroy", resolved_instance_id)
+        mutate_instance_state("destroy", instance_id)
     except IsaacCloudError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
