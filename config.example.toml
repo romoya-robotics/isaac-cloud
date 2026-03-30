@@ -16,8 +16,11 @@ user = "user"
 # ram_gb = 0
 # storage_gb = 0
 instance_name_prefix = "isaac-cloud"
-viewer_port = 8210
 isaac_version = "5.1.0"
+
+[viewer]
+enabled = false
+port = 8210
 
 [mcp]
 enabled = false

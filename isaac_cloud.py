@@ -107,6 +107,7 @@ class AppConfig:
     default_ram_gb: int
     default_storage_gb: int
     instance_name_prefix: str
+    viewer_enabled: bool
     viewer_port: int
     isaac_version: str
     mcp_enabled: bool
@@ -248,8 +249,9 @@ def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             config_data, "ISAAC_CLOUD_INSTANCE_NAME_PREFIX", "defaults", "instance_name_prefix"
         )
         or DEFAULT_INSTANCE_NAME_PREFIX,
+        viewer_enabled=bool_or_default(nested_get(config_data, "viewer", "enabled"), False),
         viewer_port=int_or_default(
-            env_or_config(config_data, "ISAAC_CLOUD_VIEWER_PORT", "defaults", "viewer_port"),
+            env_or_config(config_data, "ISAAC_CLOUD_VIEWER_PORT", "viewer", "port"),
             DEFAULT_VIEWER_PORT,
         ),
         isaac_version=env_or_config(
@@ -647,6 +649,7 @@ def build_bootstrap_script(config: AppConfig) -> str:
     viewer_dir = shell_quote(DEFAULT_VIEWER_APP_DIR)
     mcp_repo_dir = shell_quote(DEFAULT_MCP_REPO_DIR)
     app_user = shell_quote(config.ssh_user)
+    viewer_enabled = "1" if config.viewer_enabled else "0"
     viewer_port = config.viewer_port
     mcp_enabled = "1" if config.mcp_enabled else "0"
     mcp_repo_url = shell_quote(config.mcp_repo_url)
@@ -664,6 +667,7 @@ def build_bootstrap_script(config: AppConfig) -> str:
         export VIEWER_DIR={viewer_dir}
         export APP_USER={app_user}
         export ISAAC_SIM_IMAGE={shell_quote(isaac_image)}
+        export VIEWER_ENABLED={viewer_enabled}
         export WEB_VIEWER_PORT={viewer_port}
         export MCP_ENABLED={mcp_enabled}
         export MCP_REPO_DIR={mcp_repo_dir}
@@ -755,23 +759,27 @@ EOF
         nvidia-ctk runtime configure --runtime=docker
         systemctl restart docker
 
-        install_nodejs
-        npm config set "@nvidia:registry" "https://edge.urm.nvidia.com/artifactory/api/npm/omniverse-client-npm/" --location=user
-        if id -u "$APP_USER" >/dev/null 2>&1; then
-            sudo -u "$APP_USER" -H npm config set "@nvidia:registry" "https://edge.urm.nvidia.com/artifactory/api/npm/omniverse-client-npm/" --location=user
+        if [ "$VIEWER_ENABLED" = "1" ]; then
+            install_nodejs
+            npm config set "@nvidia:registry" "https://edge.urm.nvidia.com/artifactory/api/npm/omniverse-client-npm/" --location=user
+            if id -u "$APP_USER" >/dev/null 2>&1; then
+                sudo -u "$APP_USER" -H npm config set "@nvidia:registry" "https://edge.urm.nvidia.com/artifactory/api/npm/omniverse-client-npm/" --location=user
+            fi
         fi
 
         mkdir -p "$REMOTE_ROOT"
         if id -u "$APP_USER" >/dev/null 2>&1; then
             chown -R "$APP_USER:$APP_USER" "$REMOTE_ROOT"
         fi
-        if [ ! -f "$VIEWER_DIR/package.json" ]; then
-            rm -rf "$VIEWER_DIR"
-            sudo -u "$APP_USER" -H env REMOTE_ROOT="$REMOTE_ROOT" VIEWER_DIR="$VIEWER_DIR" bash -lc '
-                set -euo pipefail
-                cd "$REMOTE_ROOT"
-                npx @nvidia/create-ov-web-rtc-app --name "$(basename "$VIEWER_DIR")" --sample local-sample
-            '
+        if [ "$VIEWER_ENABLED" = "1" ]; then
+            if [ ! -f "$VIEWER_DIR/package.json" ]; then
+                rm -rf "$VIEWER_DIR"
+                sudo -u "$APP_USER" -H env REMOTE_ROOT="$REMOTE_ROOT" VIEWER_DIR="$VIEWER_DIR" bash -lc '
+                    set -euo pipefail
+                    cd "$REMOTE_ROOT"
+                    npx @nvidia/create-ov-web-rtc-app --name "$(basename "$VIEWER_DIR")" --sample local-sample
+                '
+            fi
         fi
 
         if [ "$MCP_ENABLED" = "1" ]; then
@@ -810,18 +818,22 @@ EOF
         printf '%s\\n' {ngc_api_key} | docker login nvcr.io --username '$oauthtoken' --password-stdin
         retry_command 3 10 docker pull "$ISAAC_SIM_IMAGE"
 
-        sudo -u "$APP_USER" -H env VIEWER_DIR="$VIEWER_DIR" bash -lc '
-            set -euo pipefail
-            cd "$VIEWER_DIR"
-            perl -0pi -e "s/signalingServer: '\\''127[.]0[.]0[.]1'\\'',/signalingServer: window.location.hostname,\\n            signalingPort: {DEFAULT_ISAAC_SIGNAL_PORT},/" src/main.ts
-            npm install
-            npm run build
-        '
+        if [ "$VIEWER_ENABLED" = "1" ]; then
+            sudo -u "$APP_USER" -H env VIEWER_DIR="$VIEWER_DIR" bash -lc '
+                set -euo pipefail
+                cd "$VIEWER_DIR"
+                perl -0pi -e "s/signalingServer: '\\''127[.]0[.]0[.]1'\\'',/signalingServer: window.location.hostname,\\n            signalingPort: {DEFAULT_ISAAC_SIGNAL_PORT},/" src/main.ts
+                npm install
+                npm run build
+            '
+        fi
 
         systemctl enable isaac-cloud-isaac.service
-        systemctl enable isaac-cloud-viewer.service
         systemctl restart isaac-cloud-isaac.service
-        systemctl restart isaac-cloud-viewer.service
+        if [ "$VIEWER_ENABLED" = "1" ]; then
+            systemctl enable isaac-cloud-viewer.service
+            systemctl restart isaac-cloud-viewer.service
+        fi
         """
     )
 
@@ -943,89 +955,97 @@ def build_viewer_systemd_unit() -> str:
 
 
 def build_cloud_init(config: AppConfig) -> dict[str, Any]:
+    write_files = [
+        {
+            "path": "/usr/local/bin/isaac-cloud-bootstrap",
+            "content": build_bootstrap_script(config),
+            "owner": "root:root",
+            "permissions": "0755",
+        },
+        {
+            "path": "/usr/local/bin/isaac-cloud-run-isaac",
+            "content": build_isaac_runtime_script(config),
+            "owner": "root:root",
+            "permissions": "0755",
+        },
+        {
+            "path": "/etc/systemd/system/isaac-cloud-isaac.service",
+            "content": build_isaac_systemd_unit(config),
+            "owner": "root:root",
+            "permissions": "0644",
+        },
+    ]
+    if config.viewer_enabled:
+        write_files.extend(
+            [
+                {
+                    "path": "/usr/local/bin/isaac-cloud-run-viewer",
+                    "content": build_viewer_runtime_script(config),
+                    "owner": "root:root",
+                    "permissions": "0755",
+                },
+                {
+                    "path": "/etc/systemd/system/isaac-cloud-viewer.service",
+                    "content": build_viewer_systemd_unit(),
+                    "owner": "root:root",
+                    "permissions": "0644",
+                },
+            ]
+        )
+    write_files.append(
+        {
+            "path": "/usr/local/bin/isaac-cloud-debug-report",
+            "content": textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -euo pipefail
+
+                echo "== cloud-init status =="
+                cloud-init status --long || true
+                echo
+
+                echo "== cloud-init-output.log =="
+                tail -n 200 /var/log/cloud-init-output.log || true
+                echo
+
+                echo "== isaac-cloud-bootstrap.log =="
+                tail -n 200 /var/log/isaac-cloud-bootstrap.log || true
+                echo
+
+                echo "== isaac-cloud-isaac service =="
+                systemctl status isaac-cloud-isaac.service --no-pager || true
+                echo
+
+                echo "== isaac-cloud-isaac journal =="
+                journalctl -u isaac-cloud-isaac.service --no-pager -n 200 || true
+                echo
+
+                echo "== isaac-cloud-isaac.log =="
+                tail -n 200 /var/log/isaac-cloud-isaac.log || true
+                echo
+
+                echo "== isaac-cloud-viewer service =="
+                systemctl status isaac-cloud-viewer.service --no-pager || true
+                echo
+
+                echo "== isaac-cloud-viewer journal =="
+                journalctl -u isaac-cloud-viewer.service --no-pager -n 200 || true
+                echo
+
+                echo "== isaac-cloud-viewer.log =="
+                tail -n 200 /var/log/isaac-cloud-viewer.log || true
+                """
+            ),
+            "owner": "root:root",
+            "permissions": "0755",
+        }
+    )
     return {
         "package_update": True,
         "packages": ["ca-certificates", "curl", "gnupg"],
         "output": {"all": "| tee -a /var/log/cloud-init-output.log"},
         "final_message": "isaac-cloud cloud-init completed after $UPTIME seconds",
-        "write_files": [
-            {
-                "path": "/usr/local/bin/isaac-cloud-bootstrap",
-                "content": build_bootstrap_script(config),
-                "owner": "root:root",
-                "permissions": "0755",
-            },
-            {
-                "path": "/usr/local/bin/isaac-cloud-run-isaac",
-                "content": build_isaac_runtime_script(config),
-                "owner": "root:root",
-                "permissions": "0755",
-            },
-            {
-                "path": "/usr/local/bin/isaac-cloud-run-viewer",
-                "content": build_viewer_runtime_script(config),
-                "owner": "root:root",
-                "permissions": "0755",
-            },
-            {
-                "path": "/etc/systemd/system/isaac-cloud-isaac.service",
-                "content": build_isaac_systemd_unit(config),
-                "owner": "root:root",
-                "permissions": "0644",
-            },
-            {
-                "path": "/etc/systemd/system/isaac-cloud-viewer.service",
-                "content": build_viewer_systemd_unit(),
-                "owner": "root:root",
-                "permissions": "0644",
-            },
-            {
-                "path": "/usr/local/bin/isaac-cloud-debug-report",
-                "content": textwrap.dedent(
-                    """\
-                    #!/usr/bin/env bash
-                    set -euo pipefail
-
-                    echo "== cloud-init status =="
-                    cloud-init status --long || true
-                    echo
-
-                    echo "== cloud-init-output.log =="
-                    tail -n 200 /var/log/cloud-init-output.log || true
-                    echo
-
-                    echo "== isaac-cloud-bootstrap.log =="
-                    tail -n 200 /var/log/isaac-cloud-bootstrap.log || true
-                    echo
-
-                    echo "== isaac-cloud-isaac service =="
-                    systemctl status isaac-cloud-isaac.service --no-pager || true
-                    echo
-
-                    echo "== isaac-cloud-isaac journal =="
-                    journalctl -u isaac-cloud-isaac.service --no-pager -n 200 || true
-                    echo
-
-                    echo "== isaac-cloud-isaac.log =="
-                    tail -n 200 /var/log/isaac-cloud-isaac.log || true
-                    echo
-
-                    echo "== isaac-cloud-viewer service =="
-                    systemctl status isaac-cloud-viewer.service --no-pager || true
-                    echo
-
-                    echo "== isaac-cloud-viewer journal =="
-                    journalctl -u isaac-cloud-viewer.service --no-pager -n 200 || true
-                    echo
-
-                    echo "== isaac-cloud-viewer.log =="
-                    tail -n 200 /var/log/isaac-cloud-viewer.log || true
-                    """
-                ),
-                "owner": "root:root",
-                "permissions": "0755",
-            },
-        ],
+        "write_files": write_files,
         "runcmd": [
             "systemctl daemon-reload",
             "bash -lc /usr/local/bin/isaac-cloud-bootstrap",
@@ -1291,6 +1311,15 @@ def print_mcp_access(summary: InstanceSummary, *, config: AppConfig) -> None:
     typer.echo("MCP Server: run the community server separately against the tunneled localhost port.")
 
 
+def print_viewer_access(summary: InstanceSummary, *, config: AppConfig) -> None:
+    if not config.viewer_enabled:
+        return
+    if summary.public_ip:
+        typer.echo(f"Viewer URL: {format_viewer_url(summary)}")
+        typer.echo(f"Viewer Ports: {format_viewer_ports()}")
+        typer.echo("Viewer Access: Browser client loads over TCP 8210 and then connects to Isaac Sim over WebRTC.")
+
+
 def print_instance_summary(
     summary: InstanceSummary,
     *,
@@ -1305,9 +1334,7 @@ def print_instance_summary(
         typer.echo(f"SSH Port: {summary.ssh_port}")
     if summary.public_ip:
         typer.echo(f"SSH: {format_ssh_target(config, summary)}")
-        typer.echo(f"Viewer URL: {format_viewer_url(summary)}")
-        typer.echo(f"Viewer Ports: {format_viewer_ports()}")
-        typer.echo("Viewer Access: Browser client loads over TCP 8210 and then connects to Isaac Sim over WebRTC.")
+        print_viewer_access(summary, config=config)
 
 
 def print_catalog(
@@ -1457,6 +1484,11 @@ def launch(
     ram_gb: int = typer.Option(None, help="Requested RAM in GB."),
     storage_gb: int = typer.Option(None, help="Requested storage in GB."),
     instance_name: str = typer.Option(None, help="Explicit instance name."),
+    viewer: bool | None = typer.Option(
+        None,
+        "--viewer/--no-viewer",
+        help="Enable or disable the Omniverse Web SDK viewer for this launch.",
+    ),
     mcp: bool | None = typer.Option(
         None,
         "--mcp/--no-mcp",
@@ -1474,6 +1506,7 @@ def launch(
             "ram_gb",
             "storage_gb",
             "instance_name",
+            "viewer",
             "mcp",
             "timeout_seconds",
             "ssh_timeout_seconds",
@@ -1497,8 +1530,13 @@ def launch(
         effective_vcpu = vcpu or config.default_vcpu
         effective_ram_gb = ram_gb or config.default_ram_gb
         effective_storage_gb = storage_gb or config.default_storage_gb
+        effective_viewer_enabled = viewer if viewer is not None else config.viewer_enabled
         effective_mcp_enabled = mcp if mcp is not None else config.mcp_enabled
-        effective_config = replace(config, mcp_enabled=effective_mcp_enabled)
+        effective_config = replace(
+            config,
+            viewer_enabled=effective_viewer_enabled,
+            mcp_enabled=effective_mcp_enabled,
+        )
 
         try:
             locations = client.list_locations()
