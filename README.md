@@ -59,6 +59,15 @@ port = 8210
 enabled = false
 repo_url = "https://github.com/romoya-robotics/isaac-sim-mcp"
 extension_port = 8766
+
+[tailscale]
+enabled = false
+auth_key = "tskey-auth-..."
+hostname = "isaac-cloud-dev"
+ssh = true
+accept_routes = false
+accept_dns = true
+advertise_tags = []
 ```
 
 You can still override individual settings with environment variables when needed:
@@ -67,6 +76,7 @@ You can still override individual settings with environment variables when neede
 export TENSORDOCK_API_TOKEN=...
 export TENSORDOCK_SSH_KEY=...
 export NGC_API_KEY=...
+export TAILSCALE_AUTH_KEY=...
 ```
 
 `TENSORDOCK_API_TOKEN` is the API credential this CLI uses to call the TensorDock API. You can generate or manage it from the TensorDock Developers page:
@@ -104,6 +114,8 @@ uv run python isaac_cloud.py instances
 uv run python isaac_cloud.py instances --all
 uv run python isaac_cloud.py launch --viewer
 uv run python isaac_cloud.py launch --mcp
+uv run python isaac_cloud.py launch --tailscale
+uv run python isaac_cloud.py launch --tailscale --tailscale-hostname isaac-dev
 uv run python isaac_cloud.py status --instance-id <INSTANCE_ID>
 uv run python isaac_cloud.py viewer --instance-id <INSTANCE_ID>
 uv run python isaac_cloud.py stop --instance-id <INSTANCE_ID>
@@ -150,7 +162,7 @@ uv run python isaac_cloud.py viewer --instance-id <INSTANCE_ID>
 
 This repo can launch Isaac Sim with the community `romoya-robotics/isaac-sim-mcp` extension enabled inside the Isaac container.
 
-The MCP extension runs on the VM inside Isaac Sim. The Python MCP server from the community repo should run on your local machine and connect through an SSH tunnel to the VM.
+The MCP extension runs on the VM inside Isaac Sim. The Python MCP server from the community repo should run on your local machine and connect directly to the VM's MCP endpoint.
 
 1. Launch a VM with MCP enabled.
 
@@ -164,7 +176,7 @@ You can combine `--mcp` with your usual launch filters, for example:
 uv run python isaac_cloud.py launch --mcp --region delaware
 ```
 
-When launch succeeds, the CLI prints the SSH command and MCP tunnel command. If viewer is also enabled, it prints the viewer URL as well.
+When launch succeeds, the CLI prints the SSH command and MCP endpoint. If viewer is also enabled, it prints the viewer URL as well.
 
 2. Wait for bootstrap to finish.
 
@@ -181,24 +193,14 @@ The VM is ready for MCP when:
 - `isaac-cloud-isaac.service` is active
 - the Isaac log shows `Isaac Sim MCP server started on localhost:8766`
 
-3. Open an SSH tunnel from your machine to the VM.
-
-Use the tunnel command printed by `launch`. It will look like:
-
-```bash
-ssh -i /home/you/.ssh/id_ed25519_tensordock -N -L 8766:127.0.0.1:8766 user@<VM_IP>
-```
-
-Keep that terminal open while using MCP.
-
-4. Clone the community MCP repo locally.
+3. Clone the community MCP repo locally.
 
 ```bash
 git clone https://github.com/romoya-robotics/isaac-sim-mcp
 cd isaac-sim-mcp
 ```
 
-5. Create a local Python environment and install the community server dependencies.
+4. Create a local Python environment and install the community server dependencies.
 
 ```bash
 python -m venv .venv
@@ -206,22 +208,57 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-6. Run the community MCP server locally.
+5. Run the community MCP server locally.
 
 ```bash
 python isaac_mcp/server.py
 ```
 
-That local MCP server should connect to `localhost:8766`, which is forwarded through the SSH tunnel to the Isaac Sim MCP extension running on the VM.
+That local MCP server should connect to the remote MCP endpoint printed by `launch`.
 
-7. Point your MCP client at the local server.
+Without Tailscale, that will usually be `<VM_PUBLIC_IP>:8766`.
+
+With Tailscale enabled, it will prefer the VM's Tailscale name or Tailscale IPv4.
+
+6. Point your MCP client at the local server.
 
 The exact config depends on your MCP client, but the shape is:
 - command: your local Python executable
 - args: `isaac_mcp/server.py`
 - working directory: your local clone of `isaac-sim-mcp`
 
-The important point is that your MCP client talks to a local stdio server, and that local server talks through the SSH tunnel to the VM.
+The important point is that your MCP client talks to a local stdio server, and that local server talks to the remote MCP endpoint on the VM.
+
+## Tailscale Workflow
+
+Tailscale is optional. When enabled, bootstrap installs Tailscale on the VM, joins the node to your tailnet, and prefers tailnet endpoints for SSH, MCP, and viewer access details.
+
+1. Configure a Tailscale auth key in `config.toml` or `TAILSCALE_AUTH_KEY`.
+
+The auth key must be both ephemeral and reusable. A non-reusable key or an invalidated key will cause bootstrap to fail at `tailscale up`.
+
+2. Launch with Tailscale enabled.
+
+```bash
+uv run python isaac_cloud.py launch --tailscale
+```
+
+You can also override the registered node name for one launch:
+
+```bash
+uv run python isaac_cloud.py launch --tailscale --tailscale-hostname isaac-dev
+```
+
+3. If local SSH inspection is configured and succeeds, launch output includes:
+
+- the Tailscale hostname
+- the Tailscale IPv4 address
+- a preferred SSH command using the tailnet path
+- a preferred MCP endpoint on the tailnet
+
+4. `status --verbose` also prints the VM's Tailscale state and identity details.
+
+When Tailscale is enabled, Isaac advertises the `tailscale0` address for streaming and the VM firewall restricts the viewer, MCP, and Isaac streaming ports to `tailscale0`.
 
 ## Notes
 
@@ -233,10 +270,12 @@ The important point is that your MCP client talks to a local stdio server, and t
 - `vcpu = 0`, `ram_gb = 0`, and `storage_gb = 0` mean "do not constrain candidate selection by that resource." Launch then auto-picks a small baseline size for the actual VM request, with storage still respecting the provider minimum.
 - SSH readiness checks are best-effort and only run when a local private key path is configured.
 - Browser viewer access is not SSH-tunneled. When viewer is enabled, the browser loads the viewer over TCP `8210`, then WebRTC uses TCP `49100` and UDP `47998`.
-- `viewer` prints the public access details for the target instance using its IP address and configured viewer port. It does not verify whether that instance was actually launched with viewer enabled.
+- `viewer` prints access details for the target instance using the Tailscale hostname or Tailscale IP when available, otherwise the public IP. It does not verify whether that instance was actually launched with viewer enabled.
 - The bootstrap runs a direct `nvcr.io/nvidia/isaac-sim:5.1.0` container. When viewer is enabled, it also builds and runs a generated Omniverse Web SDK `local-sample` viewer app.
 - When MCP is enabled, bootstrap clones the configured `romoya-robotics/isaac-sim-mcp` repo onto the VM, mounts that repo into the Isaac container as an extension source, and enables `isaac.sim.mcp_extension`.
-- The Python MCP server from the community repo is not run inside the Isaac container. For the current prototype flow, launch with `--mcp`, open an SSH tunnel to the configured MCP port, and run the community `isaac_mcp/server.py` separately against the tunneled localhost port.
+- The Python MCP server from the community repo is not run inside the Isaac container. For the current prototype flow, launch with `--mcp` and run the community `isaac_mcp/server.py` separately against the remote MCP endpoint printed by the CLI.
+- When Tailscale is enabled, bootstrap installs `tailscale`, starts `tailscaled`, and runs `tailscale up` with the configured auth key and options.
+- Tailscale access details are discovered over SSH after launch, so they are only printed when local SSH inspection is possible.
 - For cloud-init debugging on the VM, inspect `/var/log/cloud-init-output.log`, `/var/log/isaac-cloud-bootstrap.log`, `/var/log/isaac-cloud-isaac.log`, `/var/log/isaac-cloud-viewer.log`, or run `/usr/local/bin/isaac-cloud-debug-report`.
 - The bootstrap now waits and retries when `apt` is locked by `unattended-upgrades`, which was blocking the NVIDIA container toolkit install on Ubuntu 24 images.
 - `sync pull` and `sync push` are still placeholders; Phase 1 only covers discovery and lifecycle basics.
