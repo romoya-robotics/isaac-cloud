@@ -57,7 +57,7 @@ port = 8210
 
 [mcp]
 enabled = false
-repo_url = "https://github.com/omni-mcp/isaac-sim-mcp"
+repo_url = "https://github.com/romoya-robotics/isaac-sim-mcp"
 extension_port = 8766
 ```
 
@@ -148,7 +148,7 @@ uv run python isaac_cloud.py viewer --instance-id <INSTANCE_ID>
 
 ## MCP Workflow
 
-This repo can launch Isaac Sim with the community `omni-mcp/isaac-sim-mcp` extension enabled inside the Isaac container.
+This repo can launch Isaac Sim with the community `romoya-robotics/isaac-sim-mcp` extension enabled inside the Isaac container.
 
 The MCP extension runs on the VM inside Isaac Sim. The Python MCP server from the community repo should run on your local machine and connect through an SSH tunnel to the VM.
 
@@ -194,7 +194,7 @@ Keep that terminal open while using MCP.
 4. Clone the community MCP repo locally.
 
 ```bash
-git clone https://github.com/omni-mcp/isaac-sim-mcp
+git clone https://github.com/romoya-robotics/isaac-sim-mcp
 cd isaac-sim-mcp
 ```
 
@@ -235,7 +235,7 @@ The important point is that your MCP client talks to a local stdio server, and t
 - Browser viewer access is not SSH-tunneled. When viewer is enabled, the browser loads the viewer over TCP `8210`, then WebRTC uses TCP `49100` and UDP `47998`.
 - `viewer` prints the public access details for the target instance using its IP address and configured viewer port. It does not verify whether that instance was actually launched with viewer enabled.
 - The bootstrap runs a direct `nvcr.io/nvidia/isaac-sim:5.1.0` container. When viewer is enabled, it also builds and runs a generated Omniverse Web SDK `local-sample` viewer app.
-- When MCP is enabled, bootstrap clones the configured `omni-mcp/isaac-sim-mcp` repo onto the VM, mounts that repo into the Isaac container as an extension source, and enables `isaac.sim.mcp_extension`.
+- When MCP is enabled, bootstrap clones the configured `romoya-robotics/isaac-sim-mcp` repo onto the VM, mounts that repo into the Isaac container as an extension source, and enables `isaac.sim.mcp_extension`.
 - The Python MCP server from the community repo is not run inside the Isaac container. For the current prototype flow, launch with `--mcp`, open an SSH tunnel to the configured MCP port, and run the community `isaac_mcp/server.py` separately against the tunneled localhost port.
 - For cloud-init debugging on the VM, inspect `/var/log/cloud-init-output.log`, `/var/log/isaac-cloud-bootstrap.log`, `/var/log/isaac-cloud-isaac.log`, `/var/log/isaac-cloud-viewer.log`, or run `/usr/local/bin/isaac-cloud-debug-report`.
 - The bootstrap now waits and retries when `apt` is locked by `unattended-upgrades`, which was blocking the NVIDIA container toolkit install on Ubuntu 24 images.

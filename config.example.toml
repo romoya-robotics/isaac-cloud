@@ -24,5 +24,5 @@ port = 8210
 
 [mcp]
 enabled = false
-repo_url = "https://github.com/omni-mcp/isaac-sim-mcp"
+repo_url = "https://github.com/romoya-robotics/isaac-sim-mcp"
 extension_port = 8766
