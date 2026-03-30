@@ -860,22 +860,34 @@ def build_isaac_runtime_script(config: AppConfig) -> str:
         export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
         export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
 
-        detect_public_ip() {{
+        detect_primary_ipv4() {{
             local candidate=""
-            for endpoint in \
-                "https://api.ipify.org" \
-                "https://ifconfig.me" \
-                "https://ipv4.icanhazip.com"; do
-                candidate="$(curl -fsSL --max-time 10 "$endpoint" 2>/dev/null | tr -d '[:space:]')" || true
-                if [[ "$candidate" =~ ^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$ ]]; then
-                    printf '%s\n' "$candidate"
-                    return 0
-                fi
-            done
+            candidate="$(
+                ip -o route get 1.1.1.1 2>/dev/null \
+                | awk '{{for (i = 1; i <= NF; ++i) if ($i == "src") {{print $(i + 1); exit}}}}'
+            )"
+            if [[ "$candidate" =~ ^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+
+            candidate="$(
+                hostname -I 2>/dev/null \
+                | tr ' ' '\n' \
+                | grep -E '^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$' \
+                | grep -v '^127[.]' \
+                | grep -v '^172[.]17[.]' \
+                | head -n 1
+            )"
+            if [[ "$candidate" =~ ^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+
             return 1
         }}
 
-        PUBLIC_IP="$(detect_public_ip)"
+        PUBLIC_IP="$(detect_primary_ipv4)"
         export PUBLIC_IP
 
         docker rm -f isaac-sim >/dev/null 2>&1 || true
