@@ -115,6 +115,16 @@ port = 8210
 enabled = false
 repo_url = "https://github.com/romoya-robotics/isaac-sim-mcp"
 extension_port = 8766
+
+[persistence]
+enabled = false
+provider = "s3"
+auto_pull_on_launch = true
+auto_push_on_destroy = true
+
+[aws]
+s3_uri = "s3://romoya-isaac/dev/projects/warehouse-sim/default/"
+region = "us-west-2"
 ```
 
 Required settings for `launch`:
@@ -130,6 +140,10 @@ Useful optional settings:
 - `defaults.region`: preferred region substring, for example `seattle`
 - `viewer.enabled`: start the browser viewer automatically on launch
 - `mcp.enabled`: enable the Isaac MCP extension in the container
+- `persistence.enabled`: enable S3-backed project persistence
+- `persistence.provider`: storage backend selector, currently `s3`
+- `aws.s3_uri`: full S3 workspace URI to restore from and save to
+- `aws.region`: AWS region for the bucket
 
 You can still override individual settings with environment variables when needed:
 
@@ -138,6 +152,8 @@ export TENSORDOCK_API_TOKEN=...
 export TENSORDOCK_SSH_PUBLIC_KEY_PATH=~/.ssh/id_ed25519.pub
 export NGC_API_KEY=...
 ```
+
+Environment variables override the same values from `config.toml`, including `[aws]`.
 
 `TENSORDOCK_API_TOKEN` is the API credential this CLI uses to call the TensorDock API. You can generate or manage it from the TensorDock Developers page:
 
@@ -187,6 +203,8 @@ uv run python isaac_cloud.py launch --viewer
 uv run python isaac_cloud.py launch --mcp
 uv run python isaac_cloud.py status --instance-id <INSTANCE_ID>
 uv run python isaac_cloud.py viewer --instance-id <INSTANCE_ID>
+uv run python isaac_cloud.py sync pull --instance-id <INSTANCE_ID>
+uv run python isaac_cloud.py sync push --instance-id <INSTANCE_ID>
 uv run python isaac_cloud.py stop --instance-id <INSTANCE_ID>
 uv run python isaac_cloud.py resume --instance-id <INSTANCE_ID>
 uv run python isaac_cloud.py destroy --instance-id <INSTANCE_ID> --yes
@@ -316,6 +334,56 @@ For Codex, Claude Desktop, or another MCP-compatible client, the pattern is the 
 
 In other words, Codex or Claude should talk to the local community MCP server process, not directly to the remote VM port.
 
+## Persistence Workflow
+
+Persistence is optional. When enabled, the VM stores a durable project workspace under `/home/<ssh-user>/isaac-cloud/project` and syncs that workspace to S3.
+
+Required config:
+
+- `persistence.enabled = true`
+- `persistence.provider = "s3"`
+- `aws.s3_uri`
+
+Optional config:
+
+- `aws.region`
+
+Equivalent environment overrides:
+
+- `AWS_REGION`
+- `ISAAC_CLOUD_S3_URI`
+
+Local requirements when `persistence.enabled = true` and `persistence.provider = "s3"`:
+
+- the `aws` CLI must be installed on the local machine running this tool
+- the local AWS CLI must already be authenticated before `launch`, `sync pull`, `sync push`, or `destroy`
+- the tool verifies this with `aws sts get-caller-identity` and an S3 access check before it proceeds
+
+This is designed for SSO/SAML-based AWS auth too. If your organization uses Google-backed AWS login, complete your normal local login flow first, for example `aws sso login` or your organization’s equivalent.
+
+Launch behavior:
+
+- bootstrap creates the durable workspace on the VM and installs a remote manifest helper
+- if `auto_pull_on_launch = true`, the local CLI restores the S3 workspace over SSH after the VM is reachable, then restarts Isaac
+
+Explicit commands:
+
+```bash
+uv run python isaac_cloud.py sync pull --instance-id <INSTANCE_ID>
+uv run python isaac_cloud.py sync push --instance-id <INSTANCE_ID>
+```
+
+Lifecycle behavior when persistence is enabled:
+
+- `stop` does not sync
+- `destroy` pushes the durable workspace before destroying the VM, and aborts if that push fails
+- `destroy --all` is intentionally blocked while persistence is enabled, so saves cannot be skipped silently
+
+Current durable workspace note:
+
+- the workspace is mounted into the Isaac container at `/isaac-sim/project`
+- caches and runtime acceleration directories are not synced to S3
+
 ## Notes
 
 - The GPU compatibility table is intentionally conservative and can be expanded once we validate more TensorDock SKUs.
@@ -330,6 +398,6 @@ In other words, Codex or Claude should talk to the local community MCP server pr
 - The bootstrap runs a direct `nvcr.io/nvidia/isaac-sim:5.1.0` container. When viewer is enabled, it also builds and runs a generated Omniverse Web SDK `local-sample` viewer app.
 - When MCP is enabled, bootstrap clones the configured `romoya-robotics/isaac-sim-mcp` repo onto the VM, mounts that repo into the Isaac container as an extension source, and enables `isaac.sim.mcp_extension`.
 - The Python MCP server from the community repo is not run inside the Isaac container. For the current prototype flow, launch with `--mcp`, open an SSH tunnel to the configured MCP port, and run the community `isaac_mcp/server.py` separately against the tunneled localhost port.
+- When persistence is enabled, S3 access happens locally. The VM does not receive AWS credentials; it only stores a manifest at `/var/lib/isaac-cloud/state/persistence-manifest.json` so `status --verbose` can report the last pull/push result.
 - For cloud-init debugging on the VM, inspect `/var/log/cloud-init-output.log`, `/var/log/isaac-cloud-bootstrap.log`, `/var/log/isaac-cloud-isaac.log`, `/var/log/isaac-cloud-viewer.log`, or run `/usr/local/bin/isaac-cloud-debug-report`.
 - The bootstrap now waits and retries when `apt` is locked by `unattended-upgrades`, which was blocking the NVIDIA container toolkit install on Ubuntu 24 images.
-- `sync pull` and `sync push` are still placeholders; Phase 1 only covers discovery and lifecycle basics.

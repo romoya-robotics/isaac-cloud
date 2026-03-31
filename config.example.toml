@@ -26,3 +26,13 @@ port = 8210
 enabled = false
 repo_url = "https://github.com/romoya-robotics/isaac-sim-mcp"
 extension_port = 8766
+
+[persistence]
+enabled = false
+provider = "s3"
+auto_pull_on_launch = true
+auto_push_on_destroy = true
+
+[aws]
+s3_uri = "s3://romoya-isaac/dev/projects/warehouse-sim/default/"
+region = "us-west-2"

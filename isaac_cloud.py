@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import socket
 import subprocess
+import tempfile
 import textwrap
 import time
 from dataclasses import dataclass, field, replace
@@ -36,6 +39,10 @@ DEFAULT_VIEWER_APP_DIR = f"{DEFAULT_REMOTE_ROOT}/web-viewer"
 DEFAULT_MCP_REPO_URL = "https://github.com/romoya-robotics/isaac-sim-mcp"
 DEFAULT_MCP_EXTENSION_PORT = 8766
 DEFAULT_MCP_REPO_DIR = f"{DEFAULT_REMOTE_ROOT}/isaac-sim-mcp"
+DEFAULT_PERSISTENCE_PROVIDER = "s3"
+DEFAULT_PERSISTENCE_STATE_DIR = "/var/lib/isaac-cloud/state"
+DEFAULT_PERSISTENCE_MANIFEST_PATH = f"{DEFAULT_PERSISTENCE_STATE_DIR}/persistence-manifest.json"
+DEFAULT_PERSISTENCE_CONTAINER_DIR = "/isaac-sim/project"
 DEFAULT_AUTO_VCPU = 4
 DEFAULT_AUTO_RAM_GB = 16
 MIN_STORAGE_GB = 100
@@ -114,6 +121,12 @@ class AppConfig:
     mcp_enabled: bool
     mcp_repo_url: str
     mcp_extension_port: int
+    persistence_enabled: bool
+    persistence_provider: str
+    persistence_auto_pull_on_launch: bool
+    persistence_auto_push_on_destroy: bool
+    aws_s3_uri: str | None
+    aws_region: str | None
 
 
 @dataclass
@@ -178,6 +191,19 @@ class ProgressSummary:
     next_expected_step: str
     ready_for_streaming: bool
     possible_blocker: str | None = None
+
+
+@dataclass
+class PersistenceStatus:
+    enabled: bool
+    provider: str | None = None
+    remote_uri: str | None = None
+    local_path: str | None = None
+    last_pull_at: str | None = None
+    last_pull_status: str | None = None
+    last_push_at: str | None = None
+    last_push_status: str | None = None
+    last_push_error: str | None = None
 
 
 def _raise(message: str) -> None:
@@ -309,6 +335,28 @@ def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             nested_get(config_data, "mcp", "extension_port"),
             DEFAULT_MCP_EXTENSION_PORT,
         ),
+        persistence_enabled=bool_or_default(
+            nested_get(config_data, "persistence", "enabled"),
+            False,
+        ),
+        persistence_provider=str(
+            nested_get(config_data, "persistence", "provider") or DEFAULT_PERSISTENCE_PROVIDER
+        ),
+        persistence_auto_pull_on_launch=bool_or_default(
+            nested_get(config_data, "persistence", "auto_pull_on_launch"),
+            True,
+        ),
+        persistence_auto_push_on_destroy=bool_or_default(
+            nested_get(config_data, "persistence", "auto_push_on_destroy"),
+            True,
+        ),
+        aws_s3_uri=env_or_config(
+            config_data, "ISAAC_CLOUD_S3_URI", "aws", "s3_uri"
+        ),
+        aws_region=env_or_config(
+            config_data, "AWS_REGION", "aws", "region"
+        )
+        or os.getenv("AWS_DEFAULT_REGION"),
     )
 
 
@@ -683,9 +731,98 @@ def build_isaac_image_ref(version: str) -> str:
     return f"nvcr.io/nvidia/isaac-sim:{version}"
 
 
+def build_persistence_home_root(ssh_user: str) -> str:
+    return f"/home/{ssh_user}/isaac-cloud"
+
+
+def build_persistence_local_path(ssh_user: str) -> str:
+    return f"{build_persistence_home_root(ssh_user)}/project"
+
+
+def build_persistence_remote_uri(config: AppConfig) -> str:
+    if not config.aws_s3_uri:
+        _raise("Missing persistence S3 URI.")
+    normalized = config.aws_s3_uri.strip()
+    if not normalized.startswith("s3://"):
+        _raise("Persistence S3 URI must start with 's3://'.")
+    if normalized == "s3://":
+        _raise("Persistence S3 URI must include a bucket and path.")
+    return normalized if normalized.endswith("/") else normalized + "/"
+
+
+def extract_s3_bucket_name(s3_uri: str) -> str:
+    normalized = s3_uri.removeprefix("s3://")
+    bucket, _, _ = normalized.partition("/")
+    if not bucket:
+        _raise("Persistence S3 URI must include a bucket.")
+    return bucket
+
+
+def build_local_aws_env(config: AppConfig) -> dict[str, str]:
+    env = os.environ.copy()
+    if config.aws_region:
+        env["AWS_REGION"] = config.aws_region
+        env["AWS_DEFAULT_REGION"] = config.aws_region
+    env.setdefault("AWS_PAGER", "")
+    return env
+
+
+def validate_persistence_config(config: AppConfig) -> None:
+    if not config.persistence_enabled:
+        return
+    if config.persistence_provider != DEFAULT_PERSISTENCE_PROVIDER:
+        _raise(
+            f"Unsupported persistence provider '{config.persistence_provider}'. "
+            f"Only '{DEFAULT_PERSISTENCE_PROVIDER}' is supported right now."
+        )
+    build_persistence_remote_uri(config)
+
+
+def ensure_local_aws_cli_ready(config: AppConfig) -> None:
+    validate_persistence_config(config)
+    if shutil.which("aws") is None:
+        _raise(
+            "Persistence with provider 's3' requires the AWS CLI on the local machine. "
+            "Install `aws` and log in before continuing."
+        )
+    if shutil.which("ssh") is None:
+        _raise("Persistence requires the local `ssh` command.")
+    env = build_local_aws_env(config)
+    sts = subprocess.run(
+        ["aws", "sts", "get-caller-identity"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if sts.returncode != 0:
+        output = ((sts.stdout or "") + "\n" + (sts.stderr or "")).strip()
+        _raise(
+            "Local AWS authentication is not ready. "
+            "Run your normal AWS login flow, for example `aws sso login`, before launching.\n"
+            f"{output}"
+        )
+    s3_uri = build_persistence_remote_uri(config)
+    prefix_check = subprocess.run(
+        ["aws", "s3", "ls", s3_uri],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if prefix_check.returncode != 0:
+        output = ((prefix_check.stdout or "") + "\n" + (prefix_check.stderr or "")).strip()
+        bucket = extract_s3_bucket_name(s3_uri)
+        _raise(
+            f"Local AWS authentication is active, but {s3_uri} is not accessible. "
+            f"Check bucket access for {bucket}.\n{output}"
+        )
+
+
 def build_bootstrap_script(config: AppConfig) -> str:
     if not config.ngc_api_key:
         _raise("Missing NGC API key. Set NGC_API_KEY before launching Isaac Sim instances.")
+    validate_persistence_config(config)
 
     isaac_image = build_isaac_image_ref(config.isaac_version)
     ngc_api_key = shell_quote(config.ngc_api_key)
@@ -699,6 +836,9 @@ def build_bootstrap_script(config: AppConfig) -> str:
     mcp_enabled = "1" if config.mcp_enabled else "0"
     mcp_repo_url = shell_quote(config.mcp_repo_url)
     mcp_extension_port = config.mcp_extension_port
+    persistence_enabled = "1" if config.persistence_enabled else "0"
+    persistence_home_root = shell_quote(build_persistence_home_root(config.ssh_user))
+    persistence_local_path = shell_quote(build_persistence_local_path(config.ssh_user))
 
     return dedent_script(
         f"""\
@@ -718,6 +858,9 @@ def build_bootstrap_script(config: AppConfig) -> str:
         export MCP_REPO_DIR={mcp_repo_dir}
         export MCP_REPO_URL={mcp_repo_url}
         export ISAACSIM_MCP_EXTENSION_PORT={mcp_extension_port}
+        export PERSISTENCE_ENABLED={persistence_enabled}
+        export PERSISTENCE_HOME_ROOT={persistence_home_root}
+        export PERSISTENCE_LOCAL_PATH={persistence_local_path}
         export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
         export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
 
@@ -832,6 +975,15 @@ EOF
         if id -u "$APP_USER" >/dev/null 2>&1; then
             chown -R "$APP_USER:$APP_USER" "$REMOTE_ROOT"
         fi
+        if [ "$PERSISTENCE_ENABLED" = "1" ]; then
+            mkdir -p "$PERSISTENCE_HOME_ROOT"
+            mkdir -p "$PERSISTENCE_LOCAL_PATH"
+            mkdir -p "{DEFAULT_PERSISTENCE_STATE_DIR}"
+            if id -u "$APP_USER" >/dev/null 2>&1; then
+                chown -R "$APP_USER:$APP_USER" "$PERSISTENCE_HOME_ROOT"
+            fi
+            chmod -R a+rwX "$PERSISTENCE_HOME_ROOT" || true
+        fi
         if [ "$VIEWER_ENABLED" = "1" ]; then
             if [ ! -f "$VIEWER_DIR/package.json" ]; then
                 rm -rf "$VIEWER_DIR"
@@ -902,12 +1054,17 @@ EOF
 def build_isaac_runtime_script(config: AppConfig) -> str:
     mcp_mount_args = ""
     mcp_launch_args = ""
+    persistence_mount_args = ""
     if config.mcp_enabled:
         mcp_mount_args = (
             f' \\\n            -v "{DEFAULT_MCP_REPO_DIR}:/isaac-sim-mcp:ro"'
         )
         mcp_launch_args = (
             f" --ext-folder /isaac-sim-mcp --enable isaac.sim.mcp_extension"
+        )
+    if config.persistence_enabled:
+        persistence_mount_args = (
+            f' \\\n            -v "{build_persistence_local_path(config.ssh_user)}:{DEFAULT_PERSISTENCE_CONTAINER_DIR}:rw"'
         )
 
     return dedent_script(
@@ -961,7 +1118,7 @@ def build_isaac_runtime_script(config: AppConfig) -> str:
             -v "$RUNTIME_DIR/config:/isaac-sim/.nvidia-omniverse/config:rw" \
             -v "$RUNTIME_DIR/data:/isaac-sim/.local/share/ov/data:rw" \
             -v "$RUNTIME_DIR/pkg:/isaac-sim/.local/share/ov/pkg:rw" \
-            -v "$RUNTIME_DIR/data/Kit:/isaac-sim/.local/share/ov/data/Kit:rw"{mcp_mount_args} \
+            -v "$RUNTIME_DIR/data/Kit:/isaac-sim/.local/share/ov/data/Kit:rw"{mcp_mount_args}{persistence_mount_args} \
             -u 1234:1234 \
             "$ISAAC_SIM_IMAGE" \
             -lc "/isaac-sim/isaac-sim.streaming.sh --merge-config=/isaac-sim/config/open_endpoint.toml --allow-root -v --/exts/omni.kit.livestream.app/primaryStream/publicIp=$PUBLIC_IP --/exts/omni.kit.livestream.app/primaryStream/signalPort=$ISAACSIM_SIGNAL_PORT --/exts/omni.kit.livestream.app/primaryStream/streamPort=$ISAACSIM_STREAM_PORT{mcp_launch_args}"
@@ -980,6 +1137,142 @@ def build_viewer_runtime_script(config: AppConfig) -> str:
         export WEB_VIEWER_PORT={config.viewer_port}
         cd "$VIEWER_DIR"
         exec npx vite preview --host 0.0.0.0 --port "$WEB_VIEWER_PORT"
+        """
+    )
+
+
+def build_persistence_env_file(config: AppConfig) -> str:
+    validate_persistence_config(config)
+    lines = [
+        f"PERSISTENCE_ENABLED={'1' if config.persistence_enabled else '0'}",
+        f"PERSISTENCE_PROVIDER={DEFAULT_PERSISTENCE_PROVIDER}",
+        f"PERSISTENCE_S3_URI={build_persistence_remote_uri(config)}",
+        f"PERSISTENCE_LOCAL_PATH={build_persistence_local_path(config.ssh_user)}",
+        f"PERSISTENCE_HOME_ROOT={build_persistence_home_root(config.ssh_user)}",
+        f"PERSISTENCE_MANIFEST_PATH={DEFAULT_PERSISTENCE_MANIFEST_PATH}",
+        f"PERSISTENCE_APP_USER={config.ssh_user}",
+    ]
+    return "".join(f"{line}\n" for line in lines)
+
+
+def build_persistence_sync_script() -> str:
+    return dedent_script(
+        f"""\
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        ENV_FILE=/etc/isaac-cloud-persistence.env
+        if [ ! -f "$ENV_FILE" ]; then
+            echo '{{"enabled": false, "error": "missing env file"}}'
+            exit 1
+        fi
+        # shellcheck disable=SC1090
+        source "$ENV_FILE"
+
+        action="${{1:-}}"
+        if [ -z "$action" ]; then
+            echo "usage: isaac-cloud-sync <status|record>" >&2
+            exit 1
+        fi
+
+        write_manifest() {{
+            local action_name="$1"
+            local status_value="$2"
+            local error_value="${{3:-}}"
+            python3 - "$PERSISTENCE_MANIFEST_PATH" "$action_name" "$status_value" "$error_value" \
+                "$PERSISTENCE_PROVIDER" "$PERSISTENCE_S3_URI" "$PERSISTENCE_LOCAL_PATH" <<'PY'
+import json, os, sys
+from datetime import datetime, timezone
+
+path, action, status, error, provider, remote_uri, local_path = sys.argv[1:8]
+data = {{}}
+if os.path.exists(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        data = {{}}
+data["enabled"] = True
+data["provider"] = provider
+data["remote_uri"] = remote_uri
+data["local_path"] = local_path
+data["host"] = os.uname().nodename
+data[f"last_{{action}}_at"] = datetime.now(timezone.utc).isoformat()
+data[f"last_{{action}}_status"] = status
+data[f"last_{{action}}_error"] = error or None
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2, sort_keys=True)
+    fh.write("\\n")
+PY
+        }}
+
+        print_status() {{
+            if [ -f "$PERSISTENCE_MANIFEST_PATH" ]; then
+                cat "$PERSISTENCE_MANIFEST_PATH"
+                return 0
+            fi
+            python3 - "$PERSISTENCE_S3_URI" "$PERSISTENCE_LOCAL_PATH" <<'PY'
+import json, sys
+remote_uri, local_path = sys.argv[1:3]
+print(json.dumps({{
+    "enabled": True,
+    "provider": "{DEFAULT_PERSISTENCE_PROVIDER}",
+    "remote_uri": remote_uri,
+    "local_path": local_path,
+    "last_pull_status": "never",
+    "last_push_status": "never",
+}}, indent=2, sort_keys=True))
+PY
+        }}
+
+        if [ "${{PERSISTENCE_ENABLED:-0}}" != "1" ]; then
+            if [ "$action" = "status" ]; then
+                echo '{{"enabled": false}}'
+                exit 0
+            fi
+            echo "persistence is disabled" >&2
+            exit 1
+        fi
+
+        mkdir -p "$PERSISTENCE_HOME_ROOT" "$PERSISTENCE_LOCAL_PATH" "{DEFAULT_PERSISTENCE_STATE_DIR}"
+        if id -u "$PERSISTENCE_APP_USER" >/dev/null 2>&1; then
+            chown -R "$PERSISTENCE_APP_USER:$PERSISTENCE_APP_USER" "$PERSISTENCE_HOME_ROOT" || true
+        fi
+        chmod -R a+rwX "$PERSISTENCE_HOME_ROOT" || true
+
+        case "$action" in
+            status)
+                print_status
+                ;;
+            record)
+                action_name="${{2:-}}"
+                status_value="${{3:-}}"
+                error_value="${{4:-}}"
+                if [ -z "$action_name" ] || [ -z "$status_value" ]; then
+                    echo "usage: isaac-cloud-sync record <pull|push> <success|failed> [error]" >&2
+                    exit 1
+                fi
+                if [ "$action_name" != "pull" ] && [ "$action_name" != "push" ]; then
+                    echo "unsupported record action: $action_name" >&2
+                    exit 1
+                fi
+                if [ "$status_value" != "success" ] && [ "$status_value" != "failed" ]; then
+                    echo "unsupported record status: $status_value" >&2
+                    exit 1
+                fi
+                write_manifest "$action_name" "$status_value" "$error_value"
+                if id -u "$PERSISTENCE_APP_USER" >/dev/null 2>&1; then
+                    chown -R "$PERSISTENCE_APP_USER:$PERSISTENCE_APP_USER" "$PERSISTENCE_HOME_ROOT" || true
+                fi
+                chmod -R a+rwX "$PERSISTENCE_HOME_ROOT" || true
+                print_status
+                ;;
+            *)
+                echo "unsupported action: $action" >&2
+                exit 1
+                ;;
+        esac
         """
     )
 
@@ -1065,6 +1358,23 @@ def build_cloud_init(config: AppConfig) -> dict[str, Any]:
                 },
             ]
         )
+    if config.persistence_enabled:
+        write_files.extend(
+            [
+                {
+                    "path": "/etc/isaac-cloud-persistence.env",
+                    "content": build_persistence_env_file(config),
+                    "owner": "root:root",
+                    "permissions": "0600",
+                },
+                {
+                    "path": "/usr/local/bin/isaac-cloud-sync",
+                    "content": build_persistence_sync_script(),
+                    "owner": "root:root",
+                    "permissions": "0755",
+                },
+            ]
+        )
     write_files.append(
         {
             "path": "/usr/local/bin/isaac-cloud-debug-report",
@@ -1107,6 +1417,14 @@ def build_cloud_init(config: AppConfig) -> dict[str, Any]:
 
                 echo "== isaac-cloud-viewer.log =="
                 tail -n 200 /var/log/isaac-cloud-viewer.log || true
+                echo
+
+                echo "== persistence status =="
+                if [ -x /usr/local/bin/isaac-cloud-sync ]; then
+                    /usr/local/bin/isaac-cloud-sync status || true
+                else
+                    echo "persistence helper not installed"
+                fi
                 echo
                 """
             ),
@@ -1259,6 +1577,82 @@ def run_remote_command(
     if stderr:
         output = f"{output}\n{stderr}".strip()
     return completed.returncode, output
+
+
+def fetch_remote_persistence_status(
+    config: AppConfig,
+    summary: InstanceSummary,
+) -> PersistenceStatus | None:
+    if not summary.network.ssh_host or not summary.network.ssh_port:
+        return None
+    if not check_tcp_connectivity(summary.network.ssh_host, summary.network.ssh_port, timeout_seconds=5.0):
+        return None
+    try:
+        returncode, output = run_remote_command(
+            config,
+            summary,
+            "sudo /usr/local/bin/isaac-cloud-sync status 2>/dev/null || true",
+            timeout_seconds=30,
+        )
+    except (IsaacCloudError, subprocess.TimeoutExpired):
+        return None
+    if returncode != 0 or not output:
+        return None
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return None
+    return PersistenceStatus(
+        enabled=bool(payload.get("enabled")),
+        provider=payload.get("provider"),
+        remote_uri=payload.get("remote_uri"),
+        local_path=payload.get("local_path"),
+        last_pull_at=payload.get("last_pull_at"),
+        last_pull_status=payload.get("last_pull_status"),
+        last_push_at=payload.get("last_push_at"),
+        last_push_status=payload.get("last_push_status"),
+        last_push_error=payload.get("last_push_error"),
+    )
+
+
+def build_persistence_record_command(action: str, status: str, error: str = "") -> str:
+    if action not in {"pull", "push"}:
+        _raise(f"Unsupported persistence action: {action}")
+    if status not in {"success", "failed"}:
+        _raise(f"Unsupported persistence status: {status}")
+    parts = [
+        "sudo",
+        "/usr/local/bin/isaac-cloud-sync",
+        "record",
+        action,
+        status,
+    ]
+    if error:
+        parts.append(error)
+    return " ".join(shell_quote(part) for part in parts)
+
+
+def record_remote_persistence_status(
+    config: AppConfig,
+    summary: InstanceSummary,
+    *,
+    action: str,
+    status: str,
+    error: str = "",
+) -> None:
+    if not summary.network.ssh_host or not summary.network.ssh_port:
+        return
+    if not check_tcp_connectivity(summary.network.ssh_host, summary.network.ssh_port, timeout_seconds=5.0):
+        return
+    try:
+        run_remote_command(
+            config,
+            summary,
+            build_persistence_record_command(action, status, error),
+            timeout_seconds=30,
+        )
+    except (IsaacCloudError, subprocess.TimeoutExpired):
+        return
 
 
 def fetch_remote_progress_snapshot(
@@ -1456,6 +1850,27 @@ def print_verbose_status(summary: InstanceSummary, *, config: AppConfig) -> None
         return
 
     print_progress_summary(snapshot)
+
+    typer.echo("")
+    typer.echo("Persistence")
+    persistence_status = fetch_remote_persistence_status(config, summary)
+    if persistence_status is None and not config.persistence_enabled:
+        typer.echo("State: disabled")
+    else:
+        if persistence_status is None:
+            typer.echo("State: enabled (status unavailable)")
+        else:
+            typer.echo(f"State: {'enabled' if persistence_status.enabled else 'disabled'}")
+            if persistence_status.remote_uri:
+                typer.echo(f"Remote: {persistence_status.remote_uri}")
+            if persistence_status.local_path:
+                typer.echo(f"Local Path: {persistence_status.local_path}")
+            typer.echo(f"Last Pull: {persistence_status.last_pull_at or 'never'}")
+            typer.echo(f"Last Pull Status: {persistence_status.last_pull_status or 'never'}")
+            typer.echo(f"Last Push: {persistence_status.last_push_at or 'never'}")
+            typer.echo(f"Last Push Status: {persistence_status.last_push_status or 'never'}")
+            if persistence_status.last_push_error:
+                typer.echo(f"Last Push Error: {persistence_status.last_push_error}")
 
     sections = [
         (
@@ -1746,6 +2161,11 @@ def launch(
         "--mcp/--no-mcp",
         help="Enable or disable the omni-mcp Isaac Sim extension for this launch.",
     ),
+    s3_uri: str = typer.Option(
+        None,
+        "--s3-uri",
+        help="Override the persistence S3 workspace URI for this launch.",
+    ),
     timeout_seconds: int = typer.Option(900, help="How long to wait for the instance to reach running."),
     ssh_timeout_seconds: int = typer.Option(120, help="How long to wait for SSH reachability after the instance is running."),
 ) -> None:
@@ -1760,6 +2180,7 @@ def launch(
             "instance_name",
             "viewer",
             "mcp",
+            "s3_uri",
             "timeout_seconds",
             "ssh_timeout_seconds",
         )
@@ -1788,7 +2209,12 @@ def launch(
             config,
             viewer_enabled=effective_viewer_enabled,
             mcp_enabled=effective_mcp_enabled,
+            aws_s3_uri=s3_uri if s3_uri is not None else config.aws_s3_uri,
         )
+        if effective_config.persistence_enabled:
+            validate_persistence_config(effective_config)
+            if effective_config.persistence_auto_pull_on_launch:
+                ensure_local_aws_cli_ready(effective_config)
 
         try:
             locations = client.list_locations()
@@ -1913,6 +2339,35 @@ def launch(
                 )
                 if ssh_ready:
                     typer.echo("SSH port is reachable.")
+                    if effective_config.persistence_enabled and effective_config.persistence_auto_pull_on_launch:
+                        typer.echo(
+                            f"Restoring durable workspace from {build_persistence_remote_uri(effective_config)} ..."
+                        )
+                        sync_output = run_local_persistence_sync(
+                            effective_config,
+                            summary,
+                            direction="pull",
+                            timeout_seconds=max(timeout_seconds, 3600),
+                        )
+                        typer.echo("Restore: success")
+                        if sync_output:
+                            typer.echo(sync_output)
+                        typer.echo("Restarting Isaac after workspace restore...")
+                        returncode, output = run_remote_command(
+                            effective_config,
+                            summary,
+                            "sudo systemctl restart isaac-cloud-isaac.service",
+                            timeout_seconds=120,
+                        )
+                        if returncode != 0:
+                            _raise(output or "Failed to restart Isaac after restore.")
+                        if effective_config.viewer_enabled:
+                            run_remote_command(
+                                effective_config,
+                                summary,
+                                "sudo systemctl restart isaac-cloud-viewer.service",
+                                timeout_seconds=120,
+                            )
                 else:
                     typer.echo(
                         "SSH did not become reachable within the configured timeout. "
@@ -2001,9 +2456,192 @@ def viewer(
         typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
+
+def run_local_aws_sync(config: AppConfig, source: str, destination: str) -> str:
+    completed = subprocess.run(
+        ["aws", "s3", "sync", source, destination, "--delete"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=build_local_aws_env(config),
+    )
+    output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
+    if completed.returncode != 0:
+        _raise(output or f"Local AWS sync failed for {source} -> {destination}.")
+    return output
+
+
+def copy_remote_directory_to_local(
+    config: AppConfig,
+    summary: InstanceSummary,
+    *,
+    remote_path: str,
+    local_path: str,
+    timeout_seconds: int = 3600,
+) -> None:
+    ssh_command = build_ssh_command(
+        config,
+        summary,
+        f"sudo mkdir -p {shell_quote(remote_path)} && sudo tar -C {shell_quote(remote_path)} -cf - .",
+    )
+    os.makedirs(local_path, exist_ok=True)
+    with subprocess.Popen(ssh_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as ssh_proc:
+        try:
+            extract = subprocess.run(
+                ["tar", "-C", local_path, "-xf", "-"],
+                stdin=ssh_proc.stdout,
+                capture_output=True,
+                text=False,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        finally:
+            if ssh_proc.stdout is not None:
+                ssh_proc.stdout.close()
+        stderr_bytes = ssh_proc.stderr.read() if ssh_proc.stderr is not None else b""
+        ssh_returncode = ssh_proc.wait(timeout=timeout_seconds)
+    if ssh_returncode != 0:
+        _raise(stderr_bytes.decode("utf-8", errors="replace").strip() or "SSH download failed.")
+    if extract.returncode != 0:
+        _raise((extract.stderr or b"").decode("utf-8", errors="replace").strip() or "Local tar extract failed.")
+
+
+def replace_remote_directory_from_local(
+    config: AppConfig,
+    summary: InstanceSummary,
+    *,
+    local_path: str,
+    remote_path: str,
+    timeout_seconds: int = 3600,
+) -> None:
+    remote_command = (
+        f"sudo mkdir -p {shell_quote(remote_path)} "
+        f"&& sudo find {shell_quote(remote_path)} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} + "
+        f"&& sudo tar -C {shell_quote(remote_path)} -xf - "
+        f"; sudo chown -R {shell_quote(config.ssh_user)}:{shell_quote(config.ssh_user)} {shell_quote(build_persistence_home_root(config.ssh_user))} || true "
+        f"; sudo chmod -R a+rwX {shell_quote(build_persistence_home_root(config.ssh_user))} || true"
+    )
+    with subprocess.Popen(
+        ["tar", "-C", local_path, "-cf", "-", "."],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as tar_proc:
+        ssh_command = build_ssh_command(config, summary, remote_command)
+        try:
+            ssh_run = subprocess.run(
+                ssh_command,
+                stdin=tar_proc.stdout,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        finally:
+            if tar_proc.stdout is not None:
+                tar_proc.stdout.close()
+        tar_stderr = (tar_proc.stderr.read() or b"").decode("utf-8", errors="replace").strip()
+        tar_returncode = tar_proc.wait(timeout=timeout_seconds)
+    if tar_returncode != 0:
+        _raise(tar_stderr or "Local tar archive creation failed.")
+    if ssh_run.returncode != 0:
+        _raise(((ssh_run.stdout or "") + "\n" + (ssh_run.stderr or "")).strip() or "SSH upload failed.")
+
+
+def run_local_persistence_sync(
+    config: AppConfig,
+    summary: InstanceSummary,
+    *,
+    direction: str,
+    timeout_seconds: int = 3600,
+) -> str:
+    if direction not in {"pull", "push"}:
+        _raise(f"Unsupported sync direction: {direction}")
+    if not summary.network.ssh_host or not summary.network.ssh_port:
+        _raise("Instance does not expose SSH, so persistence sync is unavailable.")
+    if not check_tcp_connectivity(summary.network.ssh_host, summary.network.ssh_port, timeout_seconds=5.0):
+        _raise("SSH is unreachable, so persistence sync is unavailable.")
+    ensure_local_aws_cli_ready(config)
+    remote_path = build_persistence_local_path(config.ssh_user)
+    remote_uri = build_persistence_remote_uri(config)
+    try:
+        with tempfile.TemporaryDirectory(prefix="isaac-cloud-sync-") as staging_dir:
+            if direction == "pull":
+                aws_output = run_local_aws_sync(config, remote_uri, staging_dir)
+                replace_remote_directory_from_local(
+                    config,
+                    summary,
+                    local_path=staging_dir,
+                    remote_path=remote_path,
+                    timeout_seconds=timeout_seconds,
+                )
+            else:
+                copy_remote_directory_to_local(
+                    config,
+                    summary,
+                    remote_path=remote_path,
+                    local_path=staging_dir,
+                    timeout_seconds=timeout_seconds,
+                )
+                aws_output = run_local_aws_sync(config, staging_dir, remote_uri)
+    except IsaacCloudError as exc:
+        record_remote_persistence_status(
+            config,
+            summary,
+            action=direction,
+            status="failed",
+            error=str(exc),
+        )
+        raise
+    record_remote_persistence_status(config, summary, action=direction, status="success")
+    return aws_output
+
+
+def maybe_push_persistence_before_action(
+    config: AppConfig,
+    summary: InstanceSummary,
+    *,
+    action: str,
+    remote_status: PersistenceStatus | None,
+) -> None:
+    if config.persistence_enabled:
+        if action == "destroy" and not config.persistence_auto_push_on_destroy:
+            return
+    elif not (remote_status and remote_status.enabled):
+        return
+    typer.echo("Persistence: enabled")
+    remote_uri = remote_status.remote_uri if remote_status and remote_status.remote_uri else None
+    if not remote_uri and config.persistence_enabled:
+        remote_uri = build_persistence_remote_uri(config)
+    typer.echo(f"Saving durable workspace to {remote_uri or 'configured remote'} ...")
+    ensure_local_aws_cli_ready(config)
+    output = run_local_persistence_sync(config, summary, direction="push")
+    typer.echo("Save: success")
+    if output:
+        typer.echo(output)
+
+
 def mutate_instance_state(action: str, instance_id: str) -> None:
     client, config = get_client_and_config()
     try:
+        if action == "destroy":
+            summary = parse_instance_summary(client.get_instance(instance_id), config.viewer_port)
+            remote_persistence_status = None
+            if normalize_status(summary.status) not in RUNNING_STATES:
+                if action == "destroy" and config.persistence_enabled and config.persistence_auto_push_on_destroy:
+                    _raise(
+                        "Persistence is enabled but the instance is not running, so a save cannot be performed before destroy. "
+                        "Resume the instance and sync it first."
+                    )
+            else:
+                remote_persistence_status = fetch_remote_persistence_status(config, summary)
+                if config.persistence_enabled:
+                    validate_persistence_config(config)
+                maybe_push_persistence_before_action(
+                    config,
+                    summary,
+                    action=action,
+                    remote_status=remote_persistence_status,
+                )
         if action == "stop":
             client.stop_instance(instance_id)
             target_states = STOPPED_STATES
@@ -2097,6 +2735,11 @@ def destroy(
         if destroy_all:
             client, _config = get_client_and_config()
             try:
+                if _config.persistence_enabled:
+                    _raise(
+                        "destroy --all is not supported while persistence is enabled. "
+                        "Destroy instances individually so each one can be saved first."
+                    )
                 raw_instances = client.list_instances()
                 summaries = [
                     parse_instance_summary(instance, viewer_port=DEFAULT_VIEWER_PORT)
@@ -2142,13 +2785,91 @@ def destroy(
 
 
 @sync_app.command("pull")
-def sync_pull() -> None:
-    typer.echo("sync pull is not implemented yet.")
+def sync_pull(
+    ctx: typer.Context,
+    instance_id: str = typer.Option(None, help="TensorDock instance id to sync from S3."),
+    s3_uri: str = typer.Option(None, "--s3-uri", help="Override the persistence S3 workspace URI."),
+) -> None:
+    try:
+        if ctx.get_parameter_source("instance_id") == ParameterSource.DEFAULT:
+            typer.echo(ctx.get_help())
+            _raise("Pass --instance-id.")
+        client, config = get_client_and_config()
+        effective_config = replace(
+            config,
+            aws_s3_uri=s3_uri if s3_uri is not None else config.aws_s3_uri,
+        )
+        try:
+            summary = parse_instance_summary(client.get_instance(instance_id), effective_config.viewer_port)
+        finally:
+            client.close()
+        remote_status = fetch_remote_persistence_status(effective_config, summary)
+        if remote_status is None or not remote_status.enabled:
+            if not effective_config.persistence_enabled:
+                _raise("Persistence is not enabled for this VM.")
+            validate_persistence_config(effective_config)
+        ensure_local_aws_cli_ready(effective_config)
+        typer.echo(f"Pulling durable workspace from {remote_status.remote_uri if remote_status and remote_status.remote_uri else build_persistence_remote_uri(effective_config)} ...")
+        output = run_local_persistence_sync(effective_config, summary, direction="pull")
+        typer.echo("Sync pull: success")
+        if output:
+            typer.echo(output)
+    except IsaacCloudError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except httpx.HTTPStatusError as exc:
+        typer.echo(
+            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    except httpx.HTTPError as exc:
+        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @sync_app.command("push")
-def sync_push() -> None:
-    typer.echo("sync push is not implemented yet.")
+def sync_push(
+    ctx: typer.Context,
+    instance_id: str = typer.Option(None, help="TensorDock instance id to sync to S3."),
+    s3_uri: str = typer.Option(None, "--s3-uri", help="Override the persistence S3 workspace URI."),
+) -> None:
+    try:
+        if ctx.get_parameter_source("instance_id") == ParameterSource.DEFAULT:
+            typer.echo(ctx.get_help())
+            _raise("Pass --instance-id.")
+        client, config = get_client_and_config()
+        effective_config = replace(
+            config,
+            aws_s3_uri=s3_uri if s3_uri is not None else config.aws_s3_uri,
+        )
+        try:
+            summary = parse_instance_summary(client.get_instance(instance_id), effective_config.viewer_port)
+        finally:
+            client.close()
+        remote_status = fetch_remote_persistence_status(effective_config, summary)
+        if remote_status is None or not remote_status.enabled:
+            if not effective_config.persistence_enabled:
+                _raise("Persistence is not enabled for this VM.")
+            validate_persistence_config(effective_config)
+        ensure_local_aws_cli_ready(effective_config)
+        typer.echo(f"Pushing durable workspace to {remote_status.remote_uri if remote_status and remote_status.remote_uri else build_persistence_remote_uri(effective_config)} ...")
+        output = run_local_persistence_sync(effective_config, summary, direction="push")
+        typer.echo("Sync push: success")
+        if output:
+            typer.echo(output)
+    except IsaacCloudError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except httpx.HTTPStatusError as exc:
+        typer.echo(
+            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    except httpx.HTTPError as exc:
+        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 app.add_typer(sync_app, name="sync")
