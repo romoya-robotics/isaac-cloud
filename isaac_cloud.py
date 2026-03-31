@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import json
 import socket
 import subprocess
 import textwrap
@@ -23,7 +22,7 @@ except ModuleNotFoundError:  # pragma: no cover
 APP_NAME = "isaac-cloud"
 API_BASE_URL = "https://dashboard.tensordock.com/api/v2"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
-DEFAULT_IMAGE = "ubuntu2404_nvidia_570"
+DEFAULT_IMAGE = "ubuntu2404"
 DEFAULT_VIEWER_PORT = 8210
 DEFAULT_SSH_USER = "user"
 DEFAULT_INSTANCE_NAME_PREFIX = "isaac-cloud"
@@ -114,13 +113,6 @@ class AppConfig:
     mcp_enabled: bool
     mcp_repo_url: str
     mcp_extension_port: int
-    tailscale_enabled: bool
-    tailscale_auth_key: str | None
-    tailscale_hostname: str | None
-    tailscale_ssh: bool
-    tailscale_accept_routes: bool
-    tailscale_accept_dns: bool
-    tailscale_advertise_tags: list[str]
 
 
 @dataclass
@@ -152,9 +144,6 @@ class InstanceNetwork:
     ssh_host: str | None = None
     viewer_port: int = DEFAULT_VIEWER_PORT
     port_forwards: list[dict[str, Any]] = field(default_factory=list)
-    tailscale_ipv4: str | None = None
-    tailscale_name: str | None = None
-    tailscale_state: str | None = None
 
 
 @dataclass
@@ -202,16 +191,6 @@ def int_or_default(value: Any, default: int) -> int:
     if value in (None, ""):
         return default
     return int(value)
-
-
-def list_or_default(value: Any, default: list[str] | None = None) -> list[str]:
-    if value in (None, ""):
-        return list(default or [])
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    _raise(f"Invalid list value: {value!r}")
 
 
 def bool_or_default(value: Any, default: bool) -> bool:
@@ -284,54 +263,6 @@ def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         mcp_extension_port=int_or_default(
             nested_get(config_data, "mcp", "extension_port"),
             DEFAULT_MCP_EXTENSION_PORT,
-        ),
-        tailscale_enabled=bool_or_default(
-            env_or_config(config_data, "ISAAC_CLOUD_TAILSCALE_ENABLED", "tailscale", "enabled"),
-            False,
-        ),
-        tailscale_auth_key=env_or_config(
-            config_data,
-            "TAILSCALE_AUTH_KEY",
-            "tailscale",
-            "auth_key",
-        ),
-        tailscale_hostname=env_or_config(
-            config_data,
-            "ISAAC_CLOUD_TAILSCALE_HOSTNAME",
-            "tailscale",
-            "hostname",
-        )
-        or None,
-        tailscale_ssh=bool_or_default(
-            env_or_config(config_data, "ISAAC_CLOUD_TAILSCALE_SSH", "tailscale", "ssh"),
-            True,
-        ),
-        tailscale_accept_routes=bool_or_default(
-            env_or_config(
-                config_data,
-                "ISAAC_CLOUD_TAILSCALE_ACCEPT_ROUTES",
-                "tailscale",
-                "accept_routes",
-            ),
-            False,
-        ),
-        tailscale_accept_dns=bool_or_default(
-            env_or_config(
-                config_data,
-                "ISAAC_CLOUD_TAILSCALE_ACCEPT_DNS",
-                "tailscale",
-                "accept_dns",
-            ),
-            True,
-        ),
-        tailscale_advertise_tags=list_or_default(
-            env_or_config(
-                config_data,
-                "ISAAC_CLOUD_TAILSCALE_ADVERTISE_TAGS",
-                "tailscale",
-                "advertise_tags",
-            ),
-            [],
         ),
     )
 
@@ -707,23 +638,9 @@ def build_isaac_image_ref(version: str) -> str:
     return f"nvcr.io/nvidia/isaac-sim:{version}"
 
 
-def sanitize_tailscale_hostname(value: str) -> str:
-    normalized = "".join(
-        character.lower() if character.isalnum() else "-"
-        for character in value.strip()
-    ).strip("-")
-    while "--" in normalized:
-        normalized = normalized.replace("--", "-")
-    if not normalized:
-        _raise("Resolved Tailscale hostname was empty after sanitization.")
-    return normalized[:63]
-
-
 def build_bootstrap_script(config: AppConfig) -> str:
     if not config.ngc_api_key:
         _raise("Missing NGC API key. Set NGC_API_KEY before launching Isaac Sim instances.")
-    if config.tailscale_enabled and not config.tailscale_auth_key:
-        _raise("Missing Tailscale auth key. Set TAILSCALE_AUTH_KEY before launching with Tailscale enabled.")
 
     isaac_image = build_isaac_image_ref(config.isaac_version)
     ngc_api_key = shell_quote(config.ngc_api_key)
@@ -737,15 +654,6 @@ def build_bootstrap_script(config: AppConfig) -> str:
     mcp_enabled = "1" if config.mcp_enabled else "0"
     mcp_repo_url = shell_quote(config.mcp_repo_url)
     mcp_extension_port = config.mcp_extension_port
-    tailscale_enabled = "1" if config.tailscale_enabled else "0"
-    tailscale_auth_key = shell_quote(config.tailscale_auth_key or "")
-    tailscale_hostname = shell_quote(config.tailscale_hostname or "")
-    tailscale_ssh = "1" if config.tailscale_ssh else "0"
-    tailscale_accept_routes = "1" if config.tailscale_accept_routes else "0"
-    tailscale_accept_dns = "1" if config.tailscale_accept_dns else "0"
-    tailscale_advertise_tags = shell_quote(",".join(config.tailscale_advertise_tags))
-    firewall_viewer_port = shell_quote(str(config.viewer_port) if config.viewer_enabled else "")
-    firewall_mcp_port = shell_quote(str(config.mcp_extension_port) if config.mcp_enabled else "")
 
     return dedent_script(
         f"""\
@@ -765,17 +673,9 @@ def build_bootstrap_script(config: AppConfig) -> str:
         export MCP_REPO_DIR={mcp_repo_dir}
         export MCP_REPO_URL={mcp_repo_url}
         export ISAACSIM_MCP_EXTENSION_PORT={mcp_extension_port}
-        export TAILSCALE_ENABLED={tailscale_enabled}
-        export TAILSCALE_AUTH_KEY={tailscale_auth_key}
-        export TAILSCALE_HOSTNAME={tailscale_hostname}
-        export TAILSCALE_SSH={tailscale_ssh}
-        export TAILSCALE_ACCEPT_ROUTES={tailscale_accept_routes}
-        export TAILSCALE_ACCEPT_DNS={tailscale_accept_dns}
-        export TAILSCALE_ADVERTISE_TAGS={tailscale_advertise_tags}
-        export FIREWALL_VIEWER_PORT={firewall_viewer_port}
-        export FIREWALL_MCP_PORT={firewall_mcp_port}
         export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
         export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
+        export ISAACSIM_DISPLAY=:1
 
         wait_for_apt_lock() {{
             while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
@@ -843,70 +743,28 @@ EOF
             apt_get_retry install -y nodejs
         }}
 
-        install_tailscale() {{
-            if command -v tailscale >/dev/null 2>&1 && command -v tailscaled >/dev/null 2>&1; then
+        install_nvidia_host_driver() {{
+            if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
                 return 0
             fi
 
-            curl -fsSL https://tailscale.com/install.sh -o /tmp/install-tailscale.sh
-            sh /tmp/install-tailscale.sh
-        }}
+            apt_get_retry update
+            apt_get_retry install -y nvidia-driver-570
 
-        apply_tailscale_firewall() {{
-            if [ "$TAILSCALE_ENABLED" != "1" ]; then
-                return 0
-            fi
-
-            local tcp_ports=()
-            if [ -n "$FIREWALL_VIEWER_PORT" ]; then
-                tcp_ports+=("$FIREWALL_VIEWER_PORT")
-            fi
-            if [ -n "$FIREWALL_MCP_PORT" ]; then
-                tcp_ports+=("$FIREWALL_MCP_PORT")
-            fi
-            tcp_ports+=("$ISAACSIM_SIGNAL_PORT")
-
-            if ! iptables -nL ISAAC_CLOUD_INPUT >/dev/null 2>&1; then
-                iptables -N ISAAC_CLOUD_INPUT
-            fi
-            iptables -C INPUT -j ISAAC_CLOUD_INPUT >/dev/null 2>&1 || iptables -I INPUT 1 -j ISAAC_CLOUD_INPUT
-            iptables -F ISAAC_CLOUD_INPUT
-
-            local tcp_ports_csv
-            tcp_ports_csv="$(IFS=,; echo "${{tcp_ports[*]}}")"
-            iptables -A ISAAC_CLOUD_INPUT -i tailscale0 -p tcp -m multiport --dports "$tcp_ports_csv" -j ACCEPT
-            iptables -A ISAAC_CLOUD_INPUT ! -i tailscale0 -p tcp -m multiport --dports "$tcp_ports_csv" -j REJECT
-            iptables -A ISAAC_CLOUD_INPUT -i tailscale0 -p udp --dport "$ISAACSIM_STREAM_PORT" -j ACCEPT
-            iptables -A ISAAC_CLOUD_INPUT ! -i tailscale0 -p udp --dport "$ISAACSIM_STREAM_PORT" -j REJECT
-            iptables -A ISAAC_CLOUD_INPUT -j RETURN
+            modprobe nvidia || true
+            modprobe nvidia_uvm || true
+            modprobe nvidia_modeset || true
+            modprobe nvidia_drm || true
         }}
 
         apt_get_retry update
-        apt_get_retry install -y ca-certificates curl git gnupg iptables
-
-        if [ "$TAILSCALE_ENABLED" = "1" ]; then
-            install_tailscale
-            systemctl enable --now tailscaled
-            tailscale_args=(
-                up
-                "--auth-key=$TAILSCALE_AUTH_KEY"
-                "--hostname=$TAILSCALE_HOSTNAME"
-                "--accept-routes=$TAILSCALE_ACCEPT_ROUTES"
-                "--accept-dns=$TAILSCALE_ACCEPT_DNS"
-            )
-            if [ "$TAILSCALE_SSH" = "1" ]; then
-                tailscale_args+=("--ssh")
-            fi
-            if [ -n "$TAILSCALE_ADVERTISE_TAGS" ]; then
-                tailscale_args+=("--advertise-tags=$TAILSCALE_ADVERTISE_TAGS")
-            fi
-            tailscale "${{tailscale_args[@]}}"
-            apply_tailscale_firewall
-        fi
+        apt_get_retry install -y ca-certificates curl git gnupg x11-xserver-utils xvfb
 
         curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
         sh /tmp/get-docker.sh
         systemctl enable --now docker
+
+        install_nvidia_host_driver
 
         curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
             gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
@@ -973,6 +831,9 @@ EOF
         mkdir -p "$RUNTIME_DIR"/pkg
         chown -R 1234:1234 "$RUNTIME_DIR"
 
+        systemctl enable isaac-cloud-xvfb.service
+        systemctl restart isaac-cloud-xvfb.service
+
         docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
         printf '%s\\n' {ngc_api_key} | docker login nvcr.io --username '$oauthtoken' --password-stdin
         retry_command 3 10 docker pull "$ISAAC_SIM_IMAGE"
@@ -1016,19 +877,9 @@ def build_isaac_runtime_script(config: AppConfig) -> str:
 
         export RUNTIME_DIR={shell_quote(DEFAULT_RUNTIME_DIR)}
         export ISAAC_SIM_IMAGE={shell_quote(build_isaac_image_ref(config.isaac_version))}
-        export TAILSCALE_ENABLED={"1" if config.tailscale_enabled else "0"}
         export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
         export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
-
-        detect_tailscale_ipv4() {{
-            local candidate=""
-            candidate="$(ip -4 -o addr show dev tailscale0 2>/dev/null | awk '{{print $4}}' | cut -d/ -f1 | head -n 1)"
-            if [[ "$candidate" =~ ^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$ ]]; then
-                printf '%s\n' "$candidate"
-                return 0
-            fi
-            return 1
-        }}
+        export ISAACSIM_DISPLAY=:1
 
         detect_primary_ipv4() {{
             local candidate=""
@@ -1057,20 +908,15 @@ def build_isaac_runtime_script(config: AppConfig) -> str:
             return 1
         }}
 
-        detect_service_ipv4() {{
-            if [ "$TAILSCALE_ENABLED" = "1" ]; then
-                detect_tailscale_ipv4 && return 0
-            fi
-            detect_primary_ipv4
-        }}
-
-        PUBLIC_IP="$(detect_service_ipv4)"
+        PUBLIC_IP="$(detect_primary_ipv4)"
         export PUBLIC_IP
 
         docker rm -f isaac-sim >/dev/null 2>&1 || true
         exec docker run --name isaac-sim --entrypoint bash --gpus all --rm --network=host \
             -e "ACCEPT_EULA=Y" \
             -e "PRIVACY_CONSENT=Y" \
+            -e "DISPLAY=$ISAACSIM_DISPLAY" \
+            -v "/tmp/.X11-unix:/tmp/.X11-unix:rw" \
             -v "$RUNTIME_DIR/cache/main:/isaac-sim/.cache:rw" \
             -v "$RUNTIME_DIR/cache/computecache:/isaac-sim/.nv/ComputeCache:rw" \
             -v "$RUNTIME_DIR/logs:/isaac-sim/.nvidia-omniverse/logs:rw" \
@@ -1094,89 +940,8 @@ def build_viewer_runtime_script(config: AppConfig) -> str:
 
         export VIEWER_DIR={shell_quote(DEFAULT_VIEWER_APP_DIR)}
         export WEB_VIEWER_PORT={config.viewer_port}
-        export TAILSCALE_ENABLED={"1" if config.tailscale_enabled else "0"}
-
-        detect_tailscale_ipv4() {{
-            local candidate=""
-            candidate="$(ip -4 -o addr show dev tailscale0 2>/dev/null | awk '{{print $4}}' | cut -d/ -f1 | head -n 1)"
-            if [[ "$candidate" =~ ^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$ ]]; then
-                printf '%s\n' "$candidate"
-                return 0
-            fi
-            return 1
-        }}
-
-        bind_host="0.0.0.0"
-        if [ "$TAILSCALE_ENABLED" = "1" ]; then
-            bind_host="$(detect_tailscale_ipv4)"
-        fi
         cd "$VIEWER_DIR"
-        exec npx vite preview --host "$bind_host" --port "$WEB_VIEWER_PORT"
-        """
-    )
-
-
-def build_tailscale_firewall_script(config: AppConfig) -> str:
-    viewer_port = str(config.viewer_port) if config.viewer_enabled else ""
-    mcp_port = str(config.mcp_extension_port) if config.mcp_enabled else ""
-    return dedent_script(
-        f"""\
-        #!/usr/bin/env bash
-        set -euxo pipefail
-
-        export FIREWALL_VIEWER_PORT={shell_quote(viewer_port)}
-        export FIREWALL_MCP_PORT={shell_quote(mcp_port)}
-        export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
-        export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
-
-        for _ in $(seq 1 30); do
-            if ip link show tailscale0 >/dev/null 2>&1; then
-                break
-            fi
-            sleep 2
-        done
-        ip link show tailscale0 >/dev/null 2>&1
-
-        tcp_ports=()
-        if [ -n "$FIREWALL_VIEWER_PORT" ]; then
-            tcp_ports+=("$FIREWALL_VIEWER_PORT")
-        fi
-        if [ -n "$FIREWALL_MCP_PORT" ]; then
-            tcp_ports+=("$FIREWALL_MCP_PORT")
-        fi
-        tcp_ports+=("$ISAACSIM_SIGNAL_PORT")
-
-        if ! iptables -nL ISAAC_CLOUD_INPUT >/dev/null 2>&1; then
-            iptables -N ISAAC_CLOUD_INPUT
-        fi
-        iptables -C INPUT -j ISAAC_CLOUD_INPUT >/dev/null 2>&1 || iptables -I INPUT 1 -j ISAAC_CLOUD_INPUT
-        iptables -F ISAAC_CLOUD_INPUT
-
-        tcp_ports_csv="$(IFS=,; echo "${{tcp_ports[*]}}")"
-        iptables -A ISAAC_CLOUD_INPUT -i tailscale0 -p tcp -m multiport --dports "$tcp_ports_csv" -j ACCEPT
-        iptables -A ISAAC_CLOUD_INPUT ! -i tailscale0 -p tcp -m multiport --dports "$tcp_ports_csv" -j REJECT
-        iptables -A ISAAC_CLOUD_INPUT -i tailscale0 -p udp --dport "$ISAACSIM_STREAM_PORT" -j ACCEPT
-        iptables -A ISAAC_CLOUD_INPUT ! -i tailscale0 -p udp --dport "$ISAACSIM_STREAM_PORT" -j REJECT
-        iptables -A ISAAC_CLOUD_INPUT -j RETURN
-        """
-    )
-
-
-def build_tailscale_firewall_systemd_unit() -> str:
-    return textwrap.dedent(
-        """\
-        [Unit]
-        Description=Restrict Isaac service ports to tailscale0
-        Wants=network-online.target tailscaled.service
-        After=network-online.target tailscaled.service
-
-        [Service]
-        Type=oneshot
-        ExecStart=/usr/local/bin/isaac-cloud-apply-tailscale-firewall
-        RemainAfterExit=yes
-
-        [Install]
-        WantedBy=multi-user.target
+        exec npx vite preview --host 0.0.0.0 --port "$WEB_VIEWER_PORT"
         """
     )
 
@@ -1186,8 +951,8 @@ def build_isaac_systemd_unit(config: AppConfig) -> str:
         f"""\
         [Unit]
         Description=Run NVIDIA Isaac Sim headless streaming container
-        Wants=network-online.target docker.service
-        After=network-online.target docker.service
+        Wants=network-online.target docker.service isaac-cloud-xvfb.service
+        After=network-online.target docker.service isaac-cloud-xvfb.service
 
         [Service]
         Type=simple
@@ -1196,6 +961,26 @@ def build_isaac_systemd_unit(config: AppConfig) -> str:
         Restart=always
         RestartSec=10
         TimeoutStartSec=1800
+
+        [Install]
+        WantedBy=multi-user.target
+        """
+    )
+
+
+def build_xvfb_systemd_unit() -> str:
+    return textwrap.dedent(
+        """\
+        [Unit]
+        Description=Run virtual X display for Isaac Sim streaming
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        Type=simple
+        ExecStart=/usr/bin/Xvfb :1 -screen 0 1280x720x24
+        Restart=always
+        RestartSec=5
 
         [Install]
         WantedBy=multi-user.target
@@ -1244,6 +1029,12 @@ def build_cloud_init(config: AppConfig) -> dict[str, Any]:
             "owner": "root:root",
             "permissions": "0644",
         },
+        {
+            "path": "/etc/systemd/system/isaac-cloud-xvfb.service",
+            "content": build_xvfb_systemd_unit(),
+            "owner": "root:root",
+            "permissions": "0644",
+        },
     ]
     if config.viewer_enabled:
         write_files.extend(
@@ -1257,35 +1048,6 @@ def build_cloud_init(config: AppConfig) -> dict[str, Any]:
                 {
                     "path": "/etc/systemd/system/isaac-cloud-viewer.service",
                     "content": build_viewer_systemd_unit(),
-                    "owner": "root:root",
-                    "permissions": "0644",
-                },
-            ]
-        )
-    if config.tailscale_enabled:
-        write_files.extend(
-            [
-                {
-                    "path": "/usr/local/bin/isaac-cloud-tailscale-status",
-                    "content": textwrap.dedent(
-                        """\
-                        #!/usr/bin/env bash
-                        set -euo pipefail
-                        exec tailscale status --json
-                        """
-                    ),
-                    "owner": "root:root",
-                    "permissions": "0755",
-                },
-                {
-                    "path": "/usr/local/bin/isaac-cloud-apply-tailscale-firewall",
-                    "content": build_tailscale_firewall_script(config),
-                    "owner": "root:root",
-                    "permissions": "0755",
-                },
-                {
-                    "path": "/etc/systemd/system/isaac-cloud-tailscale-firewall.service",
-                    "content": build_tailscale_firewall_systemd_unit(),
                     "owner": "root:root",
                     "permissions": "0644",
                 },
@@ -1334,13 +1096,6 @@ def build_cloud_init(config: AppConfig) -> dict[str, Any]:
                 echo "== isaac-cloud-viewer.log =="
                 tail -n 200 /var/log/isaac-cloud-viewer.log || true
                 echo
-
-                echo "== tailscale status =="
-                if command -v tailscale >/dev/null 2>&1; then
-                    tailscale status --json || true
-                else
-                    echo "tailscale not installed"
-                fi
                 """
             ),
             "owner": "root:root",
@@ -1355,8 +1110,6 @@ def build_cloud_init(config: AppConfig) -> dict[str, Any]:
         "write_files": write_files,
         "runcmd": [
             "systemctl daemon-reload",
-            "systemctl enable isaac-cloud-tailscale-firewall.service || true",
-            "systemctl start isaac-cloud-tailscale-firewall.service || true",
             "bash -lc /usr/local/bin/isaac-cloud-bootstrap",
         ],
     }
@@ -1434,82 +1187,7 @@ def wait_for_ssh(host: str, port: int, *, timeout_seconds: int, poll_interval_se
     return False
 
 
-def parse_tailscale_status_json(payload: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
-    state = payload.get("BackendState")
-    self_info = payload.get("Self")
-    if not isinstance(self_info, dict):
-        return None, None, str(state) if state not in (None, "") else None
-
-    dns_name = first_truthy(
-        self_info.get("DNSName"),
-        self_info.get("HostName"),
-        self_info.get("Name"),
-    )
-    tailscale_ips = self_info.get("TailscaleIPs")
-    tailscale_ipv4 = None
-    if isinstance(tailscale_ips, list):
-        for ip in tailscale_ips:
-            text = str(ip)
-            if "." in text:
-                tailscale_ipv4 = text
-                break
-
-    normalized_name = str(dns_name).rstrip(".") if dns_name not in (None, "") else None
-    normalized_state = str(state) if state not in (None, "") else None
-    return tailscale_ipv4, normalized_name, normalized_state
-
-
-def inspect_tailscale_network(config: AppConfig, summary: InstanceSummary) -> InstanceSummary:
-    if not config.tailscale_enabled or not config.ssh_private_key_path:
-        return summary
-    try:
-        returncode, output = run_remote_command(
-            config,
-            summary,
-            "sudo /usr/local/bin/isaac-cloud-tailscale-status 2>/dev/null || sudo tailscale status --json 2>/dev/null || true",
-            timeout_seconds=20,
-        )
-    except (IsaacCloudError, subprocess.TimeoutExpired):
-        return summary
-
-    if returncode != 0 or not output:
-        return summary
-
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
-        return summary
-
-    tailscale_ipv4, tailscale_name, tailscale_state = parse_tailscale_status_json(payload)
-    return replace(
-        summary,
-        network=replace(
-            summary.network,
-            tailscale_ipv4=tailscale_ipv4,
-            tailscale_name=tailscale_name,
-            tailscale_state=tailscale_state,
-        ),
-    )
-
-
-def preferred_ssh_host(summary: InstanceSummary) -> str | None:
-    return summary.network.tailscale_name or summary.network.tailscale_ipv4 or summary.network.ssh_host
-
-
 def format_ssh_target(config: AppConfig, summary: InstanceSummary) -> str:
-    ssh_host = preferred_ssh_host(summary)
-    if not ssh_host:
-        _raise("Instance does not have a public IP yet, so an SSH target cannot be built.")
-    port_flag = ""
-    if ssh_host == summary.network.ssh_host and summary.network.ssh_port and summary.network.ssh_port != 22:
-        port_flag = f" -p {summary.network.ssh_port}"
-    key_flag = ""
-    if config.ssh_private_key_path:
-        key_flag = f" -i {config.ssh_private_key_path}"
-    return f"ssh{key_flag}{port_flag} {config.ssh_user}@{ssh_host}"
-
-
-def format_public_ssh_target(config: AppConfig, summary: InstanceSummary) -> str:
     if not summary.network.ssh_host:
         _raise("Instance does not have a public IP yet, so an SSH target cannot be built.")
     port_flag = ""
@@ -1592,33 +1270,6 @@ def print_verbose_status(summary: InstanceSummary, *, config: AppConfig) -> None
         typer.echo("Remote bootstrap inspection skipped because SSH is unreachable.")
         return
 
-    inspected_summary = inspect_tailscale_network(config, summary)
-
-    typer.echo("")
-    typer.echo("Tailscale")
-    if not config.tailscale_enabled:
-        typer.echo("State: disabled")
-    elif inspected_summary.network.tailscale_state:
-        typer.echo(f"State: {inspected_summary.network.tailscale_state}")
-        if inspected_summary.network.tailscale_name:
-            typer.echo(f"Name: {inspected_summary.network.tailscale_name}")
-        if inspected_summary.network.tailscale_ipv4:
-            typer.echo(f"IPv4: {inspected_summary.network.tailscale_ipv4}")
-    else:
-        typer.echo("State: enabled (status unavailable)")
-
-    typer.echo("")
-    typer.echo("Viewer")
-    typer.echo(f"State: {'enabled' if config.viewer_enabled else 'disabled'}")
-    if config.viewer_enabled:
-        typer.echo(f"Port: {config.viewer_port}")
-
-    typer.echo("")
-    typer.echo("MCP")
-    typer.echo(f"State: {'enabled' if config.mcp_enabled else 'disabled'}")
-    if config.mcp_enabled:
-        typer.echo(f"Extension Port: {config.mcp_extension_port}")
-
     sections = [
         (
             "Cloud-Init",
@@ -1689,10 +1340,9 @@ def print_verbose_status(summary: InstanceSummary, *, config: AppConfig) -> None
 
 
 def format_viewer_url(summary: InstanceSummary) -> str:
-    host = summary.network.tailscale_name or summary.network.tailscale_ipv4 or summary.public_ip
-    if not host:
-        _raise("Instance does not yet have a reachable host for building a viewer URL.")
-    return f"http://{host}:{summary.network.viewer_port}"
+    if not summary.public_ip:
+        _raise("Instance does not have a public IP yet, so a viewer URL cannot be built.")
+    return f"http://{summary.public_ip}:{summary.network.viewer_port}"
 
 
 def format_viewer_ports() -> str:
@@ -1703,15 +1353,20 @@ def format_viewer_ports() -> str:
     )
 
 
-def format_mcp_endpoint(summary: InstanceSummary, *, config: AppConfig) -> str | None:
-    host = (
-        summary.network.tailscale_name
-        or summary.network.tailscale_ipv4
-        or summary.public_ip
+def format_mcp_tunnel_command(config: AppConfig, summary: InstanceSummary) -> str:
+    if not summary.network.ssh_host:
+        _raise("Instance does not have a public IP yet, so an MCP tunnel command cannot be built.")
+    key_flag = ""
+    if config.ssh_private_key_path:
+        key_flag = f" -i {config.ssh_private_key_path}"
+    port_flag = ""
+    if summary.network.ssh_port and summary.network.ssh_port != 22:
+        port_flag = f" -p {summary.network.ssh_port}"
+    return (
+        f"ssh{key_flag}{port_flag} -N -L "
+        f"{config.mcp_extension_port}:127.0.0.1:{config.mcp_extension_port} "
+        f"{config.ssh_user}@{summary.network.ssh_host}"
     )
-    if not host:
-        return None
-    return f"{host}:{config.mcp_extension_port}"
 
 
 def print_mcp_access(summary: InstanceSummary, *, config: AppConfig) -> None:
@@ -1719,22 +1374,18 @@ def print_mcp_access(summary: InstanceSummary, *, config: AppConfig) -> None:
         return
     typer.echo("MCP: enabled via isaac.sim.mcp_extension")
     typer.echo(f"MCP Extension Port: {config.mcp_extension_port}")
-    direct_endpoint = format_mcp_endpoint(summary, config=config)
-    if direct_endpoint:
-        typer.echo(f"MCP Endpoint: {direct_endpoint}")
-    typer.echo("MCP Server: run the community server separately against the remote MCP endpoint.")
+    if summary.public_ip:
+        typer.echo(f"MCP Tunnel: {format_mcp_tunnel_command(config, summary)}")
+    typer.echo("MCP Server: run the community server separately against the tunneled localhost port.")
 
 
 def print_viewer_access(summary: InstanceSummary, *, config: AppConfig) -> None:
     if not config.viewer_enabled:
         return
-    if summary.public_ip or summary.network.tailscale_ipv4 or summary.network.tailscale_name:
+    if summary.public_ip:
         typer.echo(f"Viewer URL: {format_viewer_url(summary)}")
         typer.echo(f"Viewer Ports: {format_viewer_ports()}")
-        if summary.network.tailscale_ipv4 or summary.network.tailscale_name:
-            typer.echo("Viewer Access: Browser client must be on the same tailnet; viewer and streaming ports are restricted to tailscale0.")
-        else:
-            typer.echo("Viewer Access: Browser client loads over TCP 8210 and then connects to Isaac Sim over WebRTC.")
+        typer.echo("Viewer Access: Browser client loads over TCP 8210 and then connects to Isaac Sim over WebRTC.")
 
 
 def print_instance_summary(
@@ -1749,19 +1400,8 @@ def print_instance_summary(
         typer.echo(f"Public IP: {summary.public_ip}")
     if summary.ssh_port:
         typer.echo(f"SSH Port: {summary.ssh_port}")
-    if summary.network.tailscale_state:
-        typer.echo(f"Tailscale State: {summary.network.tailscale_state}")
-    if summary.network.tailscale_name:
-        typer.echo(f"Tailscale Name: {summary.network.tailscale_name}")
-    if summary.network.tailscale_ipv4:
-        typer.echo(f"Tailscale IPv4: {summary.network.tailscale_ipv4}")
-    if summary.public_ip or summary.network.tailscale_ipv4 or summary.network.tailscale_name:
+    if summary.public_ip:
         typer.echo(f"SSH: {format_ssh_target(config, summary)}")
-        if (
-            (summary.network.tailscale_ipv4 or summary.network.tailscale_name)
-            and summary.public_ip
-        ):
-            typer.echo(f"SSH Public Fallback: {format_public_ssh_target(config, summary)}")
         print_viewer_access(summary, config=config)
 
 
@@ -1922,15 +1562,6 @@ def launch(
         "--mcp/--no-mcp",
         help="Enable or disable the omni-mcp Isaac Sim extension for this launch.",
     ),
-    tailscale: bool | None = typer.Option(
-        None,
-        "--tailscale/--no-tailscale",
-        help="Enable or disable Tailscale bootstrap for this launch.",
-    ),
-    tailscale_hostname: str = typer.Option(
-        None,
-        help="Override the Tailscale hostname to register for this launch.",
-    ),
     timeout_seconds: int = typer.Option(900, help="How long to wait for the instance to reach running."),
     ssh_timeout_seconds: int = typer.Option(120, help="How long to wait for SSH reachability after the instance is running."),
 ) -> None:
@@ -1945,8 +1576,6 @@ def launch(
             "instance_name",
             "viewer",
             "mcp",
-            "tailscale",
-            "tailscale_hostname",
             "timeout_seconds",
             "ssh_timeout_seconds",
         )
@@ -1971,16 +1600,11 @@ def launch(
         effective_storage_gb = storage_gb or config.default_storage_gb
         effective_viewer_enabled = viewer if viewer is not None else config.viewer_enabled
         effective_mcp_enabled = mcp if mcp is not None else config.mcp_enabled
-        effective_tailscale_enabled = tailscale if tailscale is not None else config.tailscale_enabled
         effective_config = replace(
             config,
             viewer_enabled=effective_viewer_enabled,
             mcp_enabled=effective_mcp_enabled,
-            tailscale_enabled=effective_tailscale_enabled,
-            tailscale_hostname=tailscale_hostname if tailscale_hostname is not None else config.tailscale_hostname,
         )
-        if effective_config.tailscale_enabled and not effective_config.tailscale_auth_key:
-            _raise("Missing Tailscale auth key. Set TAILSCALE_AUTH_KEY or configure [tailscale].auth_key before launch.")
 
         try:
             locations = client.list_locations()
@@ -2029,11 +1653,6 @@ def launch(
                         "launchable GPU."
                     )
             resolved_name = instance_name or build_instance_name(config.instance_name_prefix)
-            if effective_config.tailscale_enabled and not effective_config.tailscale_hostname:
-                effective_config = replace(
-                    effective_config,
-                    tailscale_hostname=sanitize_tailscale_hostname(resolved_name),
-                )
             selected: Candidate | None = None
             instance_id: str | None = None
             create_failures: list[str] = []
@@ -2115,8 +1734,6 @@ def launch(
                         "SSH did not become reachable within the configured timeout. "
                         "The instance may still be finishing boot."
                     )
-                if ssh_ready:
-                    summary = inspect_tailscale_network(effective_config, summary)
 
             print_instance_summary(summary, config=effective_config)
             print_mcp_access(summary, config=effective_config)
@@ -2180,13 +1797,9 @@ def viewer(
         client, config = get_client_and_config()
         try:
             summary = parse_instance_summary(client.get_instance(instance_id), config.viewer_port)
-            summary = inspect_tailscale_network(config, summary)
             typer.echo(f"Viewer URL: {format_viewer_url(summary)}")
             typer.echo(f"Viewer Ports: {format_viewer_ports()}")
-            if summary.network.tailscale_ipv4 or summary.network.tailscale_name:
-                typer.echo("Notes: The browser must be on the same tailnet. Viewer and WebRTC ports are restricted to tailscale0.")
-            else:
-                typer.echo("Notes: The browser loads the viewer on TCP 8210, then connects over WebRTC on TCP 49100 and UDP 47998.")
+            typer.echo("Notes: The browser loads the viewer on TCP 8210, then connects over WebRTC on TCP 49100 and UDP 47998.")
         finally:
             client.close()
     except IsaacCloudError as exc:
