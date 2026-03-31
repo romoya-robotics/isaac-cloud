@@ -697,7 +697,6 @@ def build_bootstrap_script(config: AppConfig) -> str:
         export ISAACSIM_MCP_EXTENSION_PORT={mcp_extension_port}
         export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
         export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
-        export ISAACSIM_DISPLAY=:1
 
         wait_for_apt_lock() {{
             while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
@@ -780,7 +779,7 @@ EOF
         }}
 
         apt_get_retry update
-        apt_get_retry install -y ca-certificates curl git gnupg x11-xserver-utils xvfb
+        apt_get_retry install -y ca-certificates curl git gnupg
 
         curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
         sh /tmp/get-docker.sh
@@ -853,9 +852,6 @@ EOF
         mkdir -p "$RUNTIME_DIR"/pkg
         chown -R 1234:1234 "$RUNTIME_DIR"
 
-        systemctl enable isaac-cloud-xvfb.service
-        systemctl restart isaac-cloud-xvfb.service
-
         docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
         printf '%s\\n' {ngc_api_key} | docker login nvcr.io --username '$oauthtoken' --password-stdin
         retry_command 3 10 docker pull "$ISAAC_SIM_IMAGE"
@@ -901,7 +897,6 @@ def build_isaac_runtime_script(config: AppConfig) -> str:
         export ISAAC_SIM_IMAGE={shell_quote(build_isaac_image_ref(config.isaac_version))}
         export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
         export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
-        export ISAACSIM_DISPLAY=:1
 
         detect_primary_ipv4() {{
             local candidate=""
@@ -937,8 +932,6 @@ def build_isaac_runtime_script(config: AppConfig) -> str:
         exec docker run --name isaac-sim --entrypoint bash --gpus all --rm --network=host \
             -e "ACCEPT_EULA=Y" \
             -e "PRIVACY_CONSENT=Y" \
-            -e "DISPLAY=$ISAACSIM_DISPLAY" \
-            -v "/tmp/.X11-unix:/tmp/.X11-unix:rw" \
             -v "$RUNTIME_DIR/cache/main:/isaac-sim/.cache:rw" \
             -v "$RUNTIME_DIR/cache/computecache:/isaac-sim/.nv/ComputeCache:rw" \
             -v "$RUNTIME_DIR/logs:/isaac-sim/.nvidia-omniverse/logs:rw" \
@@ -973,8 +966,8 @@ def build_isaac_systemd_unit(config: AppConfig) -> str:
         f"""\
         [Unit]
         Description=Run NVIDIA Isaac Sim headless streaming container
-        Wants=network-online.target docker.service isaac-cloud-xvfb.service
-        After=network-online.target docker.service isaac-cloud-xvfb.service
+        Wants=network-online.target docker.service
+        After=network-online.target docker.service
 
         [Service]
         Type=simple
@@ -983,26 +976,6 @@ def build_isaac_systemd_unit(config: AppConfig) -> str:
         Restart=always
         RestartSec=10
         TimeoutStartSec=1800
-
-        [Install]
-        WantedBy=multi-user.target
-        """
-    )
-
-
-def build_xvfb_systemd_unit() -> str:
-    return textwrap.dedent(
-        """\
-        [Unit]
-        Description=Run virtual X display for Isaac Sim streaming
-        Wants=network-online.target
-        After=network-online.target
-
-        [Service]
-        Type=simple
-        ExecStart=/usr/bin/Xvfb :1 -screen 0 1280x720x24
-        Restart=always
-        RestartSec=5
 
         [Install]
         WantedBy=multi-user.target
@@ -1048,12 +1021,6 @@ def build_cloud_init(config: AppConfig) -> dict[str, Any]:
         {
             "path": "/etc/systemd/system/isaac-cloud-isaac.service",
             "content": build_isaac_systemd_unit(config),
-            "owner": "root:root",
-            "permissions": "0644",
-        },
-        {
-            "path": "/etc/systemd/system/isaac-cloud-xvfb.service",
-            "content": build_xvfb_systemd_unit(),
             "owner": "root:root",
             "permissions": "0644",
         },

@@ -173,7 +173,6 @@ What `launch` does on the VM:
 - creates an Ubuntu 24.04 GPU VM on TensorDock
 - installs Docker and NVIDIA Container Toolkit
 - installs the host NVIDIA driver if the image does not already have a working one
-- starts a virtual X display used by Isaac Sim streaming
 - pulls `nvcr.io/nvidia/isaac-sim:5.1.0`
 - optionally builds the Omniverse Web SDK viewer
 - optionally clones and mounts the `romoya-robotics/isaac-sim-mcp` extension repo
