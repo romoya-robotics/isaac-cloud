@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import textwrap
@@ -155,6 +156,28 @@ class InstanceSummary:
     ssh_port: int | None
     network: InstanceNetwork
     raw: dict[str, Any]
+
+
+@dataclass
+class RemoteProgressSnapshot:
+    ssh_reachable: bool
+    cloud_init_output: str = ""
+    docker_output: str = ""
+    isaac_service_output: str = ""
+    bootstrap_log: str = ""
+    isaac_log: str = ""
+
+
+@dataclass
+class ProgressSummary:
+    bootstrap_state: str
+    current_phase: str
+    milestone_count: int
+    milestone_total: int
+    last_completed_milestone: str
+    next_expected_step: str
+    ready_for_streaming: bool
+    possible_blocker: str | None = None
 
 
 def _raise(message: str) -> None:
@@ -1238,6 +1261,183 @@ def run_remote_command(
     return completed.returncode, output
 
 
+def fetch_remote_progress_snapshot(
+    config: AppConfig,
+    summary: InstanceSummary,
+) -> RemoteProgressSnapshot:
+    if not summary.network.ssh_host or not summary.network.ssh_port:
+        return RemoteProgressSnapshot(ssh_reachable=False)
+
+    ssh_reachable = check_tcp_connectivity(
+        summary.network.ssh_host,
+        summary.network.ssh_port,
+        timeout_seconds=5.0,
+    )
+    if not ssh_reachable:
+        return RemoteProgressSnapshot(ssh_reachable=False)
+
+    commands = {
+        "cloud_init_output": "cloud-init status --long || true",
+        "docker_output": "sudo docker ps -a --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}' || true",
+        "isaac_service_output": "sudo systemctl status isaac-cloud-isaac.service --no-pager || true",
+        "bootstrap_log": "sudo tail -n 80 /var/log/isaac-cloud-bootstrap.log || true",
+        "isaac_log": "sudo tail -n 120 /var/log/isaac-cloud-isaac.log || true",
+    }
+    snapshot = RemoteProgressSnapshot(ssh_reachable=True)
+    for field_name, remote_command in commands.items():
+        try:
+            _, output = run_remote_command(
+                config,
+                summary,
+                remote_command,
+                timeout_seconds=30,
+            )
+        except subprocess.TimeoutExpired:
+            output = "Timed out while fetching remote output."
+        setattr(snapshot, field_name, output)
+    return snapshot
+
+
+def extract_cloud_init_state(cloud_init_output: str) -> str:
+    match = re.search(r"^status:\s*(.+)$", cloud_init_output, flags=re.MULTILINE)
+    if match:
+        return match.group(1).strip()
+    if cloud_init_output:
+        lowered = cloud_init_output.lower()
+        if "status: done" in lowered:
+            return "done"
+        if "status: running" in lowered:
+            return "running"
+    return "unknown"
+
+
+def extract_isaac_service_state(service_output: str) -> str:
+    match = re.search(r"Active:\s+(\w+)", service_output)
+    if match:
+        return match.group(1).strip().lower()
+    return "unknown"
+
+
+def summarize_progress(snapshot: RemoteProgressSnapshot) -> ProgressSummary:
+    milestone_total = 7
+    cloud_init_state = extract_cloud_init_state(snapshot.cloud_init_output)
+    isaac_service_state = extract_isaac_service_state(snapshot.isaac_service_output)
+    docker_installed = "docker: command not found" not in snapshot.docker_output.lower()
+    container_running = "isaac-sim" in snapshot.docker_output and "Up " in snapshot.docker_output
+    stream_ready = "Isaac Sim Full Streaming App is loaded." in snapshot.isaac_log
+    rtx_ready = "rtx_ready for streaming" in snapshot.isaac_log
+    image_pull_in_progress = any(
+        marker in snapshot.bootstrap_log
+        for marker in ("Pulling fs layer", "Pull complete", "Download complete")
+    )
+    shader_compile_match = re.findall(
+        r"Waiting for RtPso async group async compilation: (\d+) seconds so far",
+        snapshot.isaac_log,
+    )
+    shader_compile_seconds = int(shader_compile_match[-1]) if shader_compile_match else None
+
+    milestones: list[tuple[str, bool]] = [
+        ("SSH reachable", snapshot.ssh_reachable),
+        ("Docker installed", docker_installed),
+        ("Cloud-init finished", cloud_init_state == "done"),
+        ("Isaac container running", container_running),
+        ("Isaac service active", isaac_service_state == "active"),
+        ("RTX streaming ready", rtx_ready),
+        ("Streaming app loaded", stream_ready),
+    ]
+    milestone_count = sum(1 for _, completed in milestones if completed)
+    last_completed_milestone = next(
+        (name for name, completed in reversed(milestones) if completed),
+        "None",
+    )
+
+    possible_blocker: str | None = None
+    if "timed out while fetching remote output" in snapshot.bootstrap_log.lower():
+        possible_blocker = "Remote bootstrap inspection timed out."
+    elif "tail: cannot open '/var/log/isaac-cloud-bootstrap.log'" in snapshot.bootstrap_log:
+        possible_blocker = "Bootstrap log is not available yet."
+    elif "docker: command not found" in snapshot.docker_output.lower() and cloud_init_state == "done":
+        possible_blocker = "Cloud-init finished but Docker is unavailable."
+    elif isaac_service_state == "inactive" and cloud_init_state == "done":
+        possible_blocker = "Cloud-init finished but the Isaac service is inactive."
+
+    if stream_ready:
+        current_phase = "Stream ready"
+        next_expected_step = "Test the viewer or native Isaac Streaming Client now."
+        bootstrap_state = "ready"
+    elif shader_compile_seconds is not None:
+        current_phase = f"Compiling RTX shaders ({shader_compile_seconds}s)"
+        next_expected_step = 'Wait for "Isaac Sim Full Streaming App is loaded."'
+        bootstrap_state = "progressing"
+    elif rtx_ready:
+        current_phase = "Finalizing livestream startup"
+        next_expected_step = 'Wait for "Isaac Sim Full Streaming App is loaded."'
+        bootstrap_state = "progressing"
+    elif isaac_service_state == "active" or container_running:
+        current_phase = "Starting Isaac Sim"
+        next_expected_step = "Wait for the long RTX shader compilation phase to finish."
+        bootstrap_state = "progressing"
+    elif image_pull_in_progress:
+        current_phase = "Pulling Isaac container image"
+        next_expected_step = "Wait for the image pull to finish and the Isaac service to start."
+        bootstrap_state = "progressing"
+    elif "nvidia-driver-570" in snapshot.bootstrap_log or "Building initial module" in snapshot.bootstrap_log:
+        current_phase = "Installing NVIDIA driver"
+        next_expected_step = "Wait for driver setup and Docker runtime configuration."
+        bootstrap_state = "progressing"
+    elif "nvidia-ctk runtime configure" in snapshot.bootstrap_log:
+        current_phase = "Configuring NVIDIA container runtime"
+        next_expected_step = "Wait for Isaac image pull to begin."
+        bootstrap_state = "progressing"
+    elif cloud_init_state == "running":
+        current_phase = "Bootstrap in progress"
+        next_expected_step = "Wait for cloud-init to advance."
+        bootstrap_state = "progressing"
+    elif cloud_init_state == "done":
+        current_phase = "Bootstrap completed"
+        next_expected_step = "Inspect the Isaac service and logs."
+        bootstrap_state = "waiting"
+    else:
+        current_phase = "Waiting for SSH/bootstrap"
+        next_expected_step = "Wait for SSH to come up."
+        bootstrap_state = "waiting"
+
+    return ProgressSummary(
+        bootstrap_state=bootstrap_state,
+        current_phase=current_phase,
+        milestone_count=milestone_count,
+        milestone_total=milestone_total,
+        last_completed_milestone=last_completed_milestone,
+        next_expected_step=next_expected_step,
+        ready_for_streaming=stream_ready,
+        possible_blocker=possible_blocker,
+    )
+
+
+def print_progress_summary(snapshot: RemoteProgressSnapshot) -> None:
+    progress = summarize_progress(snapshot)
+    typer.echo("")
+    typer.echo("Progress")
+    typer.echo(f"Bootstrap: {progress.bootstrap_state}")
+    typer.echo(f"Current Phase: {progress.current_phase}")
+    typer.echo(f"Milestones: {progress.milestone_count}/{progress.milestone_total}")
+    typer.echo(f"Last Completed: {progress.last_completed_milestone}")
+    typer.echo(f"Next Step: {progress.next_expected_step}")
+    typer.echo(f"Ready For Streaming: {'yes' if progress.ready_for_streaming else 'no'}")
+    if progress.possible_blocker:
+        typer.echo(f"Possible Blocker: {progress.possible_blocker}")
+
+
+def print_compact_status(summary: InstanceSummary, *, config: AppConfig) -> None:
+    if not summary.network.ssh_host or not summary.network.ssh_port:
+        return
+    snapshot = fetch_remote_progress_snapshot(config, summary)
+    typer.echo("")
+    typer.echo(f"SSH Reachability: {'reachable' if snapshot.ssh_reachable else 'unreachable'}")
+    if snapshot.ssh_reachable:
+        print_progress_summary(snapshot)
+
+
 def print_verbose_status(summary: InstanceSummary, *, config: AppConfig) -> None:
     typer.echo("")
     typer.echo("Bootstrap Status")
@@ -1248,84 +1448,79 @@ def print_verbose_status(summary: InstanceSummary, *, config: AppConfig) -> None
         typer.echo("Remote bootstrap inspection skipped.")
         return
 
-    ssh_reachable = check_tcp_connectivity(
-        summary.network.ssh_host,
-        summary.network.ssh_port,
-        timeout_seconds=5.0,
-    )
+    snapshot = fetch_remote_progress_snapshot(config, summary)
     typer.echo("")
-    typer.echo(f"SSH Reachability: {'reachable' if ssh_reachable else 'unreachable'}")
-    if not ssh_reachable:
+    typer.echo(f"SSH Reachability: {'reachable' if snapshot.ssh_reachable else 'unreachable'}")
+    if not snapshot.ssh_reachable:
         typer.echo("Remote bootstrap inspection skipped because SSH is unreachable.")
         return
+
+    print_progress_summary(snapshot)
 
     sections = [
         (
             "Cloud-Init",
-            "cloud-init status --long || true",
-            30,
+            snapshot.cloud_init_output,
         ),
         (
             "Docker",
-            "sudo docker ps -a --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}' || true",
-            30,
+            snapshot.docker_output,
         ),
         (
             "Isaac Service",
-            "sudo systemctl status isaac-cloud-isaac.service --no-pager || true",
-            30,
+            snapshot.isaac_service_output,
         ),
         (
             "Bootstrap Log",
-            "sudo tail -n 40 /var/log/isaac-cloud-bootstrap.log || true",
-            30,
+            snapshot.bootstrap_log,
         ),
         (
             "Isaac Log",
-            "sudo tail -n 40 /var/log/isaac-cloud-isaac.log || true",
-            30,
+            snapshot.isaac_log,
         ),
     ]
 
     if config.viewer_enabled:
+        try:
+            _, viewer_service_output = run_remote_command(
+                config,
+                summary,
+                "sudo systemctl status isaac-cloud-viewer.service --no-pager || true",
+                timeout_seconds=30,
+            )
+            _, viewer_log_output = run_remote_command(
+                config,
+                summary,
+                "sudo tail -n 40 /var/log/isaac-cloud-viewer.log || true",
+                timeout_seconds=30,
+            )
+        except subprocess.TimeoutExpired:
+            viewer_service_output = "Timed out while fetching remote output."
+            viewer_log_output = "Timed out while fetching remote output."
+        except IsaacCloudError as exc:
+            viewer_service_output = f"Unavailable: {exc}"
+            viewer_log_output = f"Unavailable: {exc}"
         sections.extend(
             [
                 (
                     "Viewer Service",
-                    "sudo systemctl status isaac-cloud-viewer.service --no-pager || true",
-                    30,
+                    viewer_service_output,
                 ),
                 (
                     "Viewer Log",
-                    "sudo tail -n 40 /var/log/isaac-cloud-viewer.log || true",
-                    30,
+                    viewer_log_output,
                 ),
             ]
         )
 
-    for label, remote_command, timeout_seconds in sections:
+    for label, output in sections:
         typer.echo("")
         typer.echo(f"{label}:")
-        try:
-            returncode, output = run_remote_command(
-                config,
-                summary,
-                remote_command,
-                timeout_seconds=timeout_seconds,
-            )
-        except subprocess.TimeoutExpired:
-            typer.echo("Timed out while fetching remote output.")
-            continue
-        except IsaacCloudError as exc:
-            typer.echo(f"Unavailable: {exc}")
-            return
 
         if output:
             typer.echo(output)
-        elif returncode == 0:
-            typer.echo("(no output)")
         else:
-            typer.echo(f"Command exited with status {returncode}.")
+            typer.echo("(no output)")
 
 
 def format_viewer_url(summary: InstanceSummary) -> str:
@@ -1758,6 +1953,8 @@ def status(
             print_instance_summary(summary, config=config)
             if verbose:
                 print_verbose_status(summary, config=config)
+            else:
+                print_compact_status(summary, config=config)
         finally:
             client.close()
     except IsaacCloudError as exc:
