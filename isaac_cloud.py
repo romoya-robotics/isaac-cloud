@@ -1865,6 +1865,7 @@ def print_verbose_status(summary: InstanceSummary, *, config: AppConfig) -> None
                 typer.echo(f"Remote: {persistence_status.remote_uri}")
             if persistence_status.local_path:
                 typer.echo(f"Local Path: {persistence_status.local_path}")
+                typer.echo(f"Container Path: {DEFAULT_PERSISTENCE_CONTAINER_DIR}")
             typer.echo(f"Last Pull: {persistence_status.last_pull_at or 'never'}")
             typer.echo(f"Last Pull Status: {persistence_status.last_pull_status or 'never'}")
             typer.echo(f"Last Push: {persistence_status.last_push_at or 'never'}")
@@ -1987,6 +1988,13 @@ def print_viewer_access(summary: InstanceSummary, *, config: AppConfig) -> None:
         typer.echo("Viewer Access: Browser client loads over TCP 8210 and then connects to Isaac Sim over WebRTC.")
 
 
+def print_persistence_access(config: AppConfig) -> None:
+    if not config.persistence_enabled:
+        return
+    typer.echo(f"Persistence Host Path: {build_persistence_local_path(config.ssh_user)}")
+    typer.echo(f"Persistence Container Path: {DEFAULT_PERSISTENCE_CONTAINER_DIR}")
+
+
 def print_instance_summary(
     summary: InstanceSummary,
     *,
@@ -2002,6 +2010,7 @@ def print_instance_summary(
     if summary.public_ip:
         typer.echo(f"SSH: {format_ssh_target(config, summary)}")
         print_viewer_access(summary, config=config)
+    print_persistence_access(config)
 
 
 def print_catalog(
@@ -2410,37 +2419,6 @@ def status(
                 print_verbose_status(summary, config=config)
             else:
                 print_compact_status(summary, config=config)
-        finally:
-            client.close()
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPStatusError as exc:
-        typer.echo(
-            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
-            err=True,
-        )
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPError as exc:
-        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-
-
-@app.command("viewer")
-def viewer(
-    ctx: typer.Context,
-    instance_id: str = typer.Option(None, help="TensorDock instance id to inspect."),
-) -> None:
-    try:
-        if ctx.get_parameter_source("instance_id") == ParameterSource.DEFAULT:
-            typer.echo(ctx.get_help())
-            _raise("Pass --instance-id.")
-        client, config = get_client_and_config()
-        try:
-            summary = parse_instance_summary(client.get_instance(instance_id), config.viewer_port)
-            typer.echo(f"Viewer URL: {format_viewer_url(summary)}")
-            typer.echo(f"Viewer Ports: {format_viewer_ports()}")
-            typer.echo("Notes: The browser loads the viewer on TCP 8210, then connects over WebRTC on TCP 49100 and UDP 47998.")
         finally:
             client.close()
     except IsaacCloudError as exc:
