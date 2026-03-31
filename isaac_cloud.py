@@ -206,10 +206,27 @@ def bool_or_default(value: Any, default: bool) -> bool:
     _raise(f"Invalid boolean value: {value!r}")
 
 
+def load_text_file(path_value: str, *, label: str) -> str:
+    path = Path(path_value).expanduser()
+    try:
+        contents = path.read_text().strip()
+    except OSError as exc:
+        raise IsaacCloudError(f"Failed to read {label} at {path}: {exc}") from exc
+    if not contents:
+        _raise(f"{label} at {path} was empty.")
+    return contents
+
+
 def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
     config_data = load_toml(config_path)
 
     api_token = env_or_config(config_data, "TENSORDOCK_API_TOKEN", "tensordock", "api_token")
+    ssh_public_key_path = env_or_config(
+        config_data,
+        "TENSORDOCK_SSH_PUBLIC_KEY_PATH",
+        "tensordock",
+        "public_ssh_key_path",
+    )
     ssh_key = env_or_config(config_data, "TENSORDOCK_SSH_KEY", "tensordock", "ssh_key")
 
     if not api_token:
@@ -217,10 +234,15 @@ def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             "Missing TensorDock API token. Set TENSORDOCK_API_TOKEN or configure "
             f"{config_path}."
         )
+    if ssh_public_key_path:
+        ssh_key = load_text_file(
+            str(ssh_public_key_path),
+            label="TensorDock public SSH key",
+        )
     if not ssh_key:
         _raise(
-            "Missing TensorDock SSH key reference. Set TENSORDOCK_SSH_KEY or configure "
-            f"{config_path}."
+            "Missing TensorDock public SSH key. Set TENSORDOCK_SSH_PUBLIC_KEY_PATH, "
+            "TENSORDOCK_SSH_KEY, or configure [tensordock].public_ssh_key_path."
         )
 
     return AppConfig(
