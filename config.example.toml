@@ -26,12 +26,3 @@ port = 8210
 enabled = false
 repo_url = "https://github.com/romoya-robotics/isaac-sim-mcp"
 extension_port = 8766
-
-[tailscale]
-enabled = false
-# auth_key = "tskey-auth-..."
-# hostname = "isaac-cloud-dev"
-ssh = true
-accept_routes = false
-accept_dns = true
-advertise_tags = []
