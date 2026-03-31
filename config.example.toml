@@ -1,6 +1,6 @@
 [tensordock]
 api_token = "td_your_api_token"
-ssh_key = "ssh-ed25519 AAAA... you@example.com"
+public_ssh_key_path = "/home/you/.ssh/id_ed25519.pub"
 
 [ngc]
 api_key = "nvapi-your-ngc-api-key"

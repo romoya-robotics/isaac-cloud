@@ -2,6 +2,54 @@
 
 `isaac-cloud` is a Python CLI for provisioning TensorDock GPU instances intended to run NVIDIA Isaac Sim.
 
+## Quick Start
+
+If you want the shortest path to a working VM:
+
+1. Install dependencies.
+
+```bash
+uv sync
+```
+
+2. Create your local config from the example.
+
+```bash
+cp config.example.toml config.toml
+```
+
+3. Edit `config.toml` and fill in these required values:
+
+- `tensordock.api_token`
+- `tensordock.public_ssh_key_path`
+- `ngc.api_key`
+
+4. Optionally set your local SSH private key path in `config.toml` under `[ssh]` so the CLI can print ready-to-use SSH commands and run best-effort status checks.
+
+5. Check what GPUs are available.
+
+```bash
+uv run python isaac_cloud.py catalog
+```
+
+6. Launch a VM.
+
+```bash
+uv run python isaac_cloud.py launch --viewer
+```
+
+Or launch with MCP enabled:
+
+```bash
+uv run python isaac_cloud.py launch --mcp
+```
+
+7. Watch bootstrap progress.
+
+```bash
+uv run python isaac_cloud.py status --instance-id <INSTANCE_ID> --verbose
+```
+
 ## Current State
 
 The repo now implements the Phase 1 launch skeleton against TensorDock:
@@ -24,16 +72,24 @@ uv sync
 uv run python isaac_cloud.py --help
 ```
 
-That keeps the first versions easy to iterate on while the TensorDock and Isaac Sim flow is still being validated.
-
 ## Configuration
 
-Create `config.toml` next to `isaac_cloud.py` before running the script. A checked-in template lives at `config.example.toml`:
+Create `config.toml` next to `isaac_cloud.py` before running the script. A checked-in template lives at `config.example.toml`.
+
+The normal setup flow is:
+
+```bash
+cp config.example.toml config.toml
+```
+
+Then edit `config.toml` and update the values you want to use.
+
+Example config:
 
 ```toml
 [tensordock]
 api_token = "..."
-ssh_key = "ssh-ed25519 AAAA... you@example.com"
+public_ssh_key_path = "/home/you/.ssh/id_ed25519.pub"
 
 [ngc]
 api_key = "..."
@@ -61,11 +117,25 @@ repo_url = "https://github.com/romoya-robotics/isaac-sim-mcp"
 extension_port = 8766
 ```
 
+Required settings for `launch`:
+
+- `tensordock.api_token`: TensorDock API credential
+- `tensordock.public_ssh_key_path`: path to the SSH public key file to inject into the VM
+- `ngc.api_key`: NGC API key used to pull the Isaac Sim container
+
+Useful optional settings:
+
+- `ssh.private_key_path`: local private key path used for generated SSH commands and best-effort SSH checks
+- `defaults.gpu_class`: preferred minimum GPU class, for example `rtx4080`
+- `defaults.region`: preferred region substring, for example `seattle`
+- `viewer.enabled`: start the browser viewer automatically on launch
+- `mcp.enabled`: enable the Isaac MCP extension in the container
+
 You can still override individual settings with environment variables when needed:
 
 ```bash
 export TENSORDOCK_API_TOKEN=...
-export TENSORDOCK_SSH_KEY=...
+export TENSORDOCK_SSH_PUBLIC_KEY_PATH=~/.ssh/id_ed25519.pub
 export NGC_API_KEY=...
 ```
 
@@ -73,7 +143,9 @@ export NGC_API_KEY=...
 
 `https://dashboard.tensordock.com/developers`
 
-`TENSORDOCK_SSH_KEY` should be the literal SSH public key contents to inject into the VM, not the private key.
+`TENSORDOCK_SSH_PUBLIC_KEY_PATH` should point to your SSH public key file, not the private key.
+
+`TENSORDOCK_SSH_KEY` is still accepted as a fallback for literal public-key contents, but the path-based setting is the recommended option.
 
 `NGC_API_KEY` is required for `launch`. The bootstrap flow uses it to authenticate Docker to `nvcr.io` before pulling the pinned Isaac Sim image.
 
@@ -96,6 +168,16 @@ export ISAAC_CLOUD_RAM_GB=0
 export ISAAC_CLOUD_STORAGE_GB=0
 ```
 
+What `launch` does on the VM:
+
+- creates an Ubuntu 24.04 GPU VM on TensorDock
+- installs Docker and NVIDIA Container Toolkit
+- installs the host NVIDIA driver if the image does not already have a working one
+- starts a virtual X display used by Isaac Sim streaming
+- pulls `nvcr.io/nvidia/isaac-sim:5.1.0`
+- optionally builds the Omniverse Web SDK viewer
+- optionally clones and mounts the `romoya-robotics/isaac-sim-mcp` extension repo
+
 ## Commands
 
 ```bash
@@ -117,6 +199,8 @@ Commands that inspect or mutate a specific VM require `--instance-id`, unless yo
 ## Viewer Workflow
 
 The web viewer is optional. A launch only builds and starts the Omniverse Web SDK viewer when it is enabled in config or by an explicit launch flag.
+
+Important: the viewer is not SSH-tunneled by this tool. When enabled, it is meant to be accessed over the VM public IP and uses public TCP/UDP ports for WebRTC.
 
 1. Launch a VM with viewer enabled.
 
@@ -151,6 +235,8 @@ uv run python isaac_cloud.py viewer --instance-id <INSTANCE_ID>
 This repo can launch Isaac Sim with the community `romoya-robotics/isaac-sim-mcp` extension enabled inside the Isaac container.
 
 The MCP extension runs on the VM inside Isaac Sim. The Python MCP server from the community repo should run on your local machine and connect through an SSH tunnel to the VM.
+
+Important: the community MCP server is a separate local dependency. You only need to clone and run it if you want MCP.
 
 1. Launch a VM with MCP enabled.
 
@@ -223,11 +309,19 @@ The exact config depends on your MCP client, but the shape is:
 
 The important point is that your MCP client talks to a local stdio server, and that local server talks through the SSH tunnel to the VM.
 
+For Codex, Claude Desktop, or another MCP-compatible client, the pattern is the same:
+
+- keep the SSH tunnel open
+- register the local `isaac_mcp/server.py` process as your MCP server
+- let that local MCP server connect to `localhost:8766`
+
+In other words, Codex or Claude should talk to the local community MCP server process, not directly to the remote VM port.
+
 ## Notes
 
 - The GPU compatibility table is intentionally conservative and can be expanded once we validate more TensorDock SKUs.
 - TensorDock response shapes for instance networking may vary, so `public_ip` and `ssh_port` parsing is defensive.
-- `TENSORDOCK_API_TOKEN` authenticates API requests, while `TENSORDOCK_SSH_KEY` should contain the actual public key material sent to the `/api/v2/instances` endpoint.
+- `TENSORDOCK_API_TOKEN` authenticates API requests, while `tensordock.public_ssh_key_path` or `TENSORDOCK_SSH_PUBLIC_KEY_PATH` should point to the SSH public key file whose contents are sent to the `/api/v2/instances` endpoint.
 - `launch` now expects `NGC_API_KEY` so cloud-init can authenticate to `nvcr.io` and pull the Isaac Sim image during first boot.
 - The live `config.toml` file is ignored by git. Start from `config.example.toml`.
 - `vcpu = 0`, `ram_gb = 0`, and `storage_gb = 0` mean "do not constrain candidate selection by that resource." Launch then auto-picks a small baseline size for the actual VM request, with storage still respecting the provider minimum.
