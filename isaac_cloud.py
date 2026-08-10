@@ -1,8 +1,20 @@
+"""isaac-cloud: launch and manage NVIDIA Isaac Sim on cloud GPUs.
+
+Providers:
+  - vast: Vast.ai marketplace containers (the Isaac image IS the instance).
+  - aws:  EC2 GPU VMs (g6e/L40S) running the Isaac container under Docker.
+
+Access model is SSH-only on every provider: the agent control socket (8226),
+RTSP camera streams (8554), and the noVNC GUI (6080) are all bound to
+localhost on the remote side and reached through SSH tunnels printed by the
+CLI. Nothing Isaac-related is ever exposed to the public internet.
+"""
+
 from __future__ import annotations
 
 import json
 import os
-import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -13,1494 +25,205 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-import httpx
 import typer
-from click.core import ParameterSource
 
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
-    tomllib = None
-
+    import tomli as tomllib  # type: ignore[no-redef]
 
 APP_NAME = "isaac-cloud"
-API_BASE_URL = "https://dashboard.tensordock.com/api/v2"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
-DEFAULT_IMAGE = "ubuntu2404"
-DEFAULT_VIEWER_PORT = 8210
-DEFAULT_SSH_USER = "user"
-DEFAULT_INSTANCE_NAME_PREFIX = "isaac-cloud"
-DEFAULT_ISAAC_VERSION = "5.1.0"
+
+DEFAULT_PROVIDER = "vast"
+DEFAULT_ISAAC_VERSION = "6.0.1"
 DEFAULT_ISAAC_SIGNAL_PORT = 49100
 DEFAULT_ISAAC_STREAM_PORT = 47998
-DEFAULT_REMOTE_ROOT = "/opt/gpu-orchestrator"
-DEFAULT_RUNTIME_DIR = f"{DEFAULT_REMOTE_ROOT}/runtime/docker/isaac-sim"
-DEFAULT_VIEWER_APP_DIR = f"{DEFAULT_REMOTE_ROOT}/web-viewer"
-DEFAULT_MCP_REPO_URL = "https://github.com/romoya-robotics/isaac-sim-mcp"
-DEFAULT_MCP_EXTENSION_PORT = 8766
-DEFAULT_MCP_REPO_DIR = f"{DEFAULT_REMOTE_ROOT}/isaac-sim-mcp"
-DEFAULT_PERSISTENCE_PROVIDER = "s3"
-DEFAULT_PERSISTENCE_STATE_DIR = "/var/lib/isaac-cloud/state"
-DEFAULT_PERSISTENCE_MANIFEST_PATH = f"{DEFAULT_PERSISTENCE_STATE_DIR}/persistence-manifest.json"
-DEFAULT_PERSISTENCE_CONTAINER_DIR = "/isaac-sim/project"
-DEFAULT_AUTO_VCPU = 4
-DEFAULT_AUTO_RAM_GB = 16
-MIN_STORAGE_GB = 100
+DEFAULT_AGENT_CONTROL_PORT = 8226  # isaacsim.code_editor.python_server, fixed upstream
+DEFAULT_RTSP_PORT = 8554
+DEFAULT_NOVNC_PORT = 6080
+DEFAULT_GUI_RESOLUTION = "1920x1080"
 
-GPU_COMPATIBILITY: dict[str, tuple[str, ...]] = {
-    "rtx4080": (
-        "geforcertx4080-pcie-16gb",
-        "geforcertx4080super-pcie-16gb",
-        "geforcertx4090-pcie-24gb",
-        "geforcertx5090-pcie-32gb",
-        "rtx4000ada-sff-20gb",
-        "rtx4500ada-24gb",
-        "rtx5000ada-32gb",
-        "rtx5880ada-48gb",
-        "rtx6000ada-48gb",
-        "l40-48gb",
-        "l40s-48gb",
-    ),
-    "rtx4090": (
-        "geforcertx4090-pcie-24gb",
-        "geforcertx5090-pcie-32gb",
-        "rtx5000ada-32gb",
-        "rtx5880ada-48gb",
-        "rtx6000ada-48gb",
-        "l40-48gb",
-        "l40s-48gb",
-    ),
-    "l40s": ("l40s-48gb",),
-    "l40": ("l40-48gb", "l40s-48gb"),
-    "rtxa4000": ("rtxa4000-pcie-16gb",),
-}
+DEFAULT_INSTANCE_NAME_PREFIX = "isaac-cloud"
+DEFAULT_DISK_GB = 100
+
+# Container-side paths (identical on both providers: same Isaac image).
+CONTAINER_PERSISTENCE_DIR = "/isaac-sim/project"
+
+# Vast provider defaults. NVENC requires the rented GPU to be host GPU 0
+# (see VAST_EXPERIMENT_RESULTS.md), which whole-machine offers guarantee.
+DEFAULT_VAST_QUERY = (
+    'gpu_name in ["RTX_4090","L40S"] driver_version >= 580.95.05 '
+    "verified=true rentable=true num_gpus=1 disk_space >= 80 inet_down >= 300"
+)
+DEFAULT_VAST_WHOLE_MACHINE = True
+DEFAULT_VAST_MIN_RELIABILITY = 0.99
+
+# AWS provider defaults. g6e = L40S (RT cores + NVENC, on Isaac's GPU list).
+DEFAULT_AWS_REGION = "us-west-2"
+DEFAULT_AWS_INSTANCE_TYPE = "g6e.xlarge"
+DEFAULT_AWS_SECURITY_GROUP = "isaac-cloud-ssh"
+DEFAULT_AWS_KEY_NAME = "isaac-cloud"
+DEFAULT_AWS_SSH_USER = "ubuntu"
+# Deep Learning Base OSS Nvidia Driver AMI: driver + docker + nvidia-container-toolkit preinstalled.
+DEFAULT_AWS_AMI_SSM_PARAM = (
+    "/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id"
+)
+AWS_TAG_MANAGED = "IsaacCloudManaged"
 
 ISAAC_MINIMUM_GPU_CLASSES = {"rtx4080", "rtx4090", "l40", "l40s"}
-ISAAC_MINIMUM_GPU_NAMES = {
-    gpu_name
-    for gpu_class in ISAAC_MINIMUM_GPU_CLASSES
-    for gpu_name in GPU_COMPATIBILITY[gpu_class]
-}
-
-RUNNING_STATES = {"running"}
-STOPPED_STATES = {"stopped", "stoppeddisassociated"}
-
-
-app = typer.Typer(
-    help="Provision and manage TensorDock GPU instances for NVIDIA Isaac Sim.",
-    add_completion=False,
-    no_args_is_help=True,
-)
-sync_app = typer.Typer(
-    help="Sync durable Isaac data to or from S3.",
-    add_completion=False,
-    no_args_is_help=True,
-)
 
 
 class IsaacCloudError(Exception):
-    pass
-
-
-@dataclass
-class AppConfig:
-    api_token: str
-    ssh_key: str
-    ngc_api_key: str | None
-    ssh_private_key_path: str | None
-    ssh_user: str
-    default_gpu_class: str | None
-    default_region: str | None
-    default_vcpu: int
-    default_ram_gb: int
-    default_storage_gb: int
-    instance_name_prefix: str
-    viewer_enabled: bool
-    viewer_port: int
-    isaac_version: str
-    mcp_enabled: bool
-    mcp_repo_url: str
-    mcp_extension_port: int
-    persistence_enabled: bool
-    persistence_provider: str
-    persistence_auto_pull_on_launch: bool
-    persistence_auto_push_on_destroy: bool
-    aws_s3_uri: str | None
-    aws_region: str | None
-
-
-@dataclass
-class Candidate:
-    location_id: str
-    city: str
-    stateprovince: str
-    country: str
-    tier: int | None
-    gpu_v0_name: str
-    gpu_display_name: str
-    gpu_count: int
-    gpu_price_per_hr: float
-    max_vcpus: int
-    max_ram_gb: int
-    max_storage_gb: int
-    per_vcpu_hr: float
-    per_gb_ram_hr: float
-    per_gb_storage_hr: float
-    dedicated_ip_available: bool
-    port_forwarding_available: bool
-    estimated_hourly_cost: float
-
-
-@dataclass
-class InstanceNetwork:
-    public_ip: str | None = None
-    ssh_port: int | None = None
-    ssh_host: str | None = None
-    viewer_port: int = DEFAULT_VIEWER_PORT
-    port_forwards: list[dict[str, Any]] = field(default_factory=list)
-
-
-@dataclass
-class InstanceSummary:
-    id: str
-    name: str
-    status: str
-    public_ip: str | None
-    ssh_port: int | None
-    network: InstanceNetwork
-    raw: dict[str, Any]
-
-
-@dataclass
-class RemoteProgressSnapshot:
-    ssh_reachable: bool
-    cloud_init_output: str = ""
-    docker_output: str = ""
-    isaac_service_output: str = ""
-    bootstrap_log: str = ""
-    isaac_log: str = ""
-
-
-@dataclass
-class ProgressSummary:
-    bootstrap_state: str
-    current_phase: str
-    milestone_count: int
-    milestone_total: int
-    last_completed_milestone: str
-    next_expected_step: str
-    ready_for_streaming: bool
-    possible_blocker: str | None = None
-
-
-@dataclass
-class PersistenceStatus:
-    enabled: bool
-    provider: str | None = None
-    remote_uri: str | None = None
-    local_path: str | None = None
-    last_pull_at: str | None = None
-    last_pull_status: str | None = None
-    last_push_at: str | None = None
-    last_push_status: str | None = None
-    last_push_error: str | None = None
+    """Raised for all fatal, user-reportable failures."""
 
 
 def _raise(message: str) -> None:
     raise IsaacCloudError(message)
 
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    provider: str
+    isaac_version: str
+    instance_name_prefix: str
+    disk_gb: int
+    ngc_api_key: str | None
+    ssh_private_key_path: str | None
+    ssh_public_key_path: str | None
+    agent_enabled: bool
+    gui_enabled: bool
+    gui_resolution: str
+    # vast
+    vast_query: str
+    vast_whole_machine: bool
+    vast_min_reliability: float
+    # aws
+    aws_region: str
+    aws_instance_type: str
+    aws_ami_ssm_param: str
+    aws_security_group: str
+    aws_key_name: str
+    # persistence
+    persistence_enabled: bool
+    persistence_s3_uri: str | None
+    persistence_aws_region: str | None
+
+
 def load_toml(path: Path) -> dict[str, Any]:
     if not path.exists():
-        _raise(
-            f"Missing config file: {path}. Create config.toml before running the script."
-        )
-    if tomllib is None:
-        _raise("Python tomllib is unavailable; use Python 3.11+.")
-    return tomllib.loads(path.read_text())
-
-
-def nested_get(data: dict[str, Any], *keys: str) -> Any:
-    current: Any = data
-    for key in keys:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-    return current
-
-
-def env_or_config(config_data: dict[str, Any], env_name: str, *path: str) -> Any:
-    value = os.getenv(env_name)
-    if value not in (None, ""):
-        return value
-    return nested_get(config_data, *path)
-
-
-def int_or_default(value: Any, default: int) -> int:
-    if value in (None, ""):
-        return default
-    return int(value)
-
-
-def bool_or_default(value: Any, default: bool) -> bool:
-    if value in (None, ""):
-        return default
-    if isinstance(value, bool):
-        return value
-    normalized = str(value).strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    _raise(f"Invalid boolean value: {value!r}")
-
-
-def load_text_file(path_value: str, *, label: str) -> str:
-    path = Path(path_value).expanduser()
+        return {}
     try:
-        contents = path.read_text().strip()
-    except OSError as exc:
-        raise IsaacCloudError(f"Failed to read {label} at {path}: {exc}") from exc
-    if not contents:
-        _raise(f"{label} at {path} was empty.")
-    return contents
-
-
-def load_app_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
-    config_data = load_toml(config_path)
-
-    api_token = env_or_config(config_data, "TENSORDOCK_API_TOKEN", "tensordock", "api_token")
-    ssh_public_key_path = env_or_config(
-        config_data,
-        "TENSORDOCK_SSH_PUBLIC_KEY_PATH",
-        "tensordock",
-        "public_ssh_key_path",
-    )
-    ssh_key = env_or_config(config_data, "TENSORDOCK_SSH_KEY", "tensordock", "ssh_key")
-
-    if not api_token:
-        _raise(
-            "Missing TensorDock API token. Set TENSORDOCK_API_TOKEN or configure "
-            f"{config_path}."
-        )
-    if ssh_public_key_path:
-        ssh_key = load_text_file(
-            str(ssh_public_key_path),
-            label="TensorDock public SSH key",
-        )
-    if not ssh_key:
-        _raise(
-            "Missing TensorDock public SSH key. Set TENSORDOCK_SSH_PUBLIC_KEY_PATH, "
-            "TENSORDOCK_SSH_KEY, or configure [tensordock].public_ssh_key_path."
-        )
-
-    return AppConfig(
-        api_token=api_token,
-        ssh_key=ssh_key,
-        ngc_api_key=env_or_config(config_data, "NGC_API_KEY", "ngc", "api_key"),
-        ssh_private_key_path=env_or_config(
-            config_data, "ISAAC_CLOUD_SSH_PRIVATE_KEY", "ssh", "private_key_path"
-        ),
-        ssh_user=env_or_config(config_data, "ISAAC_CLOUD_SSH_USER", "ssh", "user")
-        or DEFAULT_SSH_USER,
-        default_gpu_class=env_or_config(
-            config_data, "ISAAC_CLOUD_GPU_CLASS", "defaults", "gpu_class"
-        ),
-        default_region=env_or_config(config_data, "ISAAC_CLOUD_REGION", "defaults", "region"),
-        default_vcpu=int_or_default(
-            env_or_config(config_data, "ISAAC_CLOUD_VCPU", "defaults", "vcpu"), 0
-        ),
-        default_ram_gb=int_or_default(
-            env_or_config(config_data, "ISAAC_CLOUD_RAM_GB", "defaults", "ram_gb"), 0
-        ),
-        default_storage_gb=int_or_default(
-            env_or_config(config_data, "ISAAC_CLOUD_STORAGE_GB", "defaults", "storage_gb"), 0
-        ),
-        instance_name_prefix=env_or_config(
-            config_data, "ISAAC_CLOUD_INSTANCE_NAME_PREFIX", "defaults", "instance_name_prefix"
-        )
-        or DEFAULT_INSTANCE_NAME_PREFIX,
-        viewer_enabled=bool_or_default(nested_get(config_data, "viewer", "enabled"), False),
-        viewer_port=int_or_default(
-            env_or_config(config_data, "ISAAC_CLOUD_VIEWER_PORT", "viewer", "port"),
-            DEFAULT_VIEWER_PORT,
-        ),
-        isaac_version=env_or_config(
-            config_data, "ISAAC_CLOUD_ISAAC_VERSION", "defaults", "isaac_version"
-        )
-        or DEFAULT_ISAAC_VERSION,
-        mcp_enabled=bool_or_default(nested_get(config_data, "mcp", "enabled"), False),
-        mcp_repo_url=nested_get(config_data, "mcp", "repo_url") or DEFAULT_MCP_REPO_URL,
-        mcp_extension_port=int_or_default(
-            nested_get(config_data, "mcp", "extension_port"),
-            DEFAULT_MCP_EXTENSION_PORT,
-        ),
-        persistence_enabled=bool_or_default(
-            nested_get(config_data, "persistence", "enabled"),
-            False,
-        ),
-        persistence_provider=str(
-            nested_get(config_data, "persistence", "provider") or DEFAULT_PERSISTENCE_PROVIDER
-        ),
-        persistence_auto_pull_on_launch=bool_or_default(
-            nested_get(config_data, "persistence", "auto_pull_on_launch"),
-            True,
-        ),
-        persistence_auto_push_on_destroy=bool_or_default(
-            nested_get(config_data, "persistence", "auto_push_on_destroy"),
-            True,
-        ),
-        aws_s3_uri=env_or_config(
-            config_data, "ISAAC_CLOUD_S3_URI", "aws", "s3_uri"
-        ),
-        aws_region=env_or_config(
-            config_data, "AWS_REGION", "aws", "region"
-        )
-        or os.getenv("AWS_DEFAULT_REGION"),
-    )
-
-
-def normalize_status(status: str | None) -> str:
-    return (status or "unknown").strip().lower()
-
-
-def parse_location_label(candidate: Candidate) -> str:
-    parts = [candidate.city, candidate.stateprovince, candidate.country]
-    return ", ".join(part for part in parts if part)
-
-
-def format_bool_flag(value: bool) -> str:
-    return "yes" if value else "no"
-
-
-def extract_dict(payload: dict[str, Any], *paths: tuple[str, ...]) -> dict[str, Any]:
-    for path in paths:
-        value = nested_get(payload, *path)
-        if isinstance(value, dict):
-            return value
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        _raise(f"Failed to read config at {path}: {exc}")
     return {}
 
 
-def extract_list(payload: dict[str, Any], *paths: tuple[str, ...]) -> list[Any]:
-    for path in paths:
-        value = nested_get(payload, *path)
-        if isinstance(value, list):
-            return value
-    return []
+def nested_get(data: dict[str, Any], *keys: str) -> Any:
+    node: Any = data
+    for key in keys:
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node
 
 
-def first_truthy(*values: Any) -> Any:
-    for value in values:
-        if value not in (None, "", [], {}):
-            return value
-    return None
-
-
-def extract_instance_id(payload: dict[str, Any]) -> str | None:
-    value = first_truthy(
-        payload.get("id"),
-        payload.get("instance_id"),
-        payload.get("instanceId"),
-        payload.get("server_id"),
-        payload.get("serverId"),
-        payload.get("vm_id"),
-        payload.get("vmId"),
-        nested_get(payload, "attributes", "id"),
-        nested_get(payload, "attributes", "instance_id"),
-        nested_get(payload, "attributes", "instanceId"),
-        nested_get(payload, "attributes", "server_id"),
-        nested_get(payload, "attributes", "serverId"),
-        nested_get(payload, "attributes", "vm_id"),
-        nested_get(payload, "attributes", "vmId"),
-        nested_get(payload, "data", "id"),
-        nested_get(payload, "data", "attributes", "id"),
-        nested_get(payload, "data", "attributes", "instance_id"),
-        nested_get(payload, "data", "attributes", "instanceId"),
-        nested_get(payload, "data", "attributes", "server_id"),
-        nested_get(payload, "data", "attributes", "serverId"),
-        nested_get(payload, "data", "attributes", "vm_id"),
-        nested_get(payload, "data", "attributes", "vmId"),
-        nested_get(payload, "data", "instance", "id"),
-        nested_get(payload, "data", "server", "id"),
-        nested_get(payload, "data", "virtualmachine", "id"),
-    )
+def _bool(value: Any, default: bool) -> bool:
     if value is None:
-        return None
-    return str(value)
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def describe_payload_shape(payload: dict[str, Any]) -> str:
-    keys = sorted(str(key) for key in payload.keys())
-    attributes = payload.get("attributes")
-    data = payload.get("data")
-    parts = [f"top-level keys={keys}"]
-    if isinstance(attributes, dict):
-        parts.append(f"attributes keys={sorted(str(key) for key in attributes.keys())}")
-    if isinstance(data, dict):
-        parts.append(f"data keys={sorted(str(key) for key in data.keys())}")
-        nested_attributes = data.get("attributes")
-        if isinstance(nested_attributes, dict):
-            parts.append(
-                f"data.attributes keys={sorted(str(key) for key in nested_attributes.keys())}"
-            )
-    return "; ".join(parts)
+def load_app_config(config_path: Path | None = None) -> AppConfig:
+    data = load_toml(config_path or DEFAULT_CONFIG_PATH)
+    env = os.environ
 
+    def get(env_name: str, *keys: str) -> Any:
+        return env.get(env_name) or nested_get(data, *keys)
 
-def is_retryable_create_error(message: str) -> bool:
-    normalized = message.lower()
-    retryable_fragments = (
-        "ram per gpu exceeds ratio limit",
-        "virtual machine deployment failed",
-        "out of stock",
-        "insufficient capacity",
-        "not enough capacity",
-        "resource_error",
-    )
-    return any(fragment in normalized for fragment in retryable_fragments)
-
-
-class TensorDockClient:
-    def __init__(self, api_token: str, base_url: str = API_BASE_URL) -> None:
-        self._client = httpx.Client(
-            base_url=base_url,
-            headers={
-                "Authorization": f"Bearer {api_token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            timeout=httpx.Timeout(90.0, connect=10.0),
+    return AppConfig(
+        provider=(get("ISAAC_CLOUD_PROVIDER", "defaults", "provider") or DEFAULT_PROVIDER).lower(),
+        isaac_version=get("ISAAC_CLOUD_ISAAC_VERSION", "defaults", "isaac_version")
+        or DEFAULT_ISAAC_VERSION,
+        instance_name_prefix=get(
+            "ISAAC_CLOUD_INSTANCE_NAME_PREFIX", "defaults", "instance_name_prefix"
         )
-
-    def close(self) -> None:
-        self._client.close()
-
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        response = self._client.request(method, path, **kwargs)
-        response.raise_for_status()
-        if not response.content:
-            return {}
-        payload = response.json()
-        if isinstance(payload, dict):
-            status = payload.get("status")
-            error = first_truthy(
-                payload.get("error"),
-                payload.get("message"),
-                nested_get(payload, "errors", 0, "detail"),
-            )
-            if isinstance(status, int) and status >= 400 and error:
-                _raise(f"TensorDock API rejected {method} {path}: {error}")
-        return payload
-
-    def list_locations(self) -> list[dict[str, Any]]:
-        payload = self._request("GET", "/locations")
-        return extract_list(payload, ("data", "locations"))
-
-    def list_instances(self) -> list[dict[str, Any]]:
-        payload = self._request("GET", "/instances")
-        if isinstance(payload.get("data"), list):
-            return payload["data"]
-        return extract_list(payload, ("data", "instances"), ("data", "attributes", "instances"))
-
-    def get_instance(self, instance_id: str) -> dict[str, Any]:
-        payload = self._request("GET", f"/instances/{instance_id}")
-        if "data" in payload and isinstance(payload["data"], dict):
-            return payload["data"]
-        return payload
-
-    def create_instance(self, attributes: dict[str, Any]) -> dict[str, Any]:
-        payload = self._request(
-            "POST",
-            "/instances",
-            json={"data": {"type": "virtualmachine", "attributes": attributes}},
-        )
-        return extract_dict(payload, ("data",)) or payload
-
-    def start_instance(self, instance_id: str) -> dict[str, Any]:
-        payload = self._request("POST", f"/instances/{instance_id}/start")
-        return extract_dict(payload, ("data",)) or payload
-
-    def stop_instance(self, instance_id: str) -> dict[str, Any]:
-        payload = self._request("POST", f"/instances/{instance_id}/stop")
-        return extract_dict(payload, ("data",)) or payload
-
-    def delete_instance(self, instance_id: str) -> dict[str, Any]:
-        payload = self._request("DELETE", f"/instances/{instance_id}")
-        return extract_dict(payload, ("data",)) or payload
-
-
-def parse_instance_network(instance: dict[str, Any], viewer_port: int) -> InstanceNetwork:
-    port_forwards = first_truthy(
-        instance.get("portForwards"),
-        nested_get(instance, "attributes", "portForwards"),
-        nested_get(instance, "networking", "portForwards"),
-        [],
-    )
-    public_ip = first_truthy(
-        instance.get("ipAddress"),
-        instance.get("public_ip"),
-        instance.get("ip_address"),
-        nested_get(instance, "networking", "public_ip"),
-        nested_get(instance, "attributes", "ipAddress"),
-        nested_get(instance, "attributes", "public_ip"),
-    )
-    ssh_port = None
-    if isinstance(port_forwards, list):
-        for entry in port_forwards:
-            internal_port = entry.get("internal_port") or entry.get("internalPort")
-            if internal_port == 22:
-                ssh_port = entry.get("external_port") or entry.get("externalPort")
-                break
-    if public_ip and ssh_port is None:
-        ssh_port = 22
-    ssh_host = public_ip
-    return InstanceNetwork(
-        public_ip=public_ip,
-        ssh_port=int(ssh_port) if ssh_port not in (None, "") else None,
-        ssh_host=ssh_host,
-        viewer_port=viewer_port,
-        port_forwards=port_forwards if isinstance(port_forwards, list) else [],
-    )
-
-
-def parse_instance_summary(instance: dict[str, Any], viewer_port: int) -> InstanceSummary:
-    attributes = instance.get("attributes", {}) if isinstance(instance.get("attributes"), dict) else {}
-    status = first_truthy(instance.get("status"), attributes.get("status"), "unknown")
-    name = first_truthy(instance.get("name"), attributes.get("name"), "unknown")
-    instance_id = extract_instance_id(instance)
-    if not instance_id:
-        _raise("TensorDock instance response did not include an instance id.")
-    network = parse_instance_network(instance, viewer_port)
-    return InstanceSummary(
-        id=instance_id,
-        name=str(name),
-        status=str(status),
-        public_ip=network.public_ip,
-        ssh_port=network.ssh_port,
-        network=network,
-        raw=instance,
-    )
-
-
-def total_cost(gpu_price_per_hr: float, vcpu: int, ram_gb: int, storage_gb: int, gpu_info: dict[str, Any]) -> float:
-    pricing = gpu_info.get("pricing", {})
-    return (
-        float(gpu_price_per_hr)
-        + vcpu * float(pricing.get("per_vcpu_hr", 0.0))
-        + ram_gb * float(pricing.get("per_gb_ram_hr", 0.0))
-        + storage_gb * float(pricing.get("per_gb_storage_hr", 0.0))
-    )
-
-
-def filter_candidates(
-    locations: list[dict[str, Any]],
-    *,
-    gpu_class: str | None,
-    region: str | None,
-    vcpu: int,
-    ram_gb: int,
-    storage_gb: int,
-) -> list[Candidate]:
-    accepted_gpu_names = GPU_COMPATIBILITY.get(gpu_class) if gpu_class else None
-    if gpu_class and not accepted_gpu_names:
-        _raise(
-            f"Unsupported gpu class '{gpu_class}'. Supported values: "
-            f"{', '.join(sorted(GPU_COMPATIBILITY))}."
-        )
-
-    candidates: list[Candidate] = []
-    region_query = (region or "").strip().lower()
-
-    for location in locations:
-        location_id = str(location.get("id", ""))
-        city = str(location.get("city", ""))
-        stateprovince = str(location.get("stateprovince", ""))
-        country = str(location.get("country", ""))
-        location_blob = " ".join(
-            part for part in (location_id, city, stateprovince, country) if part
-        ).lower()
-
-        if region_query and region_query not in location_blob:
-            continue
-
-        for gpu_info in location.get("gpus", []):
-            gpu_name = str(gpu_info.get("v0Name", ""))
-            if accepted_gpu_names is not None and gpu_name not in accepted_gpu_names:
-                continue
-
-            resources = gpu_info.get("resources", {})
-            if vcpu > 0 and int(resources.get("max_vcpus", 0)) < vcpu:
-                continue
-            if ram_gb > 0 and int(resources.get("max_ram_gb", 0)) < ram_gb:
-                continue
-            required_storage_gb = storage_gb if storage_gb > 0 else MIN_STORAGE_GB
-            if int(resources.get("max_storage_gb", 0)) < required_storage_gb:
-                continue
-            if int(gpu_info.get("max_count", 0)) < 1:
-                continue
-
-            network_features = gpu_info.get("network_features", {})
-            if not bool(network_features.get("dedicated_ip_available")):
-                continue
-            candidate = Candidate(
-                location_id=location_id,
-                city=city,
-                stateprovince=stateprovince,
-                country=country,
-                tier=int(location.get("tier")) if location.get("tier") not in (None, "") else None,
-                gpu_v0_name=gpu_name,
-                gpu_display_name=str(gpu_info.get("displayName", gpu_name)),
-                gpu_count=1,
-                gpu_price_per_hr=float(gpu_info.get("price_per_hr", 0.0)),
-                max_vcpus=int(resources.get("max_vcpus", 0)),
-                max_ram_gb=int(resources.get("max_ram_gb", 0)),
-                max_storage_gb=int(resources.get("max_storage_gb", 0)),
-                per_vcpu_hr=float(gpu_info.get("pricing", {}).get("per_vcpu_hr", 0.0)),
-                per_gb_ram_hr=float(gpu_info.get("pricing", {}).get("per_gb_ram_hr", 0.0)),
-                per_gb_storage_hr=float(gpu_info.get("pricing", {}).get("per_gb_storage_hr", 0.0)),
-                dedicated_ip_available=bool(network_features.get("dedicated_ip_available")),
-                port_forwarding_available=bool(network_features.get("port_forwarding_available")),
-                estimated_hourly_cost=total_cost(
-                    float(gpu_info.get("price_per_hr", 0.0)),
-                    max(vcpu, DEFAULT_AUTO_VCPU),
-                    max(ram_gb, DEFAULT_AUTO_RAM_GB),
-                    max(storage_gb, MIN_STORAGE_GB),
-                    gpu_info,
-                ),
-            )
-            candidates.append(candidate)
-
-    return sorted(
-        candidates,
-        key=lambda candidate: (
-            accepted_gpu_names.index(candidate.gpu_v0_name) if accepted_gpu_names else 0,
-            0 if candidate.dedicated_ip_available else 1,
-            0 if candidate.port_forwarding_available else 1,
-            candidate.estimated_hourly_cost,
-            -(candidate.tier or 0),
-            parse_location_label(candidate),
+        or DEFAULT_INSTANCE_NAME_PREFIX,
+        disk_gb=int(get("ISAAC_CLOUD_DISK_GB", "defaults", "disk_gb") or DEFAULT_DISK_GB),
+        ngc_api_key=get("NGC_API_KEY", "ngc", "api_key"),
+        ssh_private_key_path=get("ISAAC_CLOUD_SSH_PRIVATE_KEY", "ssh", "private_key_path"),
+        ssh_public_key_path=get("ISAAC_CLOUD_SSH_PUBLIC_KEY", "ssh", "public_key_path"),
+        agent_enabled=_bool(nested_get(data, "agent", "enabled"), True),
+        gui_enabled=_bool(nested_get(data, "gui", "enabled"), False),
+        gui_resolution=nested_get(data, "gui", "resolution") or DEFAULT_GUI_RESOLUTION,
+        vast_query=nested_get(data, "vast", "query") or DEFAULT_VAST_QUERY,
+        vast_whole_machine=_bool(
+            nested_get(data, "vast", "whole_machine"), DEFAULT_VAST_WHOLE_MACHINE
         ),
+        vast_min_reliability=float(
+            nested_get(data, "vast", "min_reliability") or DEFAULT_VAST_MIN_RELIABILITY
+        ),
+        aws_region=get("AWS_REGION", "aws", "region") or DEFAULT_AWS_REGION,
+        aws_instance_type=nested_get(data, "aws", "instance_type") or DEFAULT_AWS_INSTANCE_TYPE,
+        aws_ami_ssm_param=nested_get(data, "aws", "ami_ssm_param") or DEFAULT_AWS_AMI_SSM_PARAM,
+        aws_security_group=nested_get(data, "aws", "security_group")
+        or DEFAULT_AWS_SECURITY_GROUP,
+        aws_key_name=nested_get(data, "aws", "key_name") or DEFAULT_AWS_KEY_NAME,
+        persistence_enabled=_bool(nested_get(data, "persistence", "enabled"), False),
+        persistence_s3_uri=nested_get(data, "persistence", "s3_uri")
+        or nested_get(data, "aws", "s3_uri"),
+        persistence_aws_region=nested_get(data, "persistence", "aws_region")
+        or get("AWS_REGION", "aws", "region"),
     )
 
 
-def build_instance_name(prefix: str) -> str:
-    return f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}"
+# ---------------------------------------------------------------------------
+# Instance model shared across providers
+# ---------------------------------------------------------------------------
 
 
-def candidate_matches_gpu_class(candidate: Candidate, gpu_class: str) -> bool:
-    accepted_gpu_names = GPU_COMPATIBILITY.get(gpu_class)
-    if not accepted_gpu_names:
-        return False
-    return candidate.gpu_v0_name in accepted_gpu_names
+@dataclass(frozen=True)
+class SshTarget:
+    host: str
+    port: int
+    user: str
+    # command prefix that places us inside the Isaac container ("" on vast,
+    # "docker exec isaac-sim " semantics handled via wrap_container_command on aws)
+    container_via_docker: bool = False
 
 
-def gpu_class_meets_isaac_minimum(gpu_class: str) -> bool:
-    return gpu_class in ISAAC_MINIMUM_GPU_CLASSES
-
-
-def candidate_meets_isaac_minimum(candidate: Candidate) -> bool:
-    return candidate.gpu_v0_name in ISAAC_MINIMUM_GPU_NAMES
-
-
-def resolve_requested_resources(candidate: Candidate, *, vcpu: int, ram_gb: int, storage_gb: int) -> tuple[int, int, int]:
-    resolved_vcpu = vcpu if vcpu > 0 else min(DEFAULT_AUTO_VCPU, candidate.max_vcpus)
-    resolved_ram_gb = ram_gb if ram_gb > 0 else min(DEFAULT_AUTO_RAM_GB, candidate.max_ram_gb)
-    resolved_storage_gb = storage_gb if storage_gb > 0 else MIN_STORAGE_GB
-
-    if resolved_vcpu <= 0 or resolved_ram_gb <= 0:
-        _raise(
-            f"Selected candidate {candidate.gpu_display_name} does not expose enough CPU or RAM capacity "
-            "to build a default launch request."
-        )
-    if candidate.max_storage_gb < resolved_storage_gb:
-        _raise(
-            f"Selected candidate {candidate.gpu_display_name} cannot satisfy the minimum storage requirement "
-            f"of {resolved_storage_gb} GB."
-        )
-    return resolved_vcpu, resolved_ram_gb, resolved_storage_gb
+@dataclass(frozen=True)
+class InstanceInfo:
+    provider: str
+    instance_id: str
+    status: str
+    label: str
+    ssh: SshTarget | None
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 def shell_quote(value: str) -> str:
-    return "'" + value.replace("'", "'\"'\"'") + "'"
+    return shlex.quote(value)
 
 
 def dedent_script(script: str) -> str:
-    return textwrap.dedent(script).lstrip()
+    return textwrap.dedent(script)
 
 
 def build_isaac_image_ref(version: str) -> str:
     return f"nvcr.io/nvidia/isaac-sim:{version}"
 
 
-def build_persistence_home_root(ssh_user: str) -> str:
-    return f"/home/{ssh_user}/isaac-cloud"
-
-
-def build_persistence_local_path(ssh_user: str) -> str:
-    return f"{build_persistence_home_root(ssh_user)}/project"
-
-
-def build_persistence_remote_uri(config: AppConfig) -> str:
-    if not config.aws_s3_uri:
-        _raise("Missing persistence S3 URI.")
-    normalized = config.aws_s3_uri.strip()
-    if not normalized.startswith("s3://"):
-        _raise("Persistence S3 URI must start with 's3://'.")
-    if normalized == "s3://":
-        _raise("Persistence S3 URI must include a bucket and path.")
-    return normalized if normalized.endswith("/") else normalized + "/"
-
-
-def extract_s3_bucket_name(s3_uri: str) -> str:
-    normalized = s3_uri.removeprefix("s3://")
-    bucket, _, _ = normalized.partition("/")
-    if not bucket:
-        _raise("Persistence S3 URI must include a bucket.")
-    return bucket
-
-
-def build_local_aws_env(config: AppConfig) -> dict[str, str]:
-    env = os.environ.copy()
-    if config.aws_region:
-        env["AWS_REGION"] = config.aws_region
-        env["AWS_DEFAULT_REGION"] = config.aws_region
-    env.setdefault("AWS_PAGER", "")
-    return env
-
-
-def validate_persistence_config(config: AppConfig) -> None:
-    if not config.persistence_enabled:
-        return
-    if config.persistence_provider != DEFAULT_PERSISTENCE_PROVIDER:
-        _raise(
-            f"Unsupported persistence provider '{config.persistence_provider}'. "
-            f"Only '{DEFAULT_PERSISTENCE_PROVIDER}' is supported right now."
-        )
-    build_persistence_remote_uri(config)
-
-
-def ensure_local_aws_cli_ready(config: AppConfig) -> None:
-    validate_persistence_config(config)
-    if shutil.which("aws") is None:
-        _raise(
-            "Persistence with provider 's3' requires the AWS CLI on the local machine. "
-            "Install `aws` and log in before continuing."
-        )
-    if shutil.which("ssh") is None:
-        _raise("Persistence requires the local `ssh` command.")
-    env = build_local_aws_env(config)
-    sts = subprocess.run(
-        ["aws", "sts", "get-caller-identity"],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=env,
-    )
-    if sts.returncode != 0:
-        output = ((sts.stdout or "") + "\n" + (sts.stderr or "")).strip()
-        _raise(
-            "Local AWS authentication is not ready. "
-            "Run your normal AWS login flow, for example `aws sso login`, before launching.\n"
-            f"{output}"
-        )
-    s3_uri = build_persistence_remote_uri(config)
-    prefix_check = subprocess.run(
-        ["aws", "s3", "ls", s3_uri],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=env,
-    )
-    if prefix_check.returncode != 0:
-        output = ((prefix_check.stdout or "") + "\n" + (prefix_check.stderr or "")).strip()
-        bucket = extract_s3_bucket_name(s3_uri)
-        _raise(
-            f"Local AWS authentication is active, but {s3_uri} is not accessible. "
-            f"Check bucket access for {bucket}.\n{output}"
-        )
-
-
-def build_bootstrap_script(config: AppConfig) -> str:
-    if not config.ngc_api_key:
-        _raise("Missing NGC API key. Set NGC_API_KEY before launching Isaac Sim instances.")
-    validate_persistence_config(config)
-
-    isaac_image = build_isaac_image_ref(config.isaac_version)
-    ngc_api_key = shell_quote(config.ngc_api_key)
-    remote_root = shell_quote(DEFAULT_REMOTE_ROOT)
-    runtime_dir = shell_quote(DEFAULT_RUNTIME_DIR)
-    viewer_dir = shell_quote(DEFAULT_VIEWER_APP_DIR)
-    mcp_repo_dir = shell_quote(DEFAULT_MCP_REPO_DIR)
-    app_user = shell_quote(config.ssh_user)
-    viewer_enabled = "1" if config.viewer_enabled else "0"
-    viewer_port = config.viewer_port
-    mcp_enabled = "1" if config.mcp_enabled else "0"
-    mcp_repo_url = shell_quote(config.mcp_repo_url)
-    mcp_extension_port = config.mcp_extension_port
-    persistence_enabled = "1" if config.persistence_enabled else "0"
-    persistence_home_root = shell_quote(build_persistence_home_root(config.ssh_user))
-    persistence_local_path = shell_quote(build_persistence_local_path(config.ssh_user))
-
-    return dedent_script(
-        f"""\
-        #!/usr/bin/env bash
-        set -euxo pipefail
-        exec > >(tee -a /var/log/isaac-cloud-bootstrap.log) 2>&1
-
-        export DEBIAN_FRONTEND=noninteractive
-        export REMOTE_ROOT={remote_root}
-        export RUNTIME_DIR={runtime_dir}
-        export VIEWER_DIR={viewer_dir}
-        export APP_USER={app_user}
-        export ISAAC_SIM_IMAGE={shell_quote(isaac_image)}
-        export VIEWER_ENABLED={viewer_enabled}
-        export WEB_VIEWER_PORT={viewer_port}
-        export MCP_ENABLED={mcp_enabled}
-        export MCP_REPO_DIR={mcp_repo_dir}
-        export MCP_REPO_URL={mcp_repo_url}
-        export ISAACSIM_MCP_EXTENSION_PORT={mcp_extension_port}
-        export PERSISTENCE_ENABLED={persistence_enabled}
-        export PERSISTENCE_HOME_ROOT={persistence_home_root}
-        export PERSISTENCE_LOCAL_PATH={persistence_local_path}
-        export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
-        export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
-
-        wait_for_apt_lock() {{
-            while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-                  fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
-                  fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
-                echo "APT is locked by another process; waiting 10s..."
-                sleep 10
-            done
-        }}
-
-        apt_get_retry() {{
-            local attempt=1
-            local max_attempts=12
-            while true; do
-                wait_for_apt_lock
-                if apt-get "$@"; then
-                    return 0
-                fi
-                if [ "$attempt" -ge "$max_attempts" ]; then
-                    echo "apt-get $* failed after $attempt attempts"
-                    return 1
-                fi
-                attempt=$((attempt + 1))
-                echo "apt-get $* failed; retrying in 10s (attempt $attempt/$max_attempts)..."
-                sleep 10
-            done
-        }}
-
-        retry_command() {{
-            local max_attempts="$1"
-            local delay_seconds="$2"
-            shift 2
-
-            local attempt=1
-            while true; do
-                if "$@"; then
-                    return 0
-                fi
-                if [ "$attempt" -ge "$max_attempts" ]; then
-                    echo "command failed after $attempt attempts: $*"
-                    return 1
-                fi
-                attempt=$((attempt + 1))
-                echo "command failed; retrying in $delay_seconds seconds (attempt $attempt/$max_attempts): $*"
-                sleep "$delay_seconds"
-            done
-        }}
-
-        install_nodejs() {{
-            if command -v node >/dev/null 2>&1; then
-                local node_major
-                node_major="$(node -p 'parseInt(process.versions.node.split(".")[0], 10)' || echo 0)"
-                if [ "${{node_major}}" -ge 20 ]; then
-                    return 0
-                fi
-            fi
-
-            mkdir -p /etc/apt/keyrings
-            curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
-                gpg --batch --yes --dearmor -o /etc/apt/keyrings/nodesource.gpg
-            cat >/etc/apt/sources.list.d/nodesource.list <<'EOF'
-deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main
-EOF
-            apt_get_retry update
-            apt_get_retry install -y nodejs
-        }}
-
-        install_nvidia_host_driver() {{
-            if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-                return 0
-            fi
-
-            apt_get_retry update
-            apt_get_retry install -y nvidia-driver-570
-
-            modprobe nvidia || true
-            modprobe nvidia_uvm || true
-            modprobe nvidia_modeset || true
-            modprobe nvidia_drm || true
-        }}
-
-        apt_get_retry update
-        apt_get_retry install -y ca-certificates curl git gnupg
-
-        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-        sh /tmp/get-docker.sh
-        systemctl enable --now docker
-
-        install_nvidia_host_driver
-
-        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
-            gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-        curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-            sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-            > /etc/apt/sources.list.d/nvidia-container-toolkit.list
-        apt_get_retry update
-        apt_get_retry install -y nvidia-container-toolkit
-        nvidia-ctk runtime configure --runtime=docker
-        systemctl restart docker
-
-        if [ "$VIEWER_ENABLED" = "1" ]; then
-            install_nodejs
-            npm config set "@nvidia:registry" "https://edge.urm.nvidia.com/artifactory/api/npm/omniverse-client-npm/" --location=user
-            if id -u "$APP_USER" >/dev/null 2>&1; then
-                sudo -u "$APP_USER" -H npm config set "@nvidia:registry" "https://edge.urm.nvidia.com/artifactory/api/npm/omniverse-client-npm/" --location=user
-            fi
-        fi
-
-        mkdir -p "$REMOTE_ROOT"
-        if id -u "$APP_USER" >/dev/null 2>&1; then
-            chown -R "$APP_USER:$APP_USER" "$REMOTE_ROOT"
-        fi
-        if [ "$PERSISTENCE_ENABLED" = "1" ]; then
-            mkdir -p "$PERSISTENCE_HOME_ROOT"
-            mkdir -p "$PERSISTENCE_LOCAL_PATH"
-            mkdir -p "{DEFAULT_PERSISTENCE_STATE_DIR}"
-            if id -u "$APP_USER" >/dev/null 2>&1; then
-                chown -R "$APP_USER:$APP_USER" "$PERSISTENCE_HOME_ROOT"
-            fi
-            chmod -R a+rwX "$PERSISTENCE_HOME_ROOT" || true
-        fi
-        if [ "$VIEWER_ENABLED" = "1" ]; then
-            if [ ! -f "$VIEWER_DIR/package.json" ]; then
-                rm -rf "$VIEWER_DIR"
-                sudo -u "$APP_USER" -H env REMOTE_ROOT="$REMOTE_ROOT" VIEWER_DIR="$VIEWER_DIR" bash -lc '
-                    set -euo pipefail
-                    cd "$REMOTE_ROOT"
-                    npx @nvidia/create-ov-web-rtc-app --name "$(basename "$VIEWER_DIR")" --sample local-sample
-                '
-            fi
-        fi
-
-        if [ "$MCP_ENABLED" = "1" ]; then
-            if [ -d "$MCP_REPO_DIR/.git" ]; then
-                sudo -u "$APP_USER" -H env MCP_REPO_DIR="$MCP_REPO_DIR" bash -lc '
-                    set -euo pipefail
-                    cd "$MCP_REPO_DIR"
-                    git checkout main
-                    git pull --ff-only origin main
-                '
-            else
-                rm -rf "$MCP_REPO_DIR"
-                sudo -u "$APP_USER" -H env REMOTE_ROOT="$REMOTE_ROOT" MCP_REPO_DIR="$MCP_REPO_DIR" MCP_REPO_URL="$MCP_REPO_URL" bash -lc '
-                    set -euo pipefail
-                    mkdir -p "$REMOTE_ROOT"
-                    cd "$REMOTE_ROOT"
-                    git clone --depth=1 "$MCP_REPO_URL" "$(basename "$MCP_REPO_DIR")"
-                '
-            fi
-
-            sed -i -E "s/server[.]socket\\s*=\\s*[0-9]+/server.socket = $ISAACSIM_MCP_EXTENSION_PORT/" \
-                "$MCP_REPO_DIR/isaac.sim.mcp_extension/config/extension.toml"
-        fi
-
-        mkdir -p "$RUNTIME_DIR"/cache/main/ov
-        mkdir -p "$RUNTIME_DIR"/cache/main/warp
-        mkdir -p "$RUNTIME_DIR"/cache/computecache
-        mkdir -p "$RUNTIME_DIR"/config
-        mkdir -p "$RUNTIME_DIR"/data/documents
-        mkdir -p "$RUNTIME_DIR"/data/Kit
-        mkdir -p "$RUNTIME_DIR"/logs
-        mkdir -p "$RUNTIME_DIR"/pkg
-        chown -R 1234:1234 "$RUNTIME_DIR"
-
-        docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
-        printf '%s\\n' {ngc_api_key} | docker login nvcr.io --username '$oauthtoken' --password-stdin
-        retry_command 3 10 docker pull "$ISAAC_SIM_IMAGE"
-
-        if [ "$VIEWER_ENABLED" = "1" ]; then
-            sudo -u "$APP_USER" -H env VIEWER_DIR="$VIEWER_DIR" bash -lc '
-                set -euo pipefail
-                cd "$VIEWER_DIR"
-                perl -0pi -e "s/signalingServer: '\\''127[.]0[.]0[.]1'\\'',/signalingServer: window.location.hostname,\\n            signalingPort: {DEFAULT_ISAAC_SIGNAL_PORT},/" src/main.ts
-                npm install
-                npm run build
-            '
-        fi
-
-        systemctl enable isaac-cloud-isaac.service
-        systemctl restart isaac-cloud-isaac.service
-        if [ "$VIEWER_ENABLED" = "1" ]; then
-            systemctl enable isaac-cloud-viewer.service
-            systemctl restart isaac-cloud-viewer.service
-        fi
-        """
-    )
-
-
-def build_isaac_runtime_script(config: AppConfig) -> str:
-    mcp_mount_args = ""
-    mcp_launch_args = ""
-    persistence_mount_args = ""
-    if config.mcp_enabled:
-        mcp_mount_args = (
-            f' \\\n            -v "{DEFAULT_MCP_REPO_DIR}:/isaac-sim-mcp:ro"'
-        )
-        mcp_launch_args = (
-            f" --ext-folder /isaac-sim-mcp --enable isaac.sim.mcp_extension"
-        )
-    if config.persistence_enabled:
-        persistence_mount_args = (
-            f' \\\n            -v "{build_persistence_local_path(config.ssh_user)}:{DEFAULT_PERSISTENCE_CONTAINER_DIR}:rw"'
-        )
-
-    return dedent_script(
-        f"""\
-        #!/usr/bin/env bash
-        set -euxo pipefail
-        exec > >(tee -a /var/log/isaac-cloud-isaac.log) 2>&1
-
-        export RUNTIME_DIR={shell_quote(DEFAULT_RUNTIME_DIR)}
-        export ISAAC_SIM_IMAGE={shell_quote(build_isaac_image_ref(config.isaac_version))}
-        export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
-        export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
-
-        detect_primary_ipv4() {{
-            local candidate=""
-            candidate="$(
-                ip -o route get 1.1.1.1 2>/dev/null \
-                | awk '{{for (i = 1; i <= NF; ++i) if ($i == "src") {{print $(i + 1); exit}}}}'
-            )"
-            if [[ "$candidate" =~ ^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$ ]]; then
-                printf '%s\n' "$candidate"
-                return 0
-            fi
-
-            candidate="$(
-                hostname -I 2>/dev/null \
-                | tr ' ' '\n' \
-                | grep -E '^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$' \
-                | grep -v '^127[.]' \
-                | grep -v '^172[.]17[.]' \
-                | head -n 1
-            )"
-            if [[ "$candidate" =~ ^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$ ]]; then
-                printf '%s\n' "$candidate"
-                return 0
-            fi
-
-            return 1
-        }}
-
-        PUBLIC_IP="$(detect_primary_ipv4)"
-        export PUBLIC_IP
-
-        docker rm -f isaac-sim >/dev/null 2>&1 || true
-        exec docker run --name isaac-sim --entrypoint bash --gpus all --rm --network=host \
-            -e "ACCEPT_EULA=Y" \
-            -e "PRIVACY_CONSENT=Y" \
-            -v "$RUNTIME_DIR/cache/main:/isaac-sim/.cache:rw" \
-            -v "$RUNTIME_DIR/cache/computecache:/isaac-sim/.nv/ComputeCache:rw" \
-            -v "$RUNTIME_DIR/logs:/isaac-sim/.nvidia-omniverse/logs:rw" \
-            -v "$RUNTIME_DIR/config:/isaac-sim/.nvidia-omniverse/config:rw" \
-            -v "$RUNTIME_DIR/data:/isaac-sim/.local/share/ov/data:rw" \
-            -v "$RUNTIME_DIR/pkg:/isaac-sim/.local/share/ov/pkg:rw" \
-            -v "$RUNTIME_DIR/data/Kit:/isaac-sim/.local/share/ov/data/Kit:rw"{mcp_mount_args}{persistence_mount_args} \
-            -u 1234:1234 \
-            "$ISAAC_SIM_IMAGE" \
-            -lc "/isaac-sim/isaac-sim.streaming.sh --merge-config=/isaac-sim/config/open_endpoint.toml --allow-root -v --/exts/omni.kit.livestream.app/primaryStream/publicIp=$PUBLIC_IP --/exts/omni.kit.livestream.app/primaryStream/signalPort=$ISAACSIM_SIGNAL_PORT --/exts/omni.kit.livestream.app/primaryStream/streamPort=$ISAACSIM_STREAM_PORT{mcp_launch_args}"
-        """
-    )
-
-
-def build_viewer_runtime_script(config: AppConfig) -> str:
-    return dedent_script(
-        f"""\
-        #!/usr/bin/env bash
-        set -euxo pipefail
-        exec > >(tee -a /var/log/isaac-cloud-viewer.log) 2>&1
-
-        export VIEWER_DIR={shell_quote(DEFAULT_VIEWER_APP_DIR)}
-        export WEB_VIEWER_PORT={config.viewer_port}
-        cd "$VIEWER_DIR"
-        exec npx vite preview --host 0.0.0.0 --port "$WEB_VIEWER_PORT"
-        """
-    )
-
-
-def build_persistence_env_file(config: AppConfig) -> str:
-    validate_persistence_config(config)
-    lines = [
-        f"PERSISTENCE_ENABLED={'1' if config.persistence_enabled else '0'}",
-        f"PERSISTENCE_PROVIDER={DEFAULT_PERSISTENCE_PROVIDER}",
-        f"PERSISTENCE_S3_URI={build_persistence_remote_uri(config)}",
-        f"PERSISTENCE_LOCAL_PATH={build_persistence_local_path(config.ssh_user)}",
-        f"PERSISTENCE_HOME_ROOT={build_persistence_home_root(config.ssh_user)}",
-        f"PERSISTENCE_MANIFEST_PATH={DEFAULT_PERSISTENCE_MANIFEST_PATH}",
-        f"PERSISTENCE_APP_USER={config.ssh_user}",
-    ]
-    return "".join(f"{line}\n" for line in lines)
-
-
-def build_persistence_sync_script() -> str:
-    return dedent_script(
-        f"""\
-        #!/usr/bin/env bash
-        set -euo pipefail
-
-        ENV_FILE=/etc/isaac-cloud-persistence.env
-        if [ ! -f "$ENV_FILE" ]; then
-            echo '{{"enabled": false, "error": "missing env file"}}'
-            exit 1
-        fi
-        # shellcheck disable=SC1090
-        source "$ENV_FILE"
-
-        action="${{1:-}}"
-        if [ -z "$action" ]; then
-            echo "usage: isaac-cloud-sync <status|record>" >&2
-            exit 1
-        fi
-
-        write_manifest() {{
-            local action_name="$1"
-            local status_value="$2"
-            local error_value="${{3:-}}"
-            python3 - "$PERSISTENCE_MANIFEST_PATH" "$action_name" "$status_value" "$error_value" \
-                "$PERSISTENCE_PROVIDER" "$PERSISTENCE_S3_URI" "$PERSISTENCE_LOCAL_PATH" <<'PY'
-import json, os, sys
-from datetime import datetime, timezone
-
-path, action, status, error, provider, remote_uri, local_path = sys.argv[1:8]
-data = {{}}
-if os.path.exists(path):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        data = {{}}
-data["enabled"] = True
-data["provider"] = provider
-data["remote_uri"] = remote_uri
-data["local_path"] = local_path
-data["host"] = os.uname().nodename
-data[f"last_{{action}}_at"] = datetime.now(timezone.utc).isoformat()
-data[f"last_{{action}}_status"] = status
-data[f"last_{{action}}_error"] = error or None
-os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2, sort_keys=True)
-    fh.write("\\n")
-PY
-        }}
-
-        print_status() {{
-            if [ -f "$PERSISTENCE_MANIFEST_PATH" ]; then
-                cat "$PERSISTENCE_MANIFEST_PATH"
-                return 0
-            fi
-            python3 - "$PERSISTENCE_S3_URI" "$PERSISTENCE_LOCAL_PATH" <<'PY'
-import json, sys
-remote_uri, local_path = sys.argv[1:3]
-print(json.dumps({{
-    "enabled": True,
-    "provider": "{DEFAULT_PERSISTENCE_PROVIDER}",
-    "remote_uri": remote_uri,
-    "local_path": local_path,
-    "last_pull_status": "never",
-    "last_push_status": "never",
-}}, indent=2, sort_keys=True))
-PY
-        }}
-
-        if [ "${{PERSISTENCE_ENABLED:-0}}" != "1" ]; then
-            if [ "$action" = "status" ]; then
-                echo '{{"enabled": false}}'
-                exit 0
-            fi
-            echo "persistence is disabled" >&2
-            exit 1
-        fi
-
-        mkdir -p "$PERSISTENCE_HOME_ROOT" "$PERSISTENCE_LOCAL_PATH" "{DEFAULT_PERSISTENCE_STATE_DIR}"
-        if id -u "$PERSISTENCE_APP_USER" >/dev/null 2>&1; then
-            chown -R "$PERSISTENCE_APP_USER:$PERSISTENCE_APP_USER" "$PERSISTENCE_HOME_ROOT" || true
-        fi
-        chmod -R a+rwX "$PERSISTENCE_HOME_ROOT" || true
-
-        case "$action" in
-            status)
-                print_status
-                ;;
-            record)
-                action_name="${{2:-}}"
-                status_value="${{3:-}}"
-                error_value="${{4:-}}"
-                if [ -z "$action_name" ] || [ -z "$status_value" ]; then
-                    echo "usage: isaac-cloud-sync record <pull|push> <success|failed> [error]" >&2
-                    exit 1
-                fi
-                if [ "$action_name" != "pull" ] && [ "$action_name" != "push" ]; then
-                    echo "unsupported record action: $action_name" >&2
-                    exit 1
-                fi
-                if [ "$status_value" != "success" ] && [ "$status_value" != "failed" ]; then
-                    echo "unsupported record status: $status_value" >&2
-                    exit 1
-                fi
-                write_manifest "$action_name" "$status_value" "$error_value"
-                if id -u "$PERSISTENCE_APP_USER" >/dev/null 2>&1; then
-                    chown -R "$PERSISTENCE_APP_USER:$PERSISTENCE_APP_USER" "$PERSISTENCE_HOME_ROOT" || true
-                fi
-                chmod -R a+rwX "$PERSISTENCE_HOME_ROOT" || true
-                print_status
-                ;;
-            *)
-                echo "unsupported action: $action" >&2
-                exit 1
-                ;;
-        esac
-        """
-    )
-
-
-def build_isaac_systemd_unit(config: AppConfig) -> str:
-    return textwrap.dedent(
-        f"""\
-        [Unit]
-        Description=Run NVIDIA Isaac Sim headless streaming container
-        Wants=network-online.target docker.service
-        After=network-online.target docker.service
-
-        [Service]
-        Type=simple
-        ExecStart=/usr/local/bin/isaac-cloud-run-isaac
-        ExecStop=/usr/bin/docker stop isaac-sim
-        Restart=always
-        RestartSec=10
-        TimeoutStartSec=1800
-
-        [Install]
-        WantedBy=multi-user.target
-        """
-    )
-
-
-def build_viewer_systemd_unit() -> str:
-    return textwrap.dedent(
-        """\
-        [Unit]
-        Description=Run NVIDIA Omniverse Web SDK viewer for Isaac Sim
-        Wants=network-online.target isaac-cloud-isaac.service
-        After=network-online.target isaac-cloud-isaac.service
-
-        [Service]
-        Type=simple
-        ExecStart=/usr/local/bin/isaac-cloud-run-viewer
-        Restart=always
-        RestartSec=10
-        TimeoutStartSec=1800
-
-        [Install]
-        WantedBy=multi-user.target
-        """
-    )
-
-
-def build_cloud_init(config: AppConfig) -> dict[str, Any]:
-    write_files = [
-        {
-            "path": "/usr/local/bin/isaac-cloud-bootstrap",
-            "content": build_bootstrap_script(config),
-            "owner": "root:root",
-            "permissions": "0755",
-        },
-        {
-            "path": "/usr/local/bin/isaac-cloud-run-isaac",
-            "content": build_isaac_runtime_script(config),
-            "owner": "root:root",
-            "permissions": "0755",
-        },
-        {
-            "path": "/etc/systemd/system/isaac-cloud-isaac.service",
-            "content": build_isaac_systemd_unit(config),
-            "owner": "root:root",
-            "permissions": "0644",
-        },
-    ]
-    if config.viewer_enabled:
-        write_files.extend(
-            [
-                {
-                    "path": "/usr/local/bin/isaac-cloud-run-viewer",
-                    "content": build_viewer_runtime_script(config),
-                    "owner": "root:root",
-                    "permissions": "0755",
-                },
-                {
-                    "path": "/etc/systemd/system/isaac-cloud-viewer.service",
-                    "content": build_viewer_systemd_unit(),
-                    "owner": "root:root",
-                    "permissions": "0644",
-                },
-            ]
-        )
-    if config.persistence_enabled:
-        write_files.extend(
-            [
-                {
-                    "path": "/etc/isaac-cloud-persistence.env",
-                    "content": build_persistence_env_file(config),
-                    "owner": "root:root",
-                    "permissions": "0600",
-                },
-                {
-                    "path": "/usr/local/bin/isaac-cloud-sync",
-                    "content": build_persistence_sync_script(),
-                    "owner": "root:root",
-                    "permissions": "0755",
-                },
-            ]
-        )
-    write_files.append(
-        {
-            "path": "/usr/local/bin/isaac-cloud-debug-report",
-            "content": textwrap.dedent(
-                """\
-                #!/usr/bin/env bash
-                set -euo pipefail
-
-                echo "== cloud-init status =="
-                cloud-init status --long || true
-                echo
-
-                echo "== cloud-init-output.log =="
-                tail -n 200 /var/log/cloud-init-output.log || true
-                echo
-
-                echo "== isaac-cloud-bootstrap.log =="
-                tail -n 200 /var/log/isaac-cloud-bootstrap.log || true
-                echo
-
-                echo "== isaac-cloud-isaac service =="
-                systemctl status isaac-cloud-isaac.service --no-pager || true
-                echo
-
-                echo "== isaac-cloud-isaac journal =="
-                journalctl -u isaac-cloud-isaac.service --no-pager -n 200 || true
-                echo
-
-                echo "== isaac-cloud-isaac.log =="
-                tail -n 200 /var/log/isaac-cloud-isaac.log || true
-                echo
-
-                echo "== isaac-cloud-viewer service =="
-                systemctl status isaac-cloud-viewer.service --no-pager || true
-                echo
-
-                echo "== isaac-cloud-viewer journal =="
-                journalctl -u isaac-cloud-viewer.service --no-pager -n 200 || true
-                echo
-
-                echo "== isaac-cloud-viewer.log =="
-                tail -n 200 /var/log/isaac-cloud-viewer.log || true
-                echo
-
-                echo "== persistence status =="
-                if [ -x /usr/local/bin/isaac-cloud-sync ]; then
-                    /usr/local/bin/isaac-cloud-sync status || true
-                else
-                    echo "persistence helper not installed"
-                fi
-                echo
-                """
-            ),
-            "owner": "root:root",
-            "permissions": "0755",
-        }
-    )
-    return {
-        "package_update": True,
-        "packages": ["ca-certificates", "curl", "gnupg"],
-        "output": {"all": "| tee -a /var/log/cloud-init-output.log"},
-        "final_message": "isaac-cloud cloud-init completed after $UPTIME seconds",
-        "write_files": write_files,
-        "runcmd": [
-            "systemctl daemon-reload",
-            "bash -lc /usr/local/bin/isaac-cloud-bootstrap",
-        ],
-    }
-
-
-def build_launch_payload(
-    *,
-    config: AppConfig,
-    candidate: Candidate,
-    instance_name: str,
-    ssh_key: str,
-    vcpu: int,
-    ram_gb: int,
-    storage_gb: int,
-) -> dict[str, Any]:
-    return {
-        "name": instance_name,
-        "type": "virtualmachine",
-        "image": DEFAULT_IMAGE,
-        "resources": {
-            "vcpu_count": vcpu,
-            "ram_gb": ram_gb,
-            "storage_gb": storage_gb,
-            "gpus": {candidate.gpu_v0_name: {"count": candidate.gpu_count}},
-        },
-        "location_id": candidate.location_id,
-        "useDedicatedIp": candidate.dedicated_ip_available,
-        "ssh_key": ssh_key,
-        "cloud_init": build_cloud_init(config),
-    }
-
-
-def wait_for_instance_state(
-    client: TensorDockClient,
-    instance_id: str,
-    *,
-    viewer_port: int,
-    target_states: set[str],
-    timeout_seconds: int,
-    poll_interval_seconds: int,
-) -> InstanceSummary:
-    deadline = time.time() + timeout_seconds
-    last_summary: InstanceSummary | None = None
-
-    while time.time() < deadline:
-        summary = parse_instance_summary(client.get_instance(instance_id), viewer_port)
-        last_summary = summary
-        if normalize_status(summary.status) in target_states:
-            return summary
-        time.sleep(poll_interval_seconds)
-
-    if last_summary is None:
-        _raise("Timed out before receiving any instance state from TensorDock.")
-
-    _raise(
-        f"Timed out waiting for instance {instance_id} to reach "
-        f"{', '.join(sorted(target_states))}. Last status was '{last_summary.status}'."
-    )
-
-
-def check_tcp_connectivity(host: str, port: int, timeout_seconds: float) -> bool:
+def check_tcp_connectivity(host: str, port: int, timeout_seconds: float = 5.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout_seconds):
             return True
@@ -1508,931 +231,810 @@ def check_tcp_connectivity(host: str, port: int, timeout_seconds: float) -> bool
         return False
 
 
-def wait_for_ssh(host: str, port: int, *, timeout_seconds: int, poll_interval_seconds: int) -> bool:
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        if check_tcp_connectivity(host, port, timeout_seconds=5.0):
-            return True
-        time.sleep(poll_interval_seconds)
-    return False
+# ---------------------------------------------------------------------------
+# SSH plumbing
+# ---------------------------------------------------------------------------
 
 
-def format_ssh_target(config: AppConfig, summary: InstanceSummary) -> str:
-    if not summary.network.ssh_host:
-        _raise("Instance does not have a public IP yet, so an SSH target cannot be built.")
-    port_flag = ""
-    if summary.network.ssh_port and summary.network.ssh_port != 22:
-        port_flag = f" -p {summary.network.ssh_port}"
-    key_flag = ""
-    if config.ssh_private_key_path:
-        key_flag = f" -i {config.ssh_private_key_path}"
-    return f"ssh{key_flag}{port_flag} {config.ssh_user}@{summary.network.ssh_host}"
-
-
-def build_ssh_command(config: AppConfig, summary: InstanceSummary, remote_command: str) -> list[str]:
-    if not summary.network.ssh_host:
-        _raise("Instance does not have a public IP yet, so SSH inspection is unavailable.")
-    if not config.ssh_private_key_path:
-        _raise(
-            "Verbose status requires ssh.private_key_path or ISAAC_CLOUD_SSH_PRIVATE_KEY to be set."
-        )
-    command = [
+def ssh_base_args(config: AppConfig, target: SshTarget) -> list[str]:
+    args = [
         "ssh",
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
         "UserKnownHostsFile=/dev/null",
         "-o",
-        "GlobalKnownHostsFile=/dev/null",
-        "-o",
         "LogLevel=ERROR",
         "-o",
-        "ConnectTimeout=10",
-        "-i",
-        config.ssh_private_key_path,
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-p",
+        str(target.port),
     ]
-    if summary.network.ssh_port and summary.network.ssh_port != 22:
-        command.extend(["-p", str(summary.network.ssh_port)])
-    command.append(f"{config.ssh_user}@{summary.network.ssh_host}")
-    command.append(remote_command)
-    return command
+    if config.ssh_private_key_path:
+        args += ["-i", config.ssh_private_key_path]
+    args.append(f"{target.user}@{target.host}")
+    return args
 
 
-def run_remote_command(
+def wrap_container_command(target: SshTarget, command: str) -> str:
+    """Return a shell command that runs `command` inside the Isaac container."""
+    if not target.container_via_docker:
+        return command
+    return f"sudo docker exec isaac-sim bash -c {shell_quote(command)}"
+
+
+def run_ssh(
     config: AppConfig,
-    summary: InstanceSummary,
-    remote_command: str,
+    target: SshTarget,
+    command: str,
     *,
-    timeout_seconds: int = 30,
-) -> tuple[int, str]:
+    in_container: bool = False,
+    timeout_seconds: int = 120,
+    check: bool = True,
+) -> str:
+    if in_container:
+        command = wrap_container_command(target, command)
     completed = subprocess.run(
-        build_ssh_command(config, summary, remote_command),
+        ssh_base_args(config, target) + [command],
         capture_output=True,
         text=True,
-        timeout=timeout_seconds,
         check=False,
+        timeout=timeout_seconds,
     )
-    output = (completed.stdout or "").strip()
-    stderr = (completed.stderr or "").strip()
-    if stderr:
-        output = f"{output}\n{stderr}".strip()
-    return completed.returncode, output
+    output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
+    if check and completed.returncode != 0:
+        _raise(f"SSH command failed ({completed.returncode}): {output[:800]}")
+    return (completed.stdout or "").strip()
 
 
-def fetch_remote_persistence_status(
+def run_ssh_script(
     config: AppConfig,
-    summary: InstanceSummary,
-) -> PersistenceStatus | None:
-    if not summary.network.ssh_host or not summary.network.ssh_port:
-        return None
-    if not check_tcp_connectivity(summary.network.ssh_host, summary.network.ssh_port, timeout_seconds=5.0):
-        return None
+    target: SshTarget,
+    script: str,
+    *,
+    in_container: bool = False,
+    timeout_seconds: int = 600,
+) -> str:
+    command = "bash -s"
+    if in_container:
+        command = wrap_container_command(target, command)
+    completed = subprocess.run(
+        ssh_base_args(config, target) + [command],
+        input=script,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout_seconds,
+    )
+    output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
+    if completed.returncode != 0:
+        _raise(f"Remote script failed ({completed.returncode}): {output[:1200]}")
+    return (completed.stdout or "").strip()
+
+
+SERVICE_PORTS: list[tuple[int, str]] = [
+    (DEFAULT_AGENT_CONTROL_PORT, "agent control"),
+    (DEFAULT_RTSP_PORT, "rtsp cameras"),
+    (DEFAULT_NOVNC_PORT, "gui (noVNC)"),
+]
+
+
+def probe_local_tunnel(timeout_seconds: float = 5.0) -> str:
+    """End-to-end health of a local tunnel, zombie-aware.
+
+    A dead ssh forward can still accept() locally, so port-open checks lie.
+    The agent socket gives a true round trip: send a no-op, expect JSON back.
+    """
     try:
-        returncode, output = run_remote_command(
-            config,
-            summary,
-            "sudo /usr/local/bin/isaac-cloud-sync status 2>/dev/null || true",
-            timeout_seconds=30,
+        sock = socket.create_connection(("127.0.0.1", DEFAULT_AGENT_CONTROL_PORT), timeout=2.0)
+    except OSError:
+        return "tunnel: not running locally (start one with: isaac_cloud.py tunnel)"
+    try:
+        sock.settimeout(timeout_seconds)
+        sock.sendall(b"pass")
+        sock.shutdown(socket.SHUT_WR)
+        response = b""
+        while chunk := sock.recv(1024):
+            response += chunk
+        if b'"status"' in response:
+            return "tunnel: healthy (agent socket answered end-to-end)"
+        return "tunnel: local port open but no agent response (service down?)"
+    except socket.timeout:
+        return "tunnel: ZOMBIE - local port accepts but nothing comes back; restart the tunnel"
+    except OSError:
+        return "tunnel: local port open but connection resets (remote service down or tunnel broken)"
+    finally:
+        sock.close()
+
+
+def run_supervised_tunnel(config: AppConfig, provider, instance_id: str) -> None:
+    """Foreground self-healing tunnel: keepalives kill zombies within ~30s,
+    then we reconnect with backoff, re-resolving the instance address in case
+    it changed across a stop/start. Ctrl-C exits."""
+    forwards = [(port, port) for port, _ in SERVICE_PORTS]
+    drops = 0
+    backoff = 3
+    while True:
+        info = provider.get(instance_id)
+        if info.status != "running" or not info.ssh:
+            typer.echo(f"Instance is {info.status}; waiting 15s for it to be reachable...")
+            time.sleep(15)
+            continue
+        target = info.ssh
+        if drops == 0:
+            typer.echo(f"Tunnel to {info.provider}:{instance_id} ({target.host}:{target.port}):")
+            for port, label in SERVICE_PORTS:
+                suffix = "/vnc.html (browser)" if port == DEFAULT_NOVNC_PORT else ""
+                typer.echo(f"  {label:14s} -> localhost:{port}{suffix}")
+            typer.echo("Ctrl-C to stop.")
+        args = ssh_base_args(config, target)
+        args[1:1] = [
+            "-N",
+            "-o",
+            "ServerAliveInterval=10",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "ExitOnForwardFailure=yes",
+        ]
+        for local_port, remote_port in forwards:
+            args[1:1] = ["-L", f"{local_port}:127.0.0.1:{remote_port}"]
+        started = time.time()
+        try:
+            completed = subprocess.run(args, check=False)
+        except KeyboardInterrupt:
+            typer.echo("\nTunnel stopped.")
+            return
+        if completed.returncode == 130:  # ssh took the SIGINT before we did
+            typer.echo("Tunnel stopped.")
+            return
+        held = time.time() - started
+        drops += 1
+        backoff = 3 if held > 60 else min(backoff * 2, 30)
+        typer.echo(
+            f"Tunnel dropped (exit {completed.returncode}, held {held:.0f}s, drop #{drops}); "
+            f"reconnecting in {backoff}s..."
         )
-    except (IsaacCloudError, subprocess.TimeoutExpired):
-        return None
-    if returncode != 0 or not output:
-        return None
+        try:
+            time.sleep(backoff)
+        except KeyboardInterrupt:
+            typer.echo("\nTunnel stopped.")
+            return
+
+
+def format_tunnel_command(config: AppConfig, target: SshTarget, forwards: list[tuple[int, int]]) -> str:
+    key_flag = f" -i {config.ssh_private_key_path}" if config.ssh_private_key_path else ""
+    fw = " ".join(f"-L {lp}:127.0.0.1:{rp}" for lp, rp in forwards)
+    return (
+        f"ssh{key_flag} -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -N "
+        f"{fw} -p {target.port} {target.user}@{target.host}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Container-side setup scripts (validated in VAST_EXPERIMENT_RESULTS.md and
+# GUI_TUNNEL_EXPERIMENT_PLAN.md; identical inside the Isaac image on every
+# provider).
+# ---------------------------------------------------------------------------
+
+
+def build_isaac_container_launch_script(config: AppConfig) -> str:
+    """Launch headless streaming Isaac inside the container.
+
+    Handles the two container quirks found on Vast hosts: env vars must be
+    exported in-shell, and a minority of hosts inject compute-only NVIDIA
+    libraries (no Vulkan/GLX/NVENC), which we fix by side-loading the exact
+    driver-matched userland libs from the Ubuntu archive.
+    """
+    agent_flag = " --enable isaacsim.code_editor.python_server" if config.agent_enabled else ""
+    return dedent_script(
+        f"""\
+        #!/bin/bash
+        set -x
+        export ACCEPT_EULA=Y PRIVACY_CONSENT=Y OMNI_KIT_ALLOW_ROOT=1
+        export ISAACSIM_HOST=127.0.0.1
+        export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
+        export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
+
+        # Side-load Vulkan/GLX/NVENC userland libs when the host runtime only
+        # injected compute libraries. Version must match the host kernel driver.
+        if ! ls /usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0 >/dev/null 2>&1; then
+            DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d " ")
+            MAJOR=${{DRIVER%%.*}}
+            apt-get update -qq >/dev/null 2>&1
+            cd /tmp && apt-get download -qq \\
+                libnvidia-gl-$MAJOR libnvidia-encode-$MAJOR libnvidia-decode-$MAJOR 2>/dev/null
+            mkdir -p /opt/nvgl
+            for deb in libnvidia-*-$MAJOR*.deb; do dpkg -x "$deb" /opt/nvgl; done
+            LIBDIR=/opt/nvgl/usr/lib/x86_64-linux-gnu
+            printf '{{"file_format_version":"1.0.0","ICD":{{"library_path":"%s/libGLX_nvidia.so.0","api_version":"1.3.194"}}}}' "$LIBDIR" > /opt/nvgl/icd.json
+            export VK_DRIVER_FILES=/opt/nvgl/icd.json VK_ICD_FILENAMES=/opt/nvgl/icd.json
+            export LD_LIBRARY_PATH=$LIBDIR
+            echo "$LIBDIR" > /etc/ld.so.conf.d/zz-nvgl.conf && ldconfig
+        fi
+
+        pkill -f "[k]it/kit" 2>/dev/null; sleep 2
+        nohup /isaac-sim/runheadless.sh -v{agent_flag} > /root/isaac.log 2>&1 &
+        echo LAUNCHED
+        """
+    )
+
+
+def build_gui_setup_script(config: AppConfig) -> str:
+    """noVNC GUI stack: Isaac GUI -> Xvfb -> x11vnc -> websockify, one TCP port.
+
+    Community-validated approach for TCP-only access (works regardless of the
+    NVENC lottery on fractional hosts).
+    """
+    agent_flag = " --enable isaacsim.code_editor.python_server" if config.agent_enabled else ""
+    return dedent_script(
+        f"""\
+        #!/bin/bash
+        set -x
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y -qq xvfb x11vnc novnc websockify >/dev/null 2>&1
+
+        pkill -f "Xvf[b] :1" 2>/dev/null; pkill -f "x11vn[c]" 2>/dev/null
+        pkill -f "[k]it/kit" 2>/dev/null; sleep 2
+        setsid Xvfb :1 -screen 0 {config.gui_resolution}x24 </dev/null >/var/log/xvfb.log 2>&1 &
+        sleep 2
+        setsid x11vnc -display :1 -localhost -forever -shared -nopw -rfbport 5901 </dev/null >/var/log/x11vnc.log 2>&1 &
+        sleep 1
+        pgrep -f "websockif[y]" >/dev/null || setsid websockify --web /usr/share/novnc 127.0.0.1:{DEFAULT_NOVNC_PORT} localhost:5901 </dev/null >/var/log/websockify.log 2>&1 &
+        sleep 1
+
+        export ACCEPT_EULA=Y PRIVACY_CONSENT=Y OMNI_KIT_ALLOW_ROOT=1 DISPLAY=:1
+        nohup /isaac-sim/isaac-sim.sh --allow-root{agent_flag} > /root/isaac_gui.log 2>&1 &
+        echo GUI_LAUNCHED
+        for p in 5901 {DEFAULT_NOVNC_PORT}; do
+            (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null && echo "port $p: open" || echo "port $p: closed"
+        done
+        """
+    )
+
+
+def build_container_probe_script() -> str:
+    """Report readiness of everything we care about inside the container."""
+    return dedent_script(
+        f"""\
+        #!/bin/bash
+        echo "gpu: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1)"
+        echo "gpu_minor: $(nvidia-smi -q 2>/dev/null | grep -i 'Minor Number' | awk '{{print $NF}}' | head -1)"
+        echo "kit_procs: $(pgrep -c '[k]it' 2>/dev/null || echo 0)"
+        for log in /root/isaac.log /root/isaac_gui.log; do
+            if [ -f "$log" ]; then
+                grep -qm1 -E "Streaming App is loaded|app ready" "$log" && echo "$(basename $log): ready" || echo "$(basename $log): loading"
+            fi
+        done
+        for p in {DEFAULT_AGENT_CONTROL_PORT} {DEFAULT_ISAAC_SIGNAL_PORT} {DEFAULT_RTSP_PORT} {DEFAULT_NOVNC_PORT}; do
+            (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null && echo "port $p: open" || echo "port $p: closed"
+        done
+        """
+    )
+
+
+# ---------------------------------------------------------------------------
+# Vast.ai provider
+# ---------------------------------------------------------------------------
+
+
+def _vastai_bin() -> str:
+    found = shutil.which("vastai") or shutil.which(
+        str(Path.home() / ".local" / "bin" / "vastai")
+    )
+    if not found:
+        candidate = Path.home() / ".local" / "bin" / "vastai"
+        if candidate.exists():
+            return str(candidate)
+        _raise("vastai CLI not found. Install with: uv tool install vastai; then: vastai set api-key <KEY>")
+    return found
+
+
+def run_vastai_json(args: list[str], *, timeout_seconds: int = 60) -> Any:
+    completed = subprocess.run(
+        [_vastai_bin(), *args, "--raw"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout_seconds,
+    )
+    if completed.returncode != 0:
+        _raise(f"vastai {' '.join(args[:2])} failed: {(completed.stderr or completed.stdout)[:500]}")
     try:
-        payload = json.loads(output)
+        return json.loads(completed.stdout)
     except json.JSONDecodeError:
-        return None
-    return PersistenceStatus(
-        enabled=bool(payload.get("enabled")),
-        provider=payload.get("provider"),
-        remote_uri=payload.get("remote_uri"),
-        local_path=payload.get("local_path"),
-        last_pull_at=payload.get("last_pull_at"),
-        last_pull_status=payload.get("last_pull_status"),
-        last_push_at=payload.get("last_push_at"),
-        last_push_status=payload.get("last_push_status"),
-        last_push_error=payload.get("last_push_error"),
-    )
+        _raise(f"vastai returned non-JSON output: {completed.stdout[:300]}")
 
 
-def build_persistence_record_command(action: str, status: str, error: str = "") -> str:
-    if action not in {"pull", "push"}:
-        _raise(f"Unsupported persistence action: {action}")
-    if status not in {"success", "failed"}:
-        _raise(f"Unsupported persistence status: {status}")
-    parts = [
-        "sudo",
-        "/usr/local/bin/isaac-cloud-sync",
-        "record",
-        action,
-        status,
-    ]
-    if error:
-        parts.append(error)
-    return " ".join(shell_quote(part) for part in parts)
+class VastProvider:
+    name = "vast"
 
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
 
-def record_remote_persistence_status(
-    config: AppConfig,
-    summary: InstanceSummary,
-    *,
-    action: str,
-    status: str,
-    error: str = "",
-) -> None:
-    if not summary.network.ssh_host or not summary.network.ssh_port:
-        return
-    if not check_tcp_connectivity(summary.network.ssh_host, summary.network.ssh_port, timeout_seconds=5.0):
-        return
-    try:
-        run_remote_command(
-            config,
-            summary,
-            build_persistence_record_command(action, status, error),
-            timeout_seconds=30,
-        )
-    except (IsaacCloudError, subprocess.TimeoutExpired):
-        return
+    def _query(self) -> str:
+        query = self.config.vast_query
+        if self.config.vast_whole_machine:
+            query += " gpu_frac=1"
+        return query
 
+    def catalog(self, limit: int = 15) -> list[dict[str, Any]]:
+        offers = run_vastai_json(["search", "offers", self._query(), "-o", "dph"])
+        offers = [
+            o
+            for o in offers
+            if float(o.get("reliability2", 0)) >= self.config.vast_min_reliability
+        ]
+        return offers[:limit]
 
-def fetch_remote_progress_snapshot(
-    config: AppConfig,
-    summary: InstanceSummary,
-) -> RemoteProgressSnapshot:
-    if not summary.network.ssh_host or not summary.network.ssh_port:
-        return RemoteProgressSnapshot(ssh_reachable=False)
-
-    ssh_reachable = check_tcp_connectivity(
-        summary.network.ssh_host,
-        summary.network.ssh_port,
-        timeout_seconds=5.0,
-    )
-    if not ssh_reachable:
-        return RemoteProgressSnapshot(ssh_reachable=False)
-
-    commands = {
-        "cloud_init_output": "cloud-init status --long || true",
-        "docker_output": "sudo docker ps -a --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}' || true",
-        "isaac_service_output": "sudo systemctl status isaac-cloud-isaac.service --no-pager || true",
-        "bootstrap_log": "sudo tail -n 80 /var/log/isaac-cloud-bootstrap.log || true",
-        "isaac_log": "sudo tail -n 120 /var/log/isaac-cloud-isaac.log || true",
-    }
-    snapshot = RemoteProgressSnapshot(ssh_reachable=True)
-    for field_name, remote_command in commands.items():
-        try:
-            _, output = run_remote_command(
-                config,
-                summary,
-                remote_command,
-                timeout_seconds=30,
-            )
-        except subprocess.TimeoutExpired:
-            output = "Timed out while fetching remote output."
-        setattr(snapshot, field_name, output)
-    return snapshot
-
-
-def extract_cloud_init_state(cloud_init_output: str) -> str:
-    match = re.search(r"^status:\s*(.+)$", cloud_init_output, flags=re.MULTILINE)
-    if match:
-        return match.group(1).strip()
-    if cloud_init_output:
-        lowered = cloud_init_output.lower()
-        if "status: done" in lowered:
-            return "done"
-        if "status: running" in lowered:
-            return "running"
-    return "unknown"
-
-
-def extract_isaac_service_state(service_output: str) -> str:
-    match = re.search(r"Active:\s+(\w+)", service_output)
-    if match:
-        return match.group(1).strip().lower()
-    return "unknown"
-
-
-def summarize_progress(snapshot: RemoteProgressSnapshot) -> ProgressSummary:
-    milestone_total = 7
-    cloud_init_state = extract_cloud_init_state(snapshot.cloud_init_output)
-    isaac_service_state = extract_isaac_service_state(snapshot.isaac_service_output)
-    docker_installed = "docker: command not found" not in snapshot.docker_output.lower()
-    container_running = "isaac-sim" in snapshot.docker_output and "Up " in snapshot.docker_output
-    stream_ready = "Isaac Sim Full Streaming App is loaded." in snapshot.isaac_log
-    rtx_ready = "rtx_ready for streaming" in snapshot.isaac_log
-    image_pull_in_progress = any(
-        marker in snapshot.bootstrap_log
-        for marker in ("Pulling fs layer", "Pull complete", "Download complete")
-    )
-    shader_compile_match = re.findall(
-        r"Waiting for RtPso async group async compilation: (\d+) seconds so far",
-        snapshot.isaac_log,
-    )
-    shader_compile_seconds = int(shader_compile_match[-1]) if shader_compile_match else None
-
-    milestones: list[tuple[str, bool]] = [
-        ("SSH reachable", snapshot.ssh_reachable),
-        ("Docker installed", docker_installed),
-        ("Cloud-init finished", cloud_init_state == "done"),
-        ("Isaac container running", container_running),
-        ("Isaac service active", isaac_service_state == "active"),
-        ("RTX streaming ready", rtx_ready),
-        ("Streaming app loaded", stream_ready),
-    ]
-    milestone_count = sum(1 for _, completed in milestones if completed)
-    last_completed_milestone = next(
-        (name for name, completed in reversed(milestones) if completed),
-        "None",
-    )
-
-    possible_blocker: str | None = None
-    if "timed out while fetching remote output" in snapshot.bootstrap_log.lower():
-        possible_blocker = "Remote bootstrap inspection timed out."
-    elif "tail: cannot open '/var/log/isaac-cloud-bootstrap.log'" in snapshot.bootstrap_log:
-        possible_blocker = "Bootstrap log is not available yet."
-    elif "docker: command not found" in snapshot.docker_output.lower() and cloud_init_state == "done":
-        possible_blocker = "Cloud-init finished but Docker is unavailable."
-    elif isaac_service_state == "inactive" and cloud_init_state == "done":
-        possible_blocker = "Cloud-init finished but the Isaac service is inactive."
-
-    if stream_ready:
-        current_phase = "Stream ready"
-        next_expected_step = "Test the viewer or native Isaac Streaming Client now."
-        bootstrap_state = "ready"
-    elif shader_compile_seconds is not None:
-        current_phase = f"Compiling RTX shaders ({shader_compile_seconds}s)"
-        next_expected_step = 'Wait for "Isaac Sim Full Streaming App is loaded."'
-        bootstrap_state = "progressing"
-    elif rtx_ready:
-        current_phase = "Finalizing livestream startup"
-        next_expected_step = 'Wait for "Isaac Sim Full Streaming App is loaded."'
-        bootstrap_state = "progressing"
-    elif isaac_service_state == "active" or container_running:
-        current_phase = "Starting Isaac Sim"
-        next_expected_step = "Wait for the long RTX shader compilation phase to finish."
-        bootstrap_state = "progressing"
-    elif image_pull_in_progress:
-        current_phase = "Pulling Isaac container image"
-        next_expected_step = "Wait for the image pull to finish and the Isaac service to start."
-        bootstrap_state = "progressing"
-    elif "nvidia-driver-570" in snapshot.bootstrap_log or "Building initial module" in snapshot.bootstrap_log:
-        current_phase = "Installing NVIDIA driver"
-        next_expected_step = "Wait for driver setup and Docker runtime configuration."
-        bootstrap_state = "progressing"
-    elif "nvidia-ctk runtime configure" in snapshot.bootstrap_log:
-        current_phase = "Configuring NVIDIA container runtime"
-        next_expected_step = "Wait for Isaac image pull to begin."
-        bootstrap_state = "progressing"
-    elif cloud_init_state == "running":
-        current_phase = "Bootstrap in progress"
-        next_expected_step = "Wait for cloud-init to advance."
-        bootstrap_state = "progressing"
-    elif cloud_init_state == "done":
-        current_phase = "Bootstrap completed"
-        next_expected_step = "Inspect the Isaac service and logs."
-        bootstrap_state = "waiting"
-    else:
-        current_phase = "Waiting for SSH/bootstrap"
-        next_expected_step = "Wait for SSH to come up."
-        bootstrap_state = "waiting"
-
-    return ProgressSummary(
-        bootstrap_state=bootstrap_state,
-        current_phase=current_phase,
-        milestone_count=milestone_count,
-        milestone_total=milestone_total,
-        last_completed_milestone=last_completed_milestone,
-        next_expected_step=next_expected_step,
-        ready_for_streaming=stream_ready,
-        possible_blocker=possible_blocker,
-    )
-
-
-def print_progress_summary(snapshot: RemoteProgressSnapshot) -> None:
-    progress = summarize_progress(snapshot)
-    typer.echo("")
-    typer.echo("Progress")
-    typer.echo(f"Bootstrap: {progress.bootstrap_state}")
-    typer.echo(f"Current Phase: {progress.current_phase}")
-    typer.echo(f"Milestones: {progress.milestone_count}/{progress.milestone_total}")
-    typer.echo(f"Last Completed: {progress.last_completed_milestone}")
-    typer.echo(f"Next Step: {progress.next_expected_step}")
-    typer.echo(f"Ready For Streaming: {'yes' if progress.ready_for_streaming else 'no'}")
-    if progress.possible_blocker:
-        typer.echo(f"Possible Blocker: {progress.possible_blocker}")
-
-
-def print_compact_status(summary: InstanceSummary, *, config: AppConfig) -> None:
-    if not summary.network.ssh_host or not summary.network.ssh_port:
-        return
-    snapshot = fetch_remote_progress_snapshot(config, summary)
-    typer.echo("")
-    typer.echo(f"SSH Reachability: {'reachable' if snapshot.ssh_reachable else 'unreachable'}")
-    if snapshot.ssh_reachable:
-        print_progress_summary(snapshot)
-
-
-def print_verbose_status(summary: InstanceSummary, *, config: AppConfig) -> None:
-    typer.echo("")
-    typer.echo("Bootstrap Status")
-
-    if not summary.network.ssh_host or not summary.network.ssh_port:
-        typer.echo("")
-        typer.echo("SSH Reachability: unavailable (instance did not report SSH host/port)")
-        typer.echo("Remote bootstrap inspection skipped.")
-        return
-
-    snapshot = fetch_remote_progress_snapshot(config, summary)
-    typer.echo("")
-    typer.echo(f"SSH Reachability: {'reachable' if snapshot.ssh_reachable else 'unreachable'}")
-    if not snapshot.ssh_reachable:
-        typer.echo("Remote bootstrap inspection skipped because SSH is unreachable.")
-        return
-
-    print_progress_summary(snapshot)
-
-    typer.echo("")
-    typer.echo("Persistence")
-    persistence_status = fetch_remote_persistence_status(config, summary)
-    if persistence_status is None and not config.persistence_enabled:
-        typer.echo("State: disabled")
-    else:
-        if persistence_status is None:
-            typer.echo("State: enabled (status unavailable)")
+    def launch(self, offer_id: str | None = None) -> InstanceInfo:
+        if not self.config.ngc_api_key:
+            _raise("Missing NGC API key ([ngc].api_key) — required to pull the Isaac image.")
+        if offer_id:
+            # User-picked offer (e.g. from `catalog` output): rent it as-is,
+            # skipping the query/reliability filters. Vast rejects the create
+            # if the offer is gone or taken.
+            chosen = offer_id
+            typer.echo(f"Renting offer {chosen} (explicitly requested).")
         else:
-            typer.echo(f"State: {'enabled' if persistence_status.enabled else 'disabled'}")
-            if persistence_status.remote_uri:
-                typer.echo(f"Remote: {persistence_status.remote_uri}")
-            if persistence_status.local_path:
-                typer.echo(f"Local Path: {persistence_status.local_path}")
-                typer.echo(f"Container Path: {DEFAULT_PERSISTENCE_CONTAINER_DIR}")
-            typer.echo(f"Last Pull: {persistence_status.last_pull_at or 'never'}")
-            typer.echo(f"Last Pull Status: {persistence_status.last_pull_status or 'never'}")
-            typer.echo(f"Last Push: {persistence_status.last_push_at or 'never'}")
-            typer.echo(f"Last Push Status: {persistence_status.last_push_status or 'never'}")
-            if persistence_status.last_push_error:
-                typer.echo(f"Last Push Error: {persistence_status.last_push_error}")
-
-    sections = [
-        (
-            "Cloud-Init",
-            snapshot.cloud_init_output,
-        ),
-        (
-            "Docker",
-            snapshot.docker_output,
-        ),
-        (
-            "Isaac Service",
-            snapshot.isaac_service_output,
-        ),
-        (
-            "Bootstrap Log",
-            snapshot.bootstrap_log,
-        ),
-        (
-            "Isaac Log",
-            snapshot.isaac_log,
-        ),
-    ]
-
-    if config.viewer_enabled:
-        try:
-            _, viewer_service_output = run_remote_command(
-                config,
-                summary,
-                "sudo systemctl status isaac-cloud-viewer.service --no-pager || true",
-                timeout_seconds=30,
-            )
-            _, viewer_log_output = run_remote_command(
-                config,
-                summary,
-                "sudo tail -n 40 /var/log/isaac-cloud-viewer.log || true",
-                timeout_seconds=30,
-            )
-        except subprocess.TimeoutExpired:
-            viewer_service_output = "Timed out while fetching remote output."
-            viewer_log_output = "Timed out while fetching remote output."
-        except IsaacCloudError as exc:
-            viewer_service_output = f"Unavailable: {exc}"
-            viewer_log_output = f"Unavailable: {exc}"
-        sections.extend(
-            [
-                (
-                    "Viewer Service",
-                    viewer_service_output,
-                ),
-                (
-                    "Viewer Log",
-                    viewer_log_output,
-                ),
-            ]
-        )
-
-    for label, output in sections:
-        typer.echo("")
-        typer.echo(f"{label}:")
-
-        if output:
-            typer.echo(output)
-        else:
-            typer.echo("(no output)")
-
-
-def format_viewer_url(summary: InstanceSummary) -> str:
-    if not summary.public_ip:
-        _raise("Instance does not have a public IP yet, so a viewer URL cannot be built.")
-    return f"http://{summary.public_ip}:{summary.network.viewer_port}"
-
-
-def format_viewer_ports() -> str:
-    return (
-        f"TCP {DEFAULT_VIEWER_PORT} (web viewer UI), "
-        f"TCP {DEFAULT_ISAAC_SIGNAL_PORT} (WebRTC signaling), "
-        f"UDP {DEFAULT_ISAAC_STREAM_PORT} (WebRTC media)"
-    )
-
-
-def format_mcp_tunnel_command(config: AppConfig, summary: InstanceSummary) -> str:
-    if not summary.network.ssh_host:
-        _raise("Instance does not have a public IP yet, so an MCP tunnel command cannot be built.")
-    key_flag = ""
-    if config.ssh_private_key_path:
-        key_flag = f" -i {config.ssh_private_key_path}"
-    port_flag = ""
-    if summary.network.ssh_port and summary.network.ssh_port != 22:
-        port_flag = f" -p {summary.network.ssh_port}"
-    return (
-        f"ssh{key_flag}{port_flag} -N -L "
-        f"{config.mcp_extension_port}:127.0.0.1:{config.mcp_extension_port} "
-        f"{config.ssh_user}@{summary.network.ssh_host}"
-    )
-
-
-def print_mcp_access(summary: InstanceSummary, *, config: AppConfig) -> None:
-    if not config.mcp_enabled:
-        return
-    typer.echo("MCP: enabled via isaac.sim.mcp_extension")
-    typer.echo(f"MCP Extension Port: {config.mcp_extension_port}")
-    if summary.public_ip:
-        typer.echo(f"MCP Tunnel: {format_mcp_tunnel_command(config, summary)}")
-    typer.echo("MCP Server: run the community server separately against the tunneled localhost port.")
-
-
-def print_viewer_access(summary: InstanceSummary, *, config: AppConfig) -> None:
-    if not config.viewer_enabled:
-        return
-    if summary.public_ip:
-        typer.echo(f"Viewer URL: {format_viewer_url(summary)}")
-        typer.echo(f"Viewer Ports: {format_viewer_ports()}")
-        typer.echo("Viewer Access: Browser client loads over TCP 8210 and then connects to Isaac Sim over WebRTC.")
-
-
-def print_persistence_access(config: AppConfig) -> None:
-    if not config.persistence_enabled:
-        return
-    typer.echo(f"Persistence Host Path: {build_persistence_local_path(config.ssh_user)}")
-    typer.echo(f"Persistence Container Path: {DEFAULT_PERSISTENCE_CONTAINER_DIR}")
-
-
-def print_instance_summary(
-    summary: InstanceSummary,
-    *,
-    config: AppConfig,
-    ) -> None:
-    typer.echo(f"Instance: {summary.name}")
-    typer.echo(f"ID: {summary.id}")
-    typer.echo(f"Status: {summary.status}")
-    if summary.public_ip:
-        typer.echo(f"Public IP: {summary.public_ip}")
-    if summary.ssh_port:
-        typer.echo(f"SSH Port: {summary.ssh_port}")
-    if summary.public_ip:
-        typer.echo(f"SSH: {format_ssh_target(config, summary)}")
-        print_viewer_access(summary, config=config)
-    print_persistence_access(config)
-
-
-def print_catalog(
-    candidates: list[Candidate],
-    *,
-    gpu_class: str | None,
-    vcpu: int,
-    ram_gb: int,
-    storage_gb: int,
-) -> None:
-    gpu_label = gpu_class or "any"
-    vcpu_label = str(vcpu) if vcpu > 0 else "any"
-    ram_label = str(ram_gb) if ram_gb > 0 else "any"
-    storage_label = str(storage_gb) if storage_gb > 0 else f"provider-min ({MIN_STORAGE_GB}+)"
-    typer.echo(
-        "Launchable TensorDock offerings "
-        f"for gpu_class={gpu_label}, vcpu>={vcpu_label}, ram_gb>={ram_label}, storage_gb>={storage_label}"
-    )
-    typer.echo("")
-    for candidate in candidates:
-        location_label = parse_location_label(candidate)
-        typer.echo(
-            f"{candidate.gpu_display_name} | {location_label} ({candidate.location_id}) | "
-            f"max {candidate.max_vcpus} vCPU / {candidate.max_ram_gb} GB RAM / "
-            f"{candidate.max_storage_gb} GB storage | "
-            f"dedicated_ip={format_bool_flag(candidate.dedicated_ip_available)} | "
-            f"port_forwarding={format_bool_flag(candidate.port_forwarding_available)} | "
-            f"est ${candidate.estimated_hourly_cost:.3f}/hr"
-        )
-
-
-def print_instances(summaries: list[InstanceSummary], *, include_all: bool) -> None:
-    if include_all:
-        typer.echo("TensorDock instances")
-    else:
-        typer.echo("Running TensorDock instances")
-    typer.echo("")
-    for summary in summaries:
-        details = [summary.status]
-        if summary.public_ip:
-            details.append(f"ip={summary.public_ip}")
-        if summary.ssh_port:
-            details.append(f"ssh_port={summary.ssh_port}")
-        typer.echo(f"{summary.name} ({summary.id}) | " + " | ".join(details))
-
-
-def get_client_and_config() -> tuple[TensorDockClient, AppConfig]:
-    config = load_app_config()
-    return TensorDockClient(config.api_token), config
-
-
-@app.command()
-def catalog(
-    gpu_class: str = typer.Option(None, help="Filter by GPU compatibility class."),
-    region: str = typer.Option(None, help="Substring match against location id/city/state/country."),
-    vcpu: int = typer.Option(None, help="Minimum vCPU capacity required."),
-    ram_gb: int = typer.Option(None, help="Minimum RAM capacity in GB."),
-    storage_gb: int = typer.Option(None, help="Minimum storage capacity in GB."),
-) -> None:
-    try:
-        client, config = get_client_and_config()
-        effective_gpu_class = gpu_class
-        effective_region = region
-        effective_vcpu = vcpu or 0
-        effective_ram_gb = ram_gb or 0
-        effective_storage_gb = storage_gb or 0
-
-        try:
-            locations = client.list_locations()
-            candidates = filter_candidates(
-                locations,
-                gpu_class=effective_gpu_class,
-                region=effective_region,
-                vcpu=effective_vcpu,
-                ram_gb=effective_ram_gb,
-                storage_gb=effective_storage_gb,
-            )
-            if not candidates:
-                _raise(
-                    "No TensorDock catalog entries matched the requested constraints. "
-                    "Try a different region or smaller resource request."
-                )
-            print_catalog(
-                candidates,
-                gpu_class=effective_gpu_class,
-                vcpu=effective_vcpu,
-                ram_gb=effective_ram_gb,
-                storage_gb=effective_storage_gb,
-            )
-        finally:
-            client.close()
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPStatusError as exc:
-        typer.echo(
-            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
-            err=True,
-        )
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPError as exc:
-        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-
-
-@app.command()
-def instances(
-    all: bool = typer.Option(False, "--all", help="Include stopped and other non-running instances."),
-) -> None:
-    try:
-        client, config = get_client_and_config()
-        try:
-            raw_instances = client.list_instances()
-            summaries = [parse_instance_summary(instance, config.viewer_port) for instance in raw_instances]
-            if not all:
-                summaries = [summary for summary in summaries if normalize_status(summary.status) in RUNNING_STATES]
-            summaries = sorted(summaries, key=lambda summary: (summary.name.lower(), summary.id))
-            if not summaries:
-                if all:
-                    typer.echo("No TensorDock instances found.")
-                else:
-                    typer.echo("No running TensorDock instances found.")
-                return
-            print_instances(summaries, include_all=all)
-        finally:
-            client.close()
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPStatusError as exc:
-        typer.echo(
-            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
-            err=True,
-        )
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPError as exc:
-        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-
-
-@app.command()
-def launch(
-    ctx: typer.Context,
-    gpu_class: str = typer.Option(None, help="Minimum GPU class to request."),
-    region: str = typer.Option(None, help="Substring match against location id/city/state/country."),
-    vcpu: int = typer.Option(None, help="Requested vCPU count."),
-    ram_gb: int = typer.Option(None, help="Requested RAM in GB."),
-    storage_gb: int = typer.Option(None, help="Requested storage in GB."),
-    instance_name: str = typer.Option(None, help="Explicit instance name."),
-    viewer: bool | None = typer.Option(
-        None,
-        "--viewer/--no-viewer",
-        help="Enable or disable the Omniverse Web SDK viewer for this launch.",
-    ),
-    mcp: bool | None = typer.Option(
-        None,
-        "--mcp/--no-mcp",
-        help="Enable or disable the omni-mcp Isaac Sim extension for this launch.",
-    ),
-    s3_uri: str = typer.Option(
-        None,
-        "--s3-uri",
-        help="Override the persistence S3 workspace URI for this launch.",
-    ),
-    timeout_seconds: int = typer.Option(900, help="How long to wait for the instance to reach running."),
-    ssh_timeout_seconds: int = typer.Option(120, help="How long to wait for SSH reachability after the instance is running."),
-) -> None:
-    if all(
-        ctx.get_parameter_source(param_name) == ParameterSource.DEFAULT
-        for param_name in (
-            "gpu_class",
-            "region",
-            "vcpu",
-            "ram_gb",
-            "storage_gb",
-            "instance_name",
-            "viewer",
-            "mcp",
-            "s3_uri",
-            "timeout_seconds",
-            "ssh_timeout_seconds",
-        )
-    ):
-        typer.echo(ctx.get_help())
-        raise typer.Exit()
-
-    try:
-        client, config = get_client_and_config()
-        if not config.ngc_api_key:
-            _raise("Missing NGC API key. Set NGC_API_KEY or configure [ngc].api_key before launch.")
-        explicit_gpu_class = ctx.get_parameter_source("gpu_class") != ParameterSource.DEFAULT
-        effective_gpu_class = gpu_class if gpu_class is not None else config.default_gpu_class
-        if effective_gpu_class and not gpu_class_meets_isaac_minimum(effective_gpu_class):
+            offers = self.catalog(limit=1)
+            if not offers:
+                _raise("No Vast offers matched the query. Loosen [vast].query or min_reliability.")
+            offer = offers[0]
+            chosen = str(offer["id"])
             typer.echo(
-                f"WARNING: Requested GPU class {effective_gpu_class} may not meet NVIDIA Isaac "
-                "minimum requirements."
+                f"Renting offer {chosen}: {offer.get('gpu_name')} "
+                f"driver {offer.get('driver_version')} at ${offer.get('dph_total', 0):.3f}/hr "
+                f"({offer.get('geolocation')})"
             )
-        effective_region = region if region is not None else config.default_region
-        effective_vcpu = vcpu or config.default_vcpu
-        effective_ram_gb = ram_gb or config.default_ram_gb
-        effective_storage_gb = storage_gb or config.default_storage_gb
-        effective_viewer_enabled = viewer if viewer is not None else config.viewer_enabled
-        effective_mcp_enabled = mcp if mcp is not None else config.mcp_enabled
-        effective_config = replace(
+        image = build_isaac_image_ref(self.config.isaac_version)
+        result = run_vastai_json(
+            [
+                "create",
+                "instance",
+                chosen,
+                "--image",
+                image,
+                "--login",
+                f"-u $oauthtoken -p {self.config.ngc_api_key} nvcr.io",
+                "--disk",
+                str(self.config.disk_gb),
+                "--onstart-cmd",
+                "sleep infinity",
+                "--ssh",
+                "--direct",
+            ],
+            timeout_seconds=120,
+        )
+        if not result.get("success"):
+            _raise(f"Vast create failed: {result}")
+        instance_id = str(result["new_contract"])
+        self._ensure_account_ssh_key()
+        return InstanceInfo(
+            provider=self.name, instance_id=instance_id, status="loading", label="", ssh=None
+        )
+
+    def _ensure_account_ssh_key(self) -> None:
+        # Account-level keys are injected at container creation; per-instance
+        # attach races the container start on some hosts.
+        pub_path = self.config.ssh_public_key_path
+        if not pub_path:
+            return
+        try:
+            pub = Path(pub_path).expanduser().read_text().strip()
+            subprocess.run(
+                [_vastai_bin(), "create", "ssh-key", pub],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        except OSError:
+            pass
+
+    def list_instances(self) -> list[InstanceInfo]:
+        rows = run_vastai_json(["show", "instances"])
+        return [self._to_info(row) for row in rows]
+
+    def get(self, instance_id: str) -> InstanceInfo:
+        row = run_vastai_json(["show", "instance", instance_id])
+        return self._to_info(row)
+
+    def _to_info(self, row: dict[str, Any]) -> InstanceInfo:
+        ssh = None
+        ports = (row.get("ports") or {}).get("22/tcp") or []
+        host_port = ports[0].get("HostPort") if ports else None
+        ip = row.get("public_ipaddr")
+        if ip and host_port:
+            ssh = SshTarget(host=ip, port=int(host_port), user="root")
+        return InstanceInfo(
+            provider=self.name,
+            instance_id=str(row.get("id")),
+            status=str(row.get("actual_status") or "unknown"),
+            label=str(row.get("label") or ""),
+            ssh=ssh,
+            raw=row,
+        )
+
+    def stop(self, instance_id: str) -> None:
+        run_vastai_json(["stop", "instance", instance_id])
+
+    def start(self, instance_id: str) -> None:
+        run_vastai_json(["start", "instance", instance_id])
+
+    def destroy(self, instance_id: str) -> None:
+        subprocess.run(
+            [_vastai_bin(), "destroy", "instance", instance_id, "-y"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
+    def persistence_remote_path(self) -> str:
+        # No volume mounts in the Vast container model; the project lives on
+        # the container filesystem and durability comes from S3 sync.
+        return CONTAINER_PERSISTENCE_DIR
+
+    def remote_sudo(self) -> str:
+        return ""  # container user is root; sudo is absent in the image
+
+
+# ---------------------------------------------------------------------------
+# AWS provider
+# ---------------------------------------------------------------------------
+
+
+def run_aws_json(config: AppConfig, args: list[str], *, timeout_seconds: int = 120) -> Any:
+    completed = subprocess.run(
+        ["aws", *args, "--region", config.aws_region, "--output", "json"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout_seconds,
+    )
+    if completed.returncode != 0:
+        _raise(f"aws {' '.join(args[:3])} failed: {(completed.stderr or completed.stdout)[:600]}")
+    return json.loads(completed.stdout) if completed.stdout.strip() else {}
+
+
+class AwsProvider:
+    name = "aws"
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+
+    def resolve_ami(self) -> str:
+        result = run_aws_json(
+            self.config,
+            ["ssm", "get-parameter", "--name", self.config.aws_ami_ssm_param],
+        )
+        return result["Parameter"]["Value"]
+
+    def _ensure_key_pair(self) -> str:
+        name = self.config.aws_key_name
+        existing = run_aws_json(
+            self.config,
+            ["ec2", "describe-key-pairs", "--filters", f"Name=key-name,Values={name}"],
+        )
+        if not existing.get("KeyPairs"):
+            if not self.config.ssh_public_key_path:
+                _raise("Set [ssh].public_key_path so the key can be imported to EC2.")
+            pub = Path(self.config.ssh_public_key_path).expanduser().read_text().strip()
+            run_aws_json(
+                self.config,
+                [
+                    "ec2",
+                    "import-key-pair",
+                    "--key-name",
+                    name,
+                    "--public-key-material",
+                    subprocess.run(  # base64 without newlines
+                        ["base64", "-w", "0"], input=pub, capture_output=True, text=True
+                    ).stdout,
+                ],
+            )
+        return name
+
+    def _ensure_security_group(self) -> str:
+        name = self.config.aws_security_group
+        found = run_aws_json(
+            self.config,
+            ["ec2", "describe-security-groups", "--filters", f"Name=group-name,Values={name}"],
+        )
+        groups = found.get("SecurityGroups") or []
+        if groups:
+            return groups[0]["GroupId"]
+        created = run_aws_json(
+            self.config,
+            [
+                "ec2",
+                "create-security-group",
+                "--group-name",
+                name,
+                "--description",
+                "isaac-cloud SSH-only access",
+            ],
+        )
+        group_id = created["GroupId"]
+        run_aws_json(
+            self.config,
+            [
+                "ec2",
+                "authorize-security-group-ingress",
+                "--group-id",
+                group_id,
+                "--protocol",
+                "tcp",
+                "--port",
+                "22",
+                "--cidr",
+                "0.0.0.0/0",
+            ],
+        )
+        return group_id
+
+    def _build_user_data(self) -> str:
+        image = build_isaac_image_ref(self.config.isaac_version)
+        persist_dir = "/home/ubuntu/isaac-cloud/project"
+        return dedent_script(
+            f"""\
+            #!/bin/bash
+            set -euxo pipefail
+            exec > >(tee -a /var/log/isaac-cloud-bootstrap.log) 2>&1
+
+            # DL Base AMI ships driver+docker+nvidia-container-toolkit. Isaac 6
+            # needs driver >= 580; upgrade if the AMI is behind.
+            DRIVER_MAJOR=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)
+            if [ "${{DRIVER_MAJOR:-0}}" -lt 580 ]; then
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq && apt-get install -y nvidia-driver-580
+                reboot
+            fi
+
+            mkdir -p {persist_dir}
+            chmod -R a+rwX /home/ubuntu/isaac-cloud
+
+            printf '%s\\n' {shell_quote(self.config.ngc_api_key or "")} | docker login nvcr.io --username '$oauthtoken' --password-stdin
+            docker pull {shell_quote(image)}
+            docker rm -f isaac-sim 2>/dev/null || true
+            docker run -d --name isaac-sim --gpus all --network=host --restart unless-stopped \\
+                --entrypoint bash \\
+                -e ACCEPT_EULA=Y -e PRIVACY_CONSENT=Y \\
+                -v {persist_dir}:{CONTAINER_PERSISTENCE_DIR}:rw \\
+                {shell_quote(image)} \\
+                -c "sleep infinity"
+            """
+        )
+
+    def launch(self, offer_id: str | None = None) -> InstanceInfo:
+        if offer_id:
+            _raise("--offer-id is a Vast.ai concept; on aws set [aws].instance_type instead.")
+        if not self.config.ngc_api_key:
+            _raise("Missing NGC API key ([ngc].api_key) — required to pull the Isaac image.")
+        ami = self.resolve_ami()
+        key_name = self._ensure_key_pair()
+        group_id = self._ensure_security_group()
+        name = f"{self.config.instance_name_prefix}-{int(time.time())}"
+        typer.echo(
+            f"Launching {self.config.aws_instance_type} in {self.config.aws_region} (AMI {ami})"
+        )
+        result = run_aws_json(
+            self.config,
+            [
+                "ec2",
+                "run-instances",
+                "--image-id",
+                ami,
+                "--instance-type",
+                self.config.aws_instance_type,
+                "--key-name",
+                key_name,
+                "--security-group-ids",
+                group_id,
+                "--block-device-mappings",
+                json.dumps(
+                    [
+                        {
+                            "DeviceName": "/dev/sda1",
+                            "Ebs": {"VolumeSize": self.config.disk_gb, "VolumeType": "gp3"},
+                        }
+                    ]
+                ),
+                "--tag-specifications",
+                json.dumps(
+                    [
+                        {
+                            "ResourceType": "instance",
+                            "Tags": [
+                                {"Key": "Name", "Value": name},
+                                {"Key": AWS_TAG_MANAGED, "Value": "true"},
+                            ],
+                        }
+                    ]
+                ),
+                "--user-data",
+                self._build_user_data(),
+            ],
+            timeout_seconds=180,
+        )
+        instance_id = result["Instances"][0]["InstanceId"]
+        return InstanceInfo(
+            provider=self.name, instance_id=instance_id, status="pending", label=name, ssh=None
+        )
+
+    def list_instances(self) -> list[InstanceInfo]:
+        result = run_aws_json(
+            self.config,
+            [
+                "ec2",
+                "describe-instances",
+                "--filters",
+                f"Name=tag:{AWS_TAG_MANAGED},Values=true",
+                "Name=instance-state-name,Values=pending,running,stopping,stopped",
+            ],
+        )
+        infos = []
+        for reservation in result.get("Reservations", []):
+            for inst in reservation.get("Instances", []):
+                infos.append(self._to_info(inst))
+        return infos
+
+    def get(self, instance_id: str) -> InstanceInfo:
+        result = run_aws_json(
+            self.config, ["ec2", "describe-instances", "--instance-ids", instance_id]
+        )
+        inst = result["Reservations"][0]["Instances"][0]
+        return self._to_info(inst)
+
+    def _to_info(self, inst: dict[str, Any]) -> InstanceInfo:
+        ip = inst.get("PublicIpAddress")
+        ssh = (
+            SshTarget(host=ip, port=22, user=DEFAULT_AWS_SSH_USER, container_via_docker=True)
+            if ip
+            else None
+        )
+        name = next(
+            (t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), ""
+        )
+        return InstanceInfo(
+            provider=self.name,
+            instance_id=inst["InstanceId"],
+            status=inst.get("State", {}).get("Name", "unknown"),
+            label=name,
+            ssh=ssh,
+            raw=inst,
+        )
+
+    def stop(self, instance_id: str) -> None:
+        run_aws_json(self.config, ["ec2", "stop-instances", "--instance-ids", instance_id])
+
+    def start(self, instance_id: str) -> None:
+        run_aws_json(self.config, ["ec2", "start-instances", "--instance-ids", instance_id])
+
+    def destroy(self, instance_id: str) -> None:
+        run_aws_json(self.config, ["ec2", "terminate-instances", "--instance-ids", instance_id])
+
+    def persistence_remote_path(self) -> str:
+        return "/home/ubuntu/isaac-cloud/project"
+
+    def remote_sudo(self) -> str:
+        return "sudo "
+
+
+PROVIDERS = {"vast": VastProvider, "aws": AwsProvider}
+
+
+def get_provider(config: AppConfig, override: str | None = None):
+    name = (override or config.provider).lower()
+    if name not in PROVIDERS:
+        _raise(f"Unknown provider '{name}'. Choose from: {', '.join(PROVIDERS)}")
+    return PROVIDERS[name](config)
+
+
+# ---------------------------------------------------------------------------
+# Post-boot orchestration (shared)
+# ---------------------------------------------------------------------------
+
+
+def wait_for_ssh(config: AppConfig, provider, instance_id: str, timeout_seconds: int = 900) -> InstanceInfo:
+    deadline = time.time() + timeout_seconds
+    info: InstanceInfo | None = None
+    while time.time() < deadline:
+        info = provider.get(instance_id)
+        if info.status in {"running"} and info.ssh:
+            try:
+                run_ssh(config, info.ssh, "true", timeout_seconds=20)
+                return info
+            except (IsaacCloudError, subprocess.TimeoutExpired):
+                pass
+        time.sleep(12)
+    _raise(f"Instance {instance_id} did not become SSH-reachable within {timeout_seconds}s "
+           f"(last status: {info.status if info else 'unknown'}).")
+    raise AssertionError  # unreachable
+
+
+def wait_for_container(config: AppConfig, info: InstanceInfo, timeout_seconds: int = 600) -> None:
+    """AWS only: wait for user-data to finish pulling and starting the container."""
+    if not info.ssh or not info.ssh.container_via_docker:
+        return
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        out = run_ssh(
             config,
-            viewer_enabled=effective_viewer_enabled,
-            mcp_enabled=effective_mcp_enabled,
-            aws_s3_uri=s3_uri if s3_uri is not None else config.aws_s3_uri,
+            info.ssh,
+            "sudo docker inspect -f '{{.State.Running}}' isaac-sim 2>/dev/null || echo absent",
+            check=False,
         )
-        if effective_config.persistence_enabled:
-            validate_persistence_config(effective_config)
-            if effective_config.persistence_auto_pull_on_launch:
-                ensure_local_aws_cli_ready(effective_config)
+        if out.strip() == "true":
+            return
+        time.sleep(15)
+    _raise("Isaac container did not start on the VM (check /var/log/isaac-cloud-bootstrap.log).")
 
-        try:
-            locations = client.list_locations()
-            candidates = filter_candidates(
-                locations,
-                gpu_class=None,
-                region=effective_region,
-                vcpu=effective_vcpu,
-                ram_gb=effective_ram_gb,
-                storage_gb=effective_storage_gb,
-            )
-            if not candidates:
-                _raise(
-                    "No TensorDock location with dedicated IP support matched the requested constraints. "
-                    "Try a different region or smaller resource request."
-                )
-            if effective_gpu_class:
-                preferred_candidates = [
-                    candidate
-                    for candidate in candidates
-                    if candidate_matches_gpu_class(candidate, effective_gpu_class)
-                ]
-                if preferred_candidates:
-                    candidates = preferred_candidates
-                else:
-                    if explicit_gpu_class:
-                        _raise(
-                            f"No TensorDock offer matched requested GPU class {effective_gpu_class} "
-                            "for the requested filters."
-                        )
-                    typer.echo(
-                        f"WARNING: Configured GPU class {effective_gpu_class} did not match any "
-                        "launchable offer for the requested filters. Launch is selecting from any "
-                        "available launchable GPU."
-                    )
-            else:
-                compatible_candidates = [
-                    candidate for candidate in candidates if candidate_meets_isaac_minimum(candidate)
-                ]
-                if compatible_candidates:
-                    candidates = compatible_candidates
-                else:
-                    typer.echo(
-                        "WARNING: No offer matching NVIDIA Isaac minimum requirements was found "
-                        "for the requested filters. Launch is falling back to any available "
-                        "launchable GPU."
-                    )
-            resolved_name = instance_name or build_instance_name(config.instance_name_prefix)
-            selected: Candidate | None = None
-            instance_id: str | None = None
-            create_failures: list[str] = []
 
-            for index, candidate in enumerate(candidates, start=1):
-                requested_vcpu, requested_ram_gb, requested_storage_gb = resolve_requested_resources(
-                    candidate,
-                    vcpu=effective_vcpu,
-                    ram_gb=effective_ram_gb,
-                    storage_gb=effective_storage_gb,
-                )
-                typer.echo(
-                    "Selected TensorDock candidate: "
-                    f"{candidate.gpu_display_name} in {parse_location_label(candidate)} "
-                    f"(estimated ${candidate.estimated_hourly_cost:.3f}/hr)"
-                )
-                typer.echo(
-                    "Requested instance size: "
-                    f"{requested_vcpu} vCPU / {requested_ram_gb} GB RAM / {requested_storage_gb} GB storage"
-                )
-                try:
-                    created = client.create_instance(
-                        build_launch_payload(
-                            config=effective_config,
-                            candidate=candidate,
-                            instance_name=resolved_name,
-                            ssh_key=effective_config.ssh_key,
-                            vcpu=requested_vcpu,
-                            ram_gb=requested_ram_gb,
-                            storage_gb=requested_storage_gb,
-                        )
-                    )
-                    instance_id = extract_instance_id(created)
-                    if not instance_id:
-                        _raise(
-                            "TensorDock create-instance response did not include an instance id. "
-                            f"Observed payload shape: {describe_payload_shape(created)}."
-                        )
-                    selected = candidate
-                    break
-                except IsaacCloudError as exc:
-                    create_failures.append(
-                        f"{parse_location_label(candidate)} ({candidate.gpu_display_name}): {exc}"
-                    )
-                    if index < len(candidates) and is_retryable_create_error(str(exc)):
-                        typer.echo(
-                            "Create attempt failed for this candidate; trying the next compatible offer..."
-                        )
-                        continue
-                    raise
+def setup_isaac(config: AppConfig, info: InstanceInfo) -> None:
+    assert info.ssh
+    if config.gui_enabled:
+        script = build_gui_setup_script(config)
+    else:
+        script = build_isaac_container_launch_script(config)
+    output = run_ssh_script(config, info.ssh, script, in_container=True, timeout_seconds=900)
+    typer.echo(output.splitlines()[-1] if output else "(no output)")
 
-            if selected is None or instance_id is None:
-                if create_failures:
-                    _raise("All candidate create attempts failed:\n" + "\n".join(create_failures))
-                _raise("No TensorDock candidate could be provisioned.")
 
-            typer.echo(f"Created instance {resolved_name} ({instance_id}). Waiting for running state...")
-            summary = wait_for_instance_state(
-                client,
-                instance_id,
-                viewer_port=effective_config.viewer_port,
-                target_states=RUNNING_STATES,
-                timeout_seconds=timeout_seconds,
-                poll_interval_seconds=5,
-            )
-
-            if summary.network.ssh_host and summary.network.ssh_port:
-                typer.echo("Instance is running. Checking SSH reachability...")
-                ssh_ready = wait_for_ssh(
-                    summary.network.ssh_host,
-                    summary.network.ssh_port,
-                    timeout_seconds=ssh_timeout_seconds,
-                    poll_interval_seconds=5,
-                )
-                if ssh_ready:
-                    typer.echo("SSH port is reachable.")
-                    if effective_config.persistence_enabled and effective_config.persistence_auto_pull_on_launch:
-                        typer.echo(
-                            f"Restoring durable workspace from {build_persistence_remote_uri(effective_config)} ..."
-                        )
-                        sync_output = run_local_persistence_sync(
-                            effective_config,
-                            summary,
-                            direction="pull",
-                            timeout_seconds=max(timeout_seconds, 3600),
-                        )
-                        typer.echo("Restore: success")
-                        if sync_output:
-                            typer.echo(sync_output)
-                        typer.echo("Restarting Isaac after workspace restore...")
-                        returncode, output = run_remote_command(
-                            effective_config,
-                            summary,
-                            "sudo systemctl restart isaac-cloud-isaac.service",
-                            timeout_seconds=120,
-                        )
-                        if returncode != 0:
-                            _raise(output or "Failed to restart Isaac after restore.")
-                        if effective_config.viewer_enabled:
-                            run_remote_command(
-                                effective_config,
-                                summary,
-                                "sudo systemctl restart isaac-cloud-viewer.service",
-                                timeout_seconds=120,
-                            )
-                else:
-                    typer.echo(
-                        "SSH did not become reachable within the configured timeout. "
-                        "The instance may still be finishing boot."
-                    )
-
-            print_instance_summary(summary, config=effective_config)
-            print_mcp_access(summary, config=effective_config)
-        finally:
-            client.close()
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPStatusError as exc:
+def print_access(config: AppConfig, info: InstanceInfo) -> None:
+    assert info.ssh
+    t = info.ssh
+    typer.echo("")
+    typer.echo(f"Instance: {info.provider}:{info.instance_id}  status={info.status}")
+    key_flag = f" -i {config.ssh_private_key_path}" if config.ssh_private_key_path else ""
+    typer.echo(f"SSH: ssh{key_flag} -p {t.port} {t.user}@{t.host}")
+    forwards: list[tuple[int, int]] = []
+    if config.agent_enabled:
+        forwards.append((DEFAULT_AGENT_CONTROL_PORT, DEFAULT_AGENT_CONTROL_PORT))
+    forwards.append((DEFAULT_RTSP_PORT, DEFAULT_RTSP_PORT))
+    if config.gui_enabled:
+        forwards.append((DEFAULT_NOVNC_PORT, DEFAULT_NOVNC_PORT))
+    typer.echo(
+        f"Tunnel (recommended): uv run python isaac_cloud.py tunnel "
+        f"--instance-id {info.instance_id} --provider {info.provider}"
+    )
+    typer.echo(f"Tunnel (raw ssh):     {format_tunnel_command(config, t, forwards)}")
+    if config.agent_enabled:
         typer.echo(
-            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
-            err=True,
+            f"  agent control  -> localhost:{DEFAULT_AGENT_CONTROL_PORT} "
+            "(isaac-sim-remote skill / raw python over TCP)"
         )
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPError as exc:
-        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+    typer.echo(f"  rtsp cameras   -> rtsp://127.0.0.1:{DEFAULT_RTSP_PORT}/stream (once a writer is attached)")
+    if config.gui_enabled:
+        typer.echo(f"  gui (noVNC)    -> http://localhost:{DEFAULT_NOVNC_PORT}/vnc.html")
+    typer.echo("All ports are localhost-only on the remote side; SSH is the only ingress.")
 
 
-@app.command()
-def status(
-    ctx: typer.Context,
-    instance_id: str = typer.Option(None, help="TensorDock instance id to inspect."),
-    verbose: bool = typer.Option(False, "--verbose", help="Also inspect bootstrap and runtime health over SSH."),
-) -> None:
-    try:
-        if ctx.get_parameter_source("instance_id") == ParameterSource.DEFAULT:
-            typer.echo(ctx.get_help())
-            _raise("Pass --instance-id.")
-        client, config = get_client_and_config()
-        try:
-            summary = parse_instance_summary(client.get_instance(instance_id), config.viewer_port)
-            print_instance_summary(summary, config=config)
-            if verbose:
-                print_verbose_status(summary, config=config)
-            else:
-                print_compact_status(summary, config=config)
-        finally:
-            client.close()
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPStatusError as exc:
-        typer.echo(
-            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
-            err=True,
-        )
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPError as exc:
-        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+# ---------------------------------------------------------------------------
+# Persistence (local-credential S3 sync over SSH; no cloud creds on instances)
+# ---------------------------------------------------------------------------
+
+
+def build_persistence_remote_uri(config: AppConfig) -> str:
+    if not config.persistence_s3_uri:
+        _raise("Missing [persistence].s3_uri.")
+    uri = config.persistence_s3_uri.strip()
+    if not uri.startswith("s3://") or uri == "s3://":
+        _raise("[persistence].s3_uri must look like s3://bucket/path/")
+    return uri if uri.endswith("/") else uri + "/"
+
+
+def build_local_aws_env(config: AppConfig) -> dict[str, str]:
+    env = os.environ.copy()
+    if config.persistence_aws_region:
+        env["AWS_REGION"] = config.persistence_aws_region
+        env["AWS_DEFAULT_REGION"] = config.persistence_aws_region
+    env.setdefault("AWS_PAGER", "")
+    return env
 
 
 def run_local_aws_sync(config: AppConfig, source: str, destination: str) -> str:
@@ -2445,23 +1047,24 @@ def run_local_aws_sync(config: AppConfig, source: str, destination: str) -> str:
     )
     output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
     if completed.returncode != 0:
-        _raise(output or f"Local AWS sync failed for {source} -> {destination}.")
+        _raise(output or f"aws s3 sync failed for {source} -> {destination}.")
     return output
 
 
 def copy_remote_directory_to_local(
     config: AppConfig,
-    summary: InstanceSummary,
+    target: SshTarget,
     *,
+    sudo: str,
     remote_path: str,
     local_path: str,
     timeout_seconds: int = 3600,
 ) -> None:
-    ssh_command = build_ssh_command(
-        config,
-        summary,
-        f"sudo mkdir -p {shell_quote(remote_path)} && sudo tar -C {shell_quote(remote_path)} -cf - .",
+    remote_command = (
+        f"{sudo}mkdir -p {shell_quote(remote_path)} && "
+        f"{sudo}tar -C {shell_quote(remote_path)} -cf - ."
     )
+    ssh_command = ssh_base_args(config, target) + [remote_command]
     os.makedirs(local_path, exist_ok=True)
     with subprocess.Popen(ssh_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as ssh_proc:
         try:
@@ -2469,7 +1072,6 @@ def copy_remote_directory_to_local(
                 ["tar", "-C", local_path, "-xf", "-"],
                 stdin=ssh_proc.stdout,
                 capture_output=True,
-                text=False,
                 check=False,
                 timeout=timeout_seconds,
             )
@@ -2481,30 +1083,30 @@ def copy_remote_directory_to_local(
     if ssh_returncode != 0:
         _raise(stderr_bytes.decode("utf-8", errors="replace").strip() or "SSH download failed.")
     if extract.returncode != 0:
-        _raise((extract.stderr or b"").decode("utf-8", errors="replace").strip() or "Local tar extract failed.")
+        _raise((extract.stderr or b"").decode("utf-8", errors="replace").strip() or "tar extract failed.")
 
 
 def replace_remote_directory_from_local(
     config: AppConfig,
-    summary: InstanceSummary,
+    target: SshTarget,
     *,
+    sudo: str,
     local_path: str,
     remote_path: str,
     timeout_seconds: int = 3600,
 ) -> None:
     remote_command = (
-        f"sudo mkdir -p {shell_quote(remote_path)} "
-        f"&& sudo find {shell_quote(remote_path)} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} + "
-        f"&& sudo tar -C {shell_quote(remote_path)} -xf - "
-        f"; sudo chown -R {shell_quote(config.ssh_user)}:{shell_quote(config.ssh_user)} {shell_quote(build_persistence_home_root(config.ssh_user))} || true "
-        f"; sudo chmod -R a+rwX {shell_quote(build_persistence_home_root(config.ssh_user))} || true"
+        f"{sudo}mkdir -p {shell_quote(remote_path)} "
+        f"&& {sudo}find {shell_quote(remote_path)} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} + "
+        f"&& {sudo}tar -C {shell_quote(remote_path)} -xf - "
+        f"; {sudo}chmod -R a+rwX {shell_quote(remote_path)} || true"
     )
     with subprocess.Popen(
         ["tar", "-C", local_path, "-cf", "-", "."],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     ) as tar_proc:
-        ssh_command = build_ssh_command(config, summary, remote_command)
+        ssh_command = ssh_base_args(config, target) + [remote_command]
         try:
             ssh_run = subprocess.run(
                 ssh_command,
@@ -2525,332 +1127,297 @@ def replace_remote_directory_from_local(
         _raise(((ssh_run.stdout or "") + "\n" + (ssh_run.stderr or "")).strip() or "SSH upload failed.")
 
 
-def run_local_persistence_sync(
+def run_persistence_sync(
     config: AppConfig,
-    summary: InstanceSummary,
+    provider,
+    info: InstanceInfo,
     *,
     direction: str,
     timeout_seconds: int = 3600,
 ) -> str:
     if direction not in {"pull", "push"}:
         _raise(f"Unsupported sync direction: {direction}")
-    if not summary.network.ssh_host or not summary.network.ssh_port:
+    if not info.ssh:
         _raise("Instance does not expose SSH, so persistence sync is unavailable.")
-    if not check_tcp_connectivity(summary.network.ssh_host, summary.network.ssh_port, timeout_seconds=5.0):
+    if not check_tcp_connectivity(info.ssh.host, info.ssh.port):
         _raise("SSH is unreachable, so persistence sync is unavailable.")
-    ensure_local_aws_cli_ready(config)
-    remote_path = build_persistence_local_path(config.ssh_user)
+    remote_path = provider.persistence_remote_path()
+    sudo = provider.remote_sudo()
     remote_uri = build_persistence_remote_uri(config)
-    try:
-        with tempfile.TemporaryDirectory(prefix="isaac-cloud-sync-") as staging_dir:
-            if direction == "pull":
-                aws_output = run_local_aws_sync(config, remote_uri, staging_dir)
-                replace_remote_directory_from_local(
-                    config,
-                    summary,
-                    local_path=staging_dir,
-                    remote_path=remote_path,
-                    timeout_seconds=timeout_seconds,
-                )
-            else:
-                copy_remote_directory_to_local(
-                    config,
-                    summary,
-                    remote_path=remote_path,
-                    local_path=staging_dir,
-                    timeout_seconds=timeout_seconds,
-                )
-                aws_output = run_local_aws_sync(config, staging_dir, remote_uri)
-    except IsaacCloudError as exc:
-        record_remote_persistence_status(
-            config,
-            summary,
-            action=direction,
-            status="failed",
-            error=str(exc),
-        )
-        raise
-    record_remote_persistence_status(config, summary, action=direction, status="success")
+    with tempfile.TemporaryDirectory(prefix="isaac-cloud-sync-") as staging_dir:
+        if direction == "pull":
+            aws_output = run_local_aws_sync(config, remote_uri, staging_dir)
+            replace_remote_directory_from_local(
+                config, info.ssh, sudo=sudo, local_path=staging_dir,
+                remote_path=remote_path, timeout_seconds=timeout_seconds,
+            )
+        else:
+            copy_remote_directory_to_local(
+                config, info.ssh, sudo=sudo, remote_path=remote_path,
+                local_path=staging_dir, timeout_seconds=timeout_seconds,
+            )
+            aws_output = run_local_aws_sync(config, staging_dir, remote_uri)
     return aws_output
 
 
-def maybe_push_persistence_before_action(
-    config: AppConfig,
-    summary: InstanceSummary,
-    *,
-    action: str,
-    remote_status: PersistenceStatus | None,
-) -> None:
-    if config.persistence_enabled:
-        if action == "destroy" and not config.persistence_auto_push_on_destroy:
-            return
-    elif not (remote_status and remote_status.enabled):
-        return
-    typer.echo("Persistence: enabled")
-    remote_uri = remote_status.remote_uri if remote_status and remote_status.remote_uri else None
-    if not remote_uri and config.persistence_enabled:
-        remote_uri = build_persistence_remote_uri(config)
-    typer.echo(f"Saving durable workspace to {remote_uri or 'configured remote'} ...")
-    ensure_local_aws_cli_ready(config)
-    output = run_local_persistence_sync(config, summary, direction="push")
-    typer.echo("Save: success")
-    if output:
-        typer.echo(output)
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+app = typer.Typer(
+    name=APP_NAME,
+    help="Launch and manage NVIDIA Isaac Sim on Vast.ai or AWS EC2, accessed over SSH only.",
+    no_args_is_help=True,
+)
+sync_app = typer.Typer(help="Sync the durable Isaac project directory to or from S3.")
+app.add_typer(sync_app, name="sync")
+
+PROVIDER_OPTION = typer.Option(None, "--provider", "-p", help="vast or aws (default from config).")
 
 
-def mutate_instance_state(action: str, instance_id: str) -> None:
-    client, config = get_client_and_config()
+def _config() -> AppConfig:
+    return load_app_config()
+
+
+@app.command()
+def catalog(provider: str = PROVIDER_OPTION) -> None:
+    """List available GPU offers/instance options for the provider."""
+    config = _config()
+    prov = get_provider(config, provider)
     try:
-        if action == "destroy":
-            summary = parse_instance_summary(client.get_instance(instance_id), config.viewer_port)
-            remote_persistence_status = None
-            if normalize_status(summary.status) not in RUNNING_STATES:
-                if action == "destroy" and config.persistence_enabled and config.persistence_auto_push_on_destroy:
-                    _raise(
-                        "Persistence is enabled but the instance is not running, so a save cannot be performed before destroy. "
-                        "Resume the instance and sync it first."
-                    )
-            else:
-                remote_persistence_status = fetch_remote_persistence_status(config, summary)
-                if config.persistence_enabled:
-                    validate_persistence_config(config)
-                maybe_push_persistence_before_action(
-                    config,
-                    summary,
-                    action=action,
-                    remote_status=remote_persistence_status,
+        if prov.name == "vast":
+            offers = prov.catalog()
+            if not offers:
+                typer.echo("No matching offers.")
+                raise typer.Exit(1)
+            for o in offers:
+                typer.echo(
+                    f"offer={o['id']} machine={o.get('machine_id')} {o.get('gpu_name')} "
+                    f"driver={o.get('driver_version')} ${o.get('dph_total', 0):.3f}/hr "
+                    f"rel={o.get('reliability2', 0):.3f} inet={o.get('inet_down', 0):.0f}Mbps "
+                    f"{o.get('geolocation')}"
                 )
-        if action == "stop":
-            client.stop_instance(instance_id)
-            target_states = STOPPED_STATES
-        elif action == "resume":
-            client.start_instance(instance_id)
-            target_states = RUNNING_STATES
-        elif action == "destroy":
-            client.delete_instance(instance_id)
-            typer.echo(f"Destroyed instance {instance_id}.")
-            return
         else:
-            _raise(f"Unsupported action: {action}")
+            ami = prov.resolve_ami()
+            typer.echo(
+                f"aws {config.aws_region}: instance_type={config.aws_instance_type} ami={ami}"
+            )
+    except IsaacCloudError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1)
 
-        typer.echo(f"Requested {action} for instance {instance_id}. Waiting for state change...")
-        summary = wait_for_instance_state(
-            client,
-            instance_id,
-            viewer_port=config.viewer_port,
-            target_states=target_states,
-            timeout_seconds=600,
-            poll_interval_seconds=5,
-        )
-        typer.echo(f"Instance {instance_id} is now {summary.status}.")
-    finally:
-        client.close()
+
+@app.command()
+def instances(provider: str = PROVIDER_OPTION) -> None:
+    """List managed instances."""
+    config = _config()
+    prov = get_provider(config, provider)
+    try:
+        rows = prov.list_instances()
+    except IsaacCloudError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1)
+    if not rows:
+        typer.echo("No instances found.")
+        return
+    for info in rows:
+        ssh = f"{info.ssh.user}@{info.ssh.host}:{info.ssh.port}" if info.ssh else "-"
+        typer.echo(f"{info.provider}:{info.instance_id} {info.status:10s} {ssh} {info.label}")
+
+
+@app.command()
+def launch(
+    provider: str = PROVIDER_OPTION,
+    offer_id: str = typer.Option(
+        None,
+        "--offer-id",
+        help="Rent a specific Vast offer (from `catalog` output) instead of the top-ranked one.",
+    ),
+    gui: bool = typer.Option(None, "--gui/--no-gui", help="Also start the noVNC GUI stack."),
+    agent: bool = typer.Option(None, "--agent/--no-agent", help="Enable the agent control socket."),
+    timeout_seconds: int = typer.Option(1200, help="How long to wait for SSH readiness."),
+) -> None:
+    """Rent/launch an instance, start Isaac, and print SSH tunnel commands."""
+    config = _config()
+    if gui is not None:
+        config = replace(config, gui_enabled=gui)
+    if agent is not None:
+        config = replace(config, agent_enabled=agent)
+    prov = get_provider(config, provider)
+    try:
+        info = prov.launch(offer_id=offer_id)
+        typer.echo(f"Created {info.provider}:{info.instance_id}; waiting for SSH...")
+        info = wait_for_ssh(config, prov, info.instance_id, timeout_seconds=timeout_seconds)
+        typer.echo("SSH reachable.")
+        wait_for_container(config, info)
+        if config.persistence_enabled:
+            typer.echo("Restoring project workspace from S3...")
+            run_persistence_sync(config, prov, info, direction="pull")
+        typer.echo("Starting Isaac (first boot compiles shaders; allow several minutes)...")
+        setup_isaac(config, info)
+        print_access(config, info)
+    except IsaacCloudError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def status(
+    instance_id: str = typer.Option(..., "--instance-id"),
+    provider: str = PROVIDER_OPTION,
+) -> None:
+    """Show instance state plus in-container readiness probes."""
+    config = _config()
+    prov = get_provider(config, provider)
+    try:
+        info = prov.get(instance_id)
+        ssh = f"{info.ssh.user}@{info.ssh.host}:{info.ssh.port}" if info.ssh else "-"
+        typer.echo(f"{info.provider}:{info.instance_id} {info.status} {ssh}")
+        if info.ssh and check_tcp_connectivity(info.ssh.host, info.ssh.port):
+            probe = run_ssh_script(
+                config, info.ssh, build_container_probe_script(),
+                in_container=True, timeout_seconds=120,
+            )
+            typer.echo(probe)
+            typer.echo(probe_local_tunnel())
+            print_access(config, info)
+        else:
+            typer.echo("SSH not reachable yet.")
+    except IsaacCloudError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1)
 
 
 @app.command()
 def stop(
-    ctx: typer.Context,
-    instance_id: str = typer.Option(None, help="Stop requires an explicit instance id."),
+    instance_id: str = typer.Option(..., "--instance-id"),
+    provider: str = PROVIDER_OPTION,
+    skip_push: bool = typer.Option(False, "--skip-push", help="Skip the S3 push before stopping."),
 ) -> None:
+    """Stop an instance (pushes the project workspace to S3 first if enabled)."""
+    config = _config()
+    prov = get_provider(config, provider)
     try:
-        if ctx.get_parameter_source("instance_id") == ParameterSource.DEFAULT:
-            typer.echo(ctx.get_help())
-            _raise("Pass --instance-id.")
-        mutate_instance_state("stop", instance_id)
+        if config.persistence_enabled and not skip_push:
+            info = prov.get(instance_id)
+            typer.echo("Pushing project workspace to S3...")
+            run_persistence_sync(config, prov, info, direction="push")
+        prov.stop(instance_id)
+        typer.echo(f"Stopped {instance_id}.")
     except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPStatusError as exc:
-        typer.echo(
-            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
-            err=True,
-        )
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPError as exc:
-        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1)
 
 
 @app.command()
 def resume(
-    ctx: typer.Context,
-    instance_id: str = typer.Option(None, help="Resume requires an explicit instance id."),
+    instance_id: str = typer.Option(..., "--instance-id"),
+    provider: str = PROVIDER_OPTION,
 ) -> None:
+    """Start a stopped instance and relaunch Isaac."""
+    config = _config()
+    prov = get_provider(config, provider)
     try:
-        if ctx.get_parameter_source("instance_id") == ParameterSource.DEFAULT:
-            typer.echo(ctx.get_help())
-            _raise("Pass --instance-id.")
-        mutate_instance_state("resume", instance_id)
+        prov.start(instance_id)
+        info = wait_for_ssh(config, prov, instance_id)
+        wait_for_container(config, info)
+        setup_isaac(config, info)
+        print_access(config, info)
     except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPStatusError as exc:
-        typer.echo(
-            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
-            err=True,
-        )
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPError as exc:
-        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1)
 
 
 @app.command()
 def destroy(
-    ctx: typer.Context,
-    instance_id: str = typer.Option(None, help="Override the instance id instead of using local state."),
-    destroy_all: bool = typer.Option(False, "--all", help="Destroy all TensorDock instances."),
-    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt."),
+    instance_id: str = typer.Option(None, "--instance-id"),
+    provider: str = PROVIDER_OPTION,
+    all_instances: bool = typer.Option(False, "--all"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    skip_push: bool = typer.Option(False, "--skip-push", help="Skip the S3 push before destroying."),
 ) -> None:
+    """Destroy instance(s) (pushes the project workspace to S3 first if enabled)."""
+    config = _config()
+    prov = get_provider(config, provider)
     try:
-        has_instance_id = ctx.get_parameter_source("instance_id") != ParameterSource.DEFAULT
-        has_all = ctx.get_parameter_source("destroy_all") != ParameterSource.DEFAULT and destroy_all
-
-        if has_instance_id == has_all:
-            typer.echo(ctx.get_help())
-            _raise("Pass exactly one of --instance-id or --all.")
-
-        if destroy_all:
-            client, _config = get_client_and_config()
-            try:
-                if _config.persistence_enabled:
-                    _raise(
-                        "destroy --all is not supported while persistence is enabled. "
-                        "Destroy instances individually so each one can be saved first."
-                    )
-                raw_instances = client.list_instances()
-                summaries = [
-                    parse_instance_summary(instance, viewer_port=DEFAULT_VIEWER_PORT)
-                    for instance in raw_instances
-                ]
-                if not summaries:
-                    typer.echo("No TensorDock instances found.")
-                    return
-
-                if not yes:
-                    confirmed = typer.confirm(
-                        f"Destroy all TensorDock instances ({len(summaries)} total)?",
-                        default=False,
-                    )
-                    if not confirmed:
-                        raise typer.Exit(code=1)
-
-                for summary in summaries:
-                    client.delete_instance(summary.id)
-                    typer.echo(f"Destroyed instance {summary.id} ({summary.name}).")
-            finally:
-                client.close()
-            return
-
-        if not yes:
-            confirmed = typer.confirm(f"Destroy TensorDock instance {instance_id}?", default=False)
-            if not confirmed:
-                raise typer.Exit(code=1)
-
-        mutate_instance_state("destroy", instance_id)
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPStatusError as exc:
-        typer.echo(
-            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
-            err=True,
+        targets = (
+            [i.instance_id for i in prov.list_instances()] if all_instances else [instance_id]
         )
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPError as exc:
-        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        targets = [t for t in targets if t]
+        if not targets:
+            typer.echo("Nothing to destroy.")
+            return
+        if not yes:
+            typer.confirm(f"Destroy {len(targets)} instance(s) on {prov.name}?", abort=True)
+        for tid in targets:
+            if config.persistence_enabled and not skip_push:
+                try:
+                    info = prov.get(tid)
+                    if info.ssh and check_tcp_connectivity(info.ssh.host, info.ssh.port):
+                        typer.echo(f"Pushing workspace from {tid} to S3...")
+                        run_persistence_sync(config, prov, info, direction="push")
+                except IsaacCloudError as exc:
+                    typer.echo(f"Warning: pre-destroy push failed for {tid}: {exc}")
+            prov.destroy(tid)
+            typer.echo(f"Destroyed {tid}.")
+    except IsaacCloudError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def tunnel(
+    instance_id: str = typer.Option(..., "--instance-id"),
+    provider: str = PROVIDER_OPTION,
+) -> None:
+    """Run a supervised SSH tunnel to the instance (auto-reconnects; Ctrl-C to stop).
+
+    Forwards agent control (8226), RTSP (8554), and noVNC (6080) to localhost.
+    SSH keepalives detect dead/zombie connections within ~30s and the tunnel
+    re-establishes itself with backoff, so client sessions (noVNC, agent
+    scripts, RTSP players) see a brief blip instead of needing manual repair.
+    """
+    config = _config()
+    prov = get_provider(config, provider)
+    try:
+        run_supervised_tunnel(config, prov, instance_id)
+    except IsaacCloudError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1)
 
 
 @sync_app.command("pull")
 def sync_pull(
-    ctx: typer.Context,
-    instance_id: str = typer.Option(None, help="TensorDock instance id to sync from S3."),
-    s3_uri: str = typer.Option(None, "--s3-uri", help="Override the persistence S3 workspace URI."),
+    instance_id: str = typer.Option(..., "--instance-id"),
+    provider: str = PROVIDER_OPTION,
 ) -> None:
+    """S3 -> instance project directory."""
+    config = _config()
+    prov = get_provider(config, provider)
     try:
-        if ctx.get_parameter_source("instance_id") == ParameterSource.DEFAULT:
-            typer.echo(ctx.get_help())
-            _raise("Pass --instance-id.")
-        client, config = get_client_and_config()
-        effective_config = replace(
-            config,
-            aws_s3_uri=s3_uri if s3_uri is not None else config.aws_s3_uri,
-        )
-        try:
-            summary = parse_instance_summary(client.get_instance(instance_id), effective_config.viewer_port)
-        finally:
-            client.close()
-        remote_status = fetch_remote_persistence_status(effective_config, summary)
-        if remote_status is None or not remote_status.enabled:
-            if not effective_config.persistence_enabled:
-                _raise("Persistence is not enabled for this VM.")
-            validate_persistence_config(effective_config)
-        ensure_local_aws_cli_ready(effective_config)
-        typer.echo(f"Pulling durable workspace from {remote_status.remote_uri if remote_status and remote_status.remote_uri else build_persistence_remote_uri(effective_config)} ...")
-        output = run_local_persistence_sync(effective_config, summary, direction="pull")
-        typer.echo("Sync pull: success")
-        if output:
-            typer.echo(output)
+        info = prov.get(instance_id)
+        output = run_persistence_sync(config, prov, info, direction="pull")
+        typer.echo(output or "Pull complete.")
     except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPStatusError as exc:
-        typer.echo(
-            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
-            err=True,
-        )
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPError as exc:
-        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1)
 
 
 @sync_app.command("push")
 def sync_push(
-    ctx: typer.Context,
-    instance_id: str = typer.Option(None, help="TensorDock instance id to sync to S3."),
-    s3_uri: str = typer.Option(None, "--s3-uri", help="Override the persistence S3 workspace URI."),
+    instance_id: str = typer.Option(..., "--instance-id"),
+    provider: str = PROVIDER_OPTION,
 ) -> None:
+    """Instance project directory -> S3."""
+    config = _config()
+    prov = get_provider(config, provider)
     try:
-        if ctx.get_parameter_source("instance_id") == ParameterSource.DEFAULT:
-            typer.echo(ctx.get_help())
-            _raise("Pass --instance-id.")
-        client, config = get_client_and_config()
-        effective_config = replace(
-            config,
-            aws_s3_uri=s3_uri if s3_uri is not None else config.aws_s3_uri,
-        )
-        try:
-            summary = parse_instance_summary(client.get_instance(instance_id), effective_config.viewer_port)
-        finally:
-            client.close()
-        remote_status = fetch_remote_persistence_status(effective_config, summary)
-        if remote_status is None or not remote_status.enabled:
-            if not effective_config.persistence_enabled:
-                _raise("Persistence is not enabled for this VM.")
-            validate_persistence_config(effective_config)
-        ensure_local_aws_cli_ready(effective_config)
-        typer.echo(f"Pushing durable workspace to {remote_status.remote_uri if remote_status and remote_status.remote_uri else build_persistence_remote_uri(effective_config)} ...")
-        output = run_local_persistence_sync(effective_config, summary, direction="push")
-        typer.echo("Sync push: success")
-        if output:
-            typer.echo(output)
+        info = prov.get(instance_id)
+        output = run_persistence_sync(config, prov, info, direction="push")
+        typer.echo(output or "Push complete.")
     except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPStatusError as exc:
-        typer.echo(
-            f"TensorDock API error: {exc.response.status_code} {exc.response.text}",
-            err=True,
-        )
-        raise typer.Exit(code=1) from exc
-    except httpx.HTTPError as exc:
-        typer.echo(f"Network error talking to TensorDock: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-
-
-app.add_typer(sync_app, name="sync")
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

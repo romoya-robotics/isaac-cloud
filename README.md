@@ -1,352 +1,115 @@
 # isaac-cloud
 
-`isaac-cloud` is a Python CLI for provisioning TensorDock GPU instances intended to run NVIDIA Isaac Sim.
+Launch and manage NVIDIA Isaac Sim 6 on cloud GPUs, accessed **over SSH only**.
 
-## Quick Start
+Two providers:
 
-If you want the shortest path to a working VM:
+| | `vast` (Vast.ai) | `aws` (EC2) |
+| --- | --- | --- |
+| Model | the Isaac container **is** the instance | VM (Deep Learning Base AMI) running the Isaac container |
+| Cost | ~$0.32/hr (RTX 4090) | ~$1.9/hr (g6e.xlarge, L40S) |
+| Startup | instant marketplace, hosts vary | slower, but consistent |
+| Best for | day-to-day dev, experiments | must-not-flake runs, AWS-native persistence |
 
-1. Install dependencies.
+Every access path binds to localhost on the remote side and is reached through
+an SSH tunnel the CLI prints for you — nothing Isaac-related is exposed to the
+internet, and your SSH key is the only authentication that exists:
 
-```bash
-uv sync
-```
+- **Agent control** (`127.0.0.1:8226`) — Isaac 6's built-in
+  `isaacsim.code_editor.python_server`. Drive the live sim with Python from
+  Claude Code via the official `isaac-sim-remote` skill
+  (from [isaac-sim/IsaacSim](https://github.com/isaac-sim/IsaacSim) `skills/`).
+- **RTSP cameras** (`rtsp://127.0.0.1:8554/stream`) — TCP camera feeds via
+  `isaacsim.streaming.rtsp`; watch in VLC/ffplay. Requires NVENC (see GPU
+  notes below).
+- **Full GUI** (`http://localhost:6080/vnc.html`, `--gui`) — the native Isaac
+  Sim application rendered into a virtual display and served with noVNC over a
+  single TCP port. Works on any host; NVENC not required.
 
-2. Create your local config from the example.
-
-```bash
-cp config.example.toml config.toml
-```
-
-3. Edit `config.toml` and fill in these required values:
-
-- `tensordock.api_token`
-- `tensordock.public_ssh_key_path`
-- `ngc.api_key`
-
-4. Optionally set your local SSH private key path in `config.toml` under `[ssh]` so the CLI can print ready-to-use SSH commands and run best-effort status checks.
-
-5. Check what GPUs are available.
-
-```bash
-uv run python isaac_cloud.py catalog
-```
-
-6. Launch a VM.
-
-```bash
-uv run python isaac_cloud.py launch --mcp
-```
-
-7. Watch bootstrap progress.
-
-```bash
-uv run python isaac_cloud.py status --instance-id <INSTANCE_ID> --verbose
-```
-
-## Current State
-
-The repo now implements the Phase 1 launch skeleton against TensorDock:
-
-- query TensorDock locations
-- filter and rank compatible GPU candidates
-- create an Ubuntu 24.04 instance
-- attach cloud-init that installs Docker and NVIDIA Container Toolkit
-- bootstrap the pinned Isaac Sim container, plus optional MCP components
-- poll until the instance reaches `running`
-- perform a best-effort SSH reachability check
-- print SSH access details plus optional MCP connection details
-
-## Run From Source
-
-This project currently starts with a simple Python script entrypoint instead of an installed console script.
+## Setup
 
 ```bash
 uv sync
-uv run python isaac_cloud.py --help
+# Vast provider:
+uv tool install vastai
+vastai set api-key <YOUR_VAST_KEY>
+# AWS provider:
+aws login   # and G-instance vCPU quota > 0 (Service Quotas code L-DB2E81BA)
+
+cp config.example.toml config.toml   # then fill in [ngc] and [ssh]
 ```
 
-## Configuration
-
-Create `config.toml` next to `isaac_cloud.py` before running the script. A checked-in template lives at `config.example.toml`.
-
-The normal setup flow is:
+## Usage
 
 ```bash
-cp config.example.toml config.toml
-```
-
-Then edit `config.toml` and update the values you want to use.
-
-Example config:
-
-```toml
-[tensordock]
-api_token = "..."
-public_ssh_key_path = "/home/you/.ssh/id_ed25519.pub"
-
-[ngc]
-api_key = "..."
-
-[ssh]
-private_key_path = "/home/you/.ssh/id_ed25519"
-user = "user"
-
-[defaults]
-gpu_class = "rtx4080"
-region = "seattle"
-vcpu = 0
-ram_gb = 0
-storage_gb = 0
-instance_name_prefix = "isaac-cloud"
-isaac_version = "5.1.0"
-
-[mcp]
-enabled = false
-repo_url = "https://github.com/romoya-robotics/isaac-sim-mcp"
-extension_port = 8766
-
-[persistence]
-enabled = false
-provider = "s3"
-auto_pull_on_launch = true
-auto_push_on_destroy = true
-
-[aws]
-s3_uri = "s3://romoya-isaac/dev/projects/warehouse-sim/default/"
-region = "us-west-2"
-```
-
-Required settings for `launch`:
-
-- `tensordock.api_token`: TensorDock API credential
-- `tensordock.public_ssh_key_path`: path to the SSH public key file to inject into the VM
-- `ngc.api_key`: NGC API key used to pull the Isaac Sim container
-
-Useful optional settings:
-
-- `ssh.private_key_path`: local private key path used for generated SSH commands and best-effort SSH checks
-- `defaults.gpu_class`: preferred minimum GPU class, for example `rtx4080`
-- `defaults.region`: preferred region substring, for example `seattle`
-- `mcp.enabled`: enable the Isaac MCP extension in the container
-- `persistence.enabled`: enable S3-backed project persistence
-- `persistence.provider`: storage backend selector, currently `s3`
-- `aws.s3_uri`: full S3 workspace URI to restore from and save to
-- `aws.region`: AWS region for the bucket
-
-You can still override individual settings with environment variables when needed:
-
-```bash
-export TENSORDOCK_API_TOKEN=...
-export TENSORDOCK_SSH_PUBLIC_KEY_PATH=~/.ssh/id_ed25519.pub
-export NGC_API_KEY=...
-```
-
-Environment variables override the same values from `config.toml`, including `[aws]`.
-
-`TENSORDOCK_API_TOKEN` is the API credential this CLI uses to call the TensorDock API. You can generate or manage it from the TensorDock Developers page:
-
-`https://dashboard.tensordock.com/developers`
-
-`TENSORDOCK_SSH_PUBLIC_KEY_PATH` should point to your SSH public key file, not the private key.
-
-`TENSORDOCK_SSH_KEY` is still accepted as a fallback for literal public-key contents, but the path-based setting is the recommended option.
-
-`NGC_API_KEY` is required for `launch`. The bootstrap flow uses it to authenticate Docker to `nvcr.io` before pulling the pinned Isaac Sim image.
-
-Optional local SSH settings for readiness checks and admin access:
-
-```bash
-export ISAAC_CLOUD_SSH_PRIVATE_KEY=~/.ssh/id_ed25519
-export ISAAC_CLOUD_SSH_USER=user
-```
-
-`ISAAC_CLOUD_SSH_PRIVATE_KEY` is local-only and optional. It is used for generated SSH commands and for best-effort SSH readiness checks.
-
-Optional defaults for launch behavior:
-
-```bash
-export ISAAC_CLOUD_GPU_CLASS=rtx4080
-export ISAAC_CLOUD_REGION=seattle
-export ISAAC_CLOUD_VCPU=0
-export ISAAC_CLOUD_RAM_GB=0
-export ISAAC_CLOUD_STORAGE_GB=0
-```
-
-What `launch` does on the VM:
-
-- creates an Ubuntu 24.04 GPU VM on TensorDock
-- installs Docker and NVIDIA Container Toolkit
-- installs the host NVIDIA driver if the image does not already have a working one
-- pulls `nvcr.io/nvidia/isaac-sim:5.1.0`
-- optionally clones and mounts the `romoya-robotics/isaac-sim-mcp` extension repo
-
-## Commands
-
-```bash
-uv run python isaac_cloud.py catalog
+uv run python isaac_cloud.py catalog                     # browse offers
+uv run python isaac_cloud.py launch                      # headless + agent socket
+uv run python isaac_cloud.py launch --gui                # + noVNC GUI
+uv run python isaac_cloud.py launch --provider aws
 uv run python isaac_cloud.py instances
-uv run python isaac_cloud.py instances --all
-uv run python isaac_cloud.py launch --mcp
-uv run python isaac_cloud.py status --instance-id <INSTANCE_ID>
-uv run python isaac_cloud.py sync pull --instance-id <INSTANCE_ID>
-uv run python isaac_cloud.py sync push --instance-id <INSTANCE_ID>
-uv run python isaac_cloud.py stop --instance-id <INSTANCE_ID>
-uv run python isaac_cloud.py resume --instance-id <INSTANCE_ID>
-uv run python isaac_cloud.py destroy --instance-id <INSTANCE_ID> --yes
-uv run python isaac_cloud.py destroy --all --yes
+uv run python isaac_cloud.py status  --instance-id <ID>
+uv run python isaac_cloud.py tunnel  --instance-id <ID>   # supervised, auto-reconnecting
+uv run python isaac_cloud.py sync pull --instance-id <ID>
+uv run python isaac_cloud.py sync push --instance-id <ID>
+uv run python isaac_cloud.py stop    --instance-id <ID>
+uv run python isaac_cloud.py resume  --instance-id <ID>
+uv run python isaac_cloud.py destroy --instance-id <ID> --yes
 ```
 
-Commands that inspect or mutate a specific VM require `--instance-id`, unless you use `destroy --all`.
+`launch` prints an SSH command plus a ready-made tunnel command; run the
+tunnel in a spare terminal and every service above is on `localhost`.
 
-## MCP Workflow
+First boot compiles RTX shaders — allow 5–10 minutes before the sim is
+responsive. Warm restarts take under a minute.
 
-This repo can launch Isaac Sim with the community `romoya-robotics/isaac-sim-mcp` extension enabled inside the Isaac container.
+## GPU notes (important for video)
 
-The MCP extension runs on the VM inside Isaac Sim. The Python MCP server from the community repo should run on your local machine and connect through an SSH tunnel to the VM.
+**NVENC (hardware H.264) only works when the rented GPU is host GPU 0.**
+This is an NVIDIA driver limitation
+([k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282)),
+not a provider quirk. Consequences:
 
-Important: the community MCP server is a separate local dependency. You only need to clone and run it if you want MCP.
+- The default Vast query rents **whole machines** (`gpu_frac=1`), which
+  guarantees GPU 0. Set `[vast].whole_machine = false` to allow cheaper
+  fractional hosts — agent control and the noVNC GUI still work there, but
+  RTSP/WebRTC video will fail if you draw the wrong GPU slot.
+- EC2 instances always see their GPU as device 0; NVENC always works there.
 
-1. Launch a VM with MCP enabled.
+A minority of Vast hosts inject compute-only NVIDIA libraries (no
+Vulkan/GLX/NVENC userland). The launch script detects this and side-loads the
+exact driver-matched libraries automatically.
 
-```bash
-uv run python isaac_cloud.py launch --mcp
-```
+## Persistence
 
-You can combine `--mcp` with your usual launch filters, for example:
+When `[persistence].enabled = true`, the project directory
+(`/isaac-sim/project` in the container) is synced with S3:
 
-```bash
-uv run python isaac_cloud.py launch --mcp --region delaware
-```
+- restored from S3 automatically on `launch`
+- pushed to S3 automatically on `stop` / `destroy`
+- manual `sync pull` / `sync push` anytime
 
-When launch succeeds, the CLI prints the SSH command and MCP tunnel command.
+Sync runs **through your local machine** (SSH + tar + `aws s3 sync`): cloud
+instances never receive AWS credentials.
 
-2. Wait for bootstrap to finish.
+On AWS the project directory also lives on the VM at
+`/home/ubuntu/isaac-cloud/project` (bind-mounted into the container), so it
+additionally survives container restarts.
 
-The first boot may take a while because cloud-init installs Docker, validates the NVIDIA runtime, clones the MCP repo on the VM, and pulls `nvcr.io/nvidia/isaac-sim:5.1.0`.
+## Config reference
 
-To check progress:
+See `config.example.toml`. Highlights:
 
-```bash
-uv run python isaac_cloud.py status --instance-id <INSTANCE_ID> --verbose
-```
+- `[defaults].provider` — `vast` or `aws`; `--provider` overrides per command.
+- `[agent].enabled` — agent control socket (default true).
+- `[gui].enabled` / `resolution` — noVNC GUI stack (default off; `--gui` per launch).
+- `[vast].whole_machine` / `min_reliability` / `query` — offer selection.
+- `[aws].region` / `instance_type` — defaults `us-west-2` / `g6e.xlarge`.
+- `[persistence].s3_uri` — `s3://bucket/path/` workspace location.
 
-The VM is ready for MCP when:
-- `cloud-init` reports `done`
-- `isaac-cloud-isaac.service` is active
-- the Isaac log shows `Isaac Sim MCP server started on localhost:8766`
+## Background
 
-3. Open an SSH tunnel from your machine to the VM.
-
-Use the tunnel command printed by `launch`. It will look like:
-
-```bash
-ssh -i /home/you/.ssh/id_ed25519_tensordock -N -L 8766:127.0.0.1:8766 user@<VM_IP>
-```
-
-Keep that terminal open while using MCP.
-
-4. Clone the community MCP repo locally.
-
-```bash
-git clone https://github.com/romoya-robotics/isaac-sim-mcp
-cd isaac-sim-mcp
-```
-
-5. Create a local Python environment and install the community server dependencies.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-6. Run the community MCP server locally.
-
-```bash
-python isaac_mcp/server.py
-```
-
-That local MCP server should connect to `localhost:8766`, which is forwarded through the SSH tunnel to the Isaac Sim MCP extension running on the VM.
-
-7. Point your MCP client at the local server.
-
-The exact config depends on your MCP client, but the shape is:
-- command: your local Python executable
-- args: `isaac_mcp/server.py`
-- working directory: your local clone of `isaac-sim-mcp`
-
-The important point is that your MCP client talks to a local stdio server, and that local server talks through the SSH tunnel to the VM.
-
-For Codex, Claude Desktop, or another MCP-compatible client, the pattern is the same:
-
-- keep the SSH tunnel open
-- register the local `isaac_mcp/server.py` process as your MCP server
-- let that local MCP server connect to `localhost:8766`
-
-In other words, Codex or Claude should talk to the local community MCP server process, not directly to the remote VM port.
-
-## Persistence Workflow
-
-Persistence is optional. When enabled, the VM stores a durable project workspace under `/home/<ssh-user>/isaac-cloud/project` and syncs that workspace to S3.
-
-Required config:
-
-- `persistence.enabled = true`
-- `persistence.provider = "s3"`
-- `aws.s3_uri`
-
-Optional config:
-
-- `aws.region`
-
-Equivalent environment overrides:
-
-- `AWS_REGION`
-- `ISAAC_CLOUD_S3_URI`
-
-Local requirements when `persistence.enabled = true` and `persistence.provider = "s3"`:
-
-- the `aws` CLI must be installed on the local machine running this tool
-- the local AWS CLI must already be authenticated before `launch`, `sync pull`, `sync push`, or `destroy`
-- the tool verifies this with `aws sts get-caller-identity` and an S3 access check before it proceeds
-
-This is designed for SSO/SAML-based AWS auth too. If your organization uses Google-backed AWS login, complete your normal local login flow first, for example `aws sso login` or your organization’s equivalent.
-
-Launch behavior:
-
-- bootstrap creates the durable workspace on the VM and installs a remote manifest helper
-- if `auto_pull_on_launch = true`, the local CLI restores the S3 workspace over SSH after the VM is reachable, then restarts Isaac
-
-Explicit commands:
-
-```bash
-uv run python isaac_cloud.py sync pull --instance-id <INSTANCE_ID>
-uv run python isaac_cloud.py sync push --instance-id <INSTANCE_ID>
-```
-
-Lifecycle behavior when persistence is enabled:
-
-- `stop` does not sync
-- `destroy` pushes the durable workspace before destroying the VM, and aborts if that push fails
-- `destroy --all` is intentionally blocked while persistence is enabled, so saves cannot be skipped silently
-
-Current durable workspace note:
-
-- the workspace is mounted into the Isaac container at `/isaac-sim/project`
-- caches and runtime acceleration directories are not synced to S3
-
-## Notes
-
-- The GPU compatibility table is intentionally conservative and can be expanded once we validate more TensorDock SKUs.
-- TensorDock response shapes for instance networking may vary, so `public_ip` and `ssh_port` parsing is defensive.
-- `TENSORDOCK_API_TOKEN` authenticates API requests, while `tensordock.public_ssh_key_path` or `TENSORDOCK_SSH_PUBLIC_KEY_PATH` should point to the SSH public key file whose contents are sent to the `/api/v2/instances` endpoint.
-- `launch` now expects `NGC_API_KEY` so cloud-init can authenticate to `nvcr.io` and pull the Isaac Sim image during first boot.
-- The live `config.toml` file is ignored by git. Start from `config.example.toml`.
-- `vcpu = 0`, `ram_gb = 0`, and `storage_gb = 0` mean "do not constrain candidate selection by that resource." Launch then auto-picks a small baseline size for the actual VM request, with storage still respecting the provider minimum.
-- SSH readiness checks are best-effort and only run when a local private key path is configured.
-- When MCP is enabled, bootstrap clones the configured `romoya-robotics/isaac-sim-mcp` repo onto the VM, mounts that repo into the Isaac container as an extension source, and enables `isaac.sim.mcp_extension`.
-- The Python MCP server from the community repo is not run inside the Isaac container. For the current prototype flow, launch with `--mcp`, open an SSH tunnel to the configured MCP port, and run the community `isaac_mcp/server.py` separately against the tunneled localhost port.
-- When persistence is enabled, S3 access happens locally. The VM does not receive AWS credentials; it only stores a manifest at `/var/lib/isaac-cloud/state/persistence-manifest.json` so `status --verbose` can report the last pull/push result.
-- For cloud-init debugging on the VM, inspect `/var/log/cloud-init-output.log`, `/var/log/isaac-cloud-bootstrap.log`, `/var/log/isaac-cloud-isaac.log`, or run `/usr/local/bin/isaac-cloud-debug-report`.
-- The bootstrap now waits and retries when `apt` is locked by `unattended-upgrades`, which was blocking the NVIDIA container toolkit install on Ubuntu 24 images.
+This tool previously targeted TensorDock, whose marketplace emptied out after
+the Voltage Park acquisition (2025–2026). The experiment logs from the
+migration — including why WebRTC browser streaming over SSH tunnels was
+abandoned in favor of noVNC, and the NVENC device-index discovery — live in
+`VAST_EXPERIMENT_RESULTS.md` and `GUI_TUNNEL_EXPERIMENT_PLAN.md`.

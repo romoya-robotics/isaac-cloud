@@ -1,38 +1,47 @@
-[tensordock]
-api_token = "td_your_api_token"
-public_ssh_key_path = "/home/you/.ssh/id_ed25519.pub"
+[defaults]
+# "vast" (Vast.ai marketplace, cheap, instant) or "aws" (EC2 g6e, reliable, ~6x price)
+provider = "vast"
+isaac_version = "6.0.1"
+instance_name_prefix = "isaac-cloud"
+disk_gb = 100
 
 [ngc]
 api_key = "nvapi-your-ngc-api-key"
 
 [ssh]
 private_key_path = "/home/you/.ssh/id_ed25519"
-user = "user"
+public_key_path = "/home/you/.ssh/id_ed25519.pub"
 
-[defaults]
-# gpu_class = "rtx4080"
-# region = "seattle"
-# vcpu = 0
-# ram_gb = 0
-# storage_gb = 0
-instance_name_prefix = "isaac-cloud"
-isaac_version = "5.1.0"
+# Isaac Sim's built-in agent control socket (isaacsim.code_editor.python_server).
+# Binds 127.0.0.1:8226 on the instance; reach it through the printed SSH tunnel
+# and drive it with the isaac-sim-remote skill.
+[agent]
+enabled = true
 
-[viewer]
+# Full interactive GUI via noVNC (Isaac GUI -> Xvfb -> x11vnc -> one TCP port).
+# Works on any host, NVENC not required. Open http://localhost:6080/vnc.html
+# through the tunnel.
+[gui]
 enabled = false
-port = 8210
+resolution = "1920x1080"
 
-[mcp]
-enabled = false
-repo_url = "https://github.com/romoya-robotics/isaac-sim-mcp"
-extension_port = 8766
+[vast]
+# Requires the vastai CLI: uv tool install vastai && vastai set api-key <KEY>
+# whole_machine=true guarantees host GPU 0, which NVENC (RTSP/WebRTC video)
+# requires. Fractional hosts are fine for agent-only or noVNC GUI work.
+whole_machine = true
+min_reliability = 0.99
+# query = 'gpu_name in ["RTX_4090","L40S"] driver_version >= 580.95.05 verified=true rentable=true num_gpus=1 disk_space >= 80 inet_down >= 300'
+
+[aws]
+# Requires: aws login. Also requires G-instance vCPU quota > 0 in the region
+# (Service Quotas code L-DB2E81BA).
+region = "us-west-2"
+instance_type = "g6e.xlarge"
+# security_group = "isaac-cloud-ssh"
+# key_name = "isaac-cloud"
 
 [persistence]
 enabled = false
-provider = "s3"
-auto_pull_on_launch = true
-auto_push_on_destroy = true
-
-[aws]
-s3_uri = "s3://romoya-isaac/dev/projects/warehouse-sim/default/"
-region = "us-west-2"
+s3_uri = "s3://your-bucket/projects/your-project/"
+aws_region = "us-west-2"
