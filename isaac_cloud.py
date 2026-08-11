@@ -59,6 +59,28 @@ DEFAULT_VAST_QUERY = (
 DEFAULT_VAST_WHOLE_MACHINE = True
 DEFAULT_VAST_MIN_RELIABILITY = 0.99
 
+# Vast surfaces docker's own error text in `status_msg` while the instance sits
+# in "loading" forever (measured: bad registry login visible at +30s, missing
+# image tag at +50s; neither ever self-heals — see VAST_TIMEOUT_EXPERIMENT_RESULTS.md).
+# Matching one of these means the provision is doomed: bail instead of waiting
+# out the timeout.
+VAST_FATAL_STATUS_PATTERNS = (
+    "docker login failed",       # bad registry credentials (e.g. NGC key)
+    "manifest unknown",          # image tag does not exist
+    "pull access denied",
+    "unauthorized",
+    "no space left on device",
+)
+# A healthy pull can go up to ~6 min without a status_msg change (large layers),
+# so generic daemon errors only count as fatal once they persist across polls.
+VAST_DAEMON_ERROR_MARKER = "error response from daemon"
+VAST_DAEMON_ERROR_FATAL_S = 90
+# Some hosts fail to inject the account-level SSH key: the instance reaches
+# "running", TCP connects, but pubkey auth is denied indefinitely (measured 16
+# min of steady denials). Re-attach the key once, then give up.
+VAST_SSH_DENIED_ATTACH_S = 45
+VAST_SSH_DENIED_GIVE_UP_S = 300
+
 # AWS provider defaults. g6e = L40S (RT cores + NVENC, on Isaac's GPU list).
 DEFAULT_AWS_REGION = "us-west-2"
 DEFAULT_AWS_INSTANCE_TYPE = "g6e.xlarge"
@@ -76,6 +98,13 @@ ISAAC_MINIMUM_GPU_CLASSES = {"rtx4080", "rtx4090", "l40", "l40s"}
 
 class IsaacCloudError(Exception):
     """Raised for all fatal, user-reportable failures."""
+
+
+class ProvisioningDoomed(IsaacCloudError):
+    """The instance can never become usable (bad image, bad creds, broken host).
+
+    Unlike a plain timeout — where the instance might still come up — a doomed
+    instance only accrues cost, so callers should destroy it."""
 
 
 def _raise(message: str) -> None:
@@ -659,6 +688,38 @@ class VastProvider:
             raw=row,
         )
 
+    def provisioning_error(self, info: InstanceInfo) -> str | None:
+        """Return docker's error text when the provision is doomed (else None)."""
+        msg = str(info.raw.get("status_msg") or "").strip()
+        low = msg.lower()
+        if any(pat in low for pat in VAST_FATAL_STATUS_PATTERNS):
+            return msg
+        return None
+
+    def transient_daemon_error(self, info: InstanceInfo) -> str | None:
+        """Generic docker daemon error: fatal only if it persists across polls."""
+        msg = str(info.raw.get("status_msg") or "").strip()
+        if VAST_DAEMON_ERROR_MARKER in msg.lower():
+            return msg
+        return None
+
+    def attach_ssh_key(self, instance_id: str) -> None:
+        """Recovery for hosts that miss the account-key injection at create."""
+        pub_path = self.config.ssh_public_key_path
+        if not pub_path:
+            return
+        try:
+            pub = Path(pub_path).expanduser().read_text().strip()
+            subprocess.run(
+                [_vastai_bin(), "attach", "ssh", instance_id, pub],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=45,
+            )
+        except OSError:
+            pass
+
     def stop(self, instance_id: str) -> None:
         run_vastai_json(["stop", "instance", instance_id])
 
@@ -941,19 +1002,67 @@ def get_provider(config: AppConfig, override: str | None = None):
 
 
 def wait_for_ssh(config: AppConfig, provider, instance_id: str, timeout_seconds: int = 900) -> InstanceInfo:
+    """Wait for SSH, bailing early on provisioning failures the provider can detect.
+
+    Measured on Vast (VAST_TIMEOUT_EXPERIMENT_RESULTS.md): healthy launches are
+    SSH-ready in 1.5-10 min; every observed failure mode is detectable in under
+    2 min via status_msg, or via persistent pubkey denial after "running".
+    """
     deadline = time.time() + timeout_seconds
     info: InstanceInfo | None = None
+    daemon_error_since: float | None = None
+    auth_denied_since: float | None = None
+    key_reattached = False
     while time.time() < deadline:
         info = provider.get(instance_id)
+        fatal = getattr(provider, "provisioning_error", lambda _info: None)(info)
+        if fatal:
+            raise ProvisioningDoomed(
+                f"Provisioning of {instance_id} failed (image pull cannot succeed): "
+                f"{fatal[:300]}. Retry with another offer (or fix credentials/image)."
+            )
+        transient = getattr(provider, "transient_daemon_error", lambda _info: None)(info)
+        if transient:
+            daemon_error_since = daemon_error_since or time.time()
+            if time.time() - daemon_error_since >= VAST_DAEMON_ERROR_FATAL_S:
+                raise ProvisioningDoomed(
+                    f"Provisioning of {instance_id} stuck on a docker daemon error "
+                    f"for {VAST_DAEMON_ERROR_FATAL_S}s: {transient[:300]}"
+                )
+        else:
+            daemon_error_since = None
         if info.status in {"running"} and info.ssh:
             try:
                 run_ssh(config, info.ssh, "true", timeout_seconds=20)
                 return info
-            except (IsaacCloudError, subprocess.TimeoutExpired):
-                pass
+            except (IsaacCloudError, subprocess.TimeoutExpired) as exc:
+                if "permission denied" in str(exc).lower():
+                    auth_denied_since = auth_denied_since or time.time()
+                    denied_for = time.time() - auth_denied_since
+                    if (
+                        not key_reattached
+                        and denied_for >= VAST_SSH_DENIED_ATTACH_S
+                        and hasattr(provider, "attach_ssh_key")
+                    ):
+                        typer.echo(
+                            "SSH key auth denied after instance start; "
+                            "re-attaching the key to the instance..."
+                        )
+                        provider.attach_ssh_key(instance_id)
+                        key_reattached = True
+                    elif denied_for >= VAST_SSH_DENIED_GIVE_UP_S:
+                        raise ProvisioningDoomed(
+                            f"Instance {instance_id} is running but has refused pubkey "
+                            f"auth for {int(denied_for)}s (host failed to inject the SSH "
+                            f"key). This does not self-heal: rent another offer."
+                        )
+                else:
+                    auth_denied_since = None
         time.sleep(12)
+    last_msg = str(info.raw.get("status_msg") or "").strip()[:200] if info else ""
     _raise(f"Instance {instance_id} did not become SSH-reachable within {timeout_seconds}s "
-           f"(last status: {info.status if info else 'unknown'}).")
+           f"(last status: {info.status if info else 'unknown'}"
+           + (f", status_msg: {last_msg!r}" if last_msg else "") + ").")
     raise AssertionError  # unreachable
 
 
@@ -1244,10 +1353,19 @@ def launch(
     if agent is not None:
         config = replace(config, agent_enabled=agent)
     prov = get_provider(config, provider)
+    live_instance_id: str | None = None
     try:
         info = prov.launch(offer_id=offer_id)
+        live_instance_id = info.instance_id
         typer.echo(f"Created {info.provider}:{info.instance_id}; waiting for SSH...")
-        info = wait_for_ssh(config, prov, info.instance_id, timeout_seconds=timeout_seconds)
+        try:
+            info = wait_for_ssh(config, prov, info.instance_id, timeout_seconds=timeout_seconds)
+        except ProvisioningDoomed as exc:
+            # The instance can never become usable and only accrues cost.
+            typer.echo(f"Destroying doomed instance {info.instance_id}...")
+            prov.destroy(info.instance_id)
+            live_instance_id = None
+            raise IsaacCloudError(f"{exc} (instance destroyed)")
         typer.echo("SSH reachable.")
         wait_for_container(config, info)
         if config.persistence_enabled:
@@ -1258,6 +1376,12 @@ def launch(
         print_access(config, info)
     except IsaacCloudError as exc:
         typer.echo(f"Error: {exc}")
+        if live_instance_id:
+            typer.echo(
+                f"Instance {live_instance_id} is still running (and billing). Inspect it, or "
+                f"destroy with: uv run python isaac_cloud.py destroy "
+                f"--provider {provider} --instance-id {live_instance_id}"
+            )
         raise typer.Exit(1)
 
 
