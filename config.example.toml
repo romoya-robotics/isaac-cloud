@@ -12,11 +12,16 @@ api_key = "nvapi-your-ngc-api-key"
 private_key_path = "/home/you/.ssh/id_ed25519"
 public_key_path = "/home/you/.ssh/id_ed25519.pub"
 
-# Isaac Sim's built-in agent control socket (isaacsim.code_editor.python_server).
-# Binds 127.0.0.1:8226 on the instance; reach it through the printed SSH tunnel
-# and drive it with the isaac-sim-remote skill.
-[agent]
-enabled = true
+# Isaac runtime options.
+#   agent:  Isaac Sim's built-in control socket (isaacsim.code_editor.python_server).
+#           Binds 127.0.0.1:8226 on the instance; reach it through the printed
+#           SSH tunnel and drive it with the isaac-sim-remote skill.
+#   curobo: install cuRobo (GPU motion planning) into Isaac's python after
+#           launch. Background, ~5 min: torch cu128 + cuRobo (warp kernels, no
+#           CUDA toolkit needed) + cuda-core. `status` reports "curobo: ready".
+[isaac]
+agent = true
+curobo = false
 
 # Full interactive GUI via noVNC (Isaac GUI -> Xvfb -> x11vnc -> one TCP port).
 # Works on any host, NVENC not required. Open http://localhost:6080/vnc.html

@@ -140,6 +140,7 @@ class AppConfig:
     agent_enabled: bool
     gui_enabled: bool
     gui_resolution: str
+    curobo_enabled: bool
     # vast
     vast_query: str
     vast_whole_machine: bool
@@ -205,9 +206,10 @@ def load_app_config(config_path: Path | None = None) -> AppConfig:
         ngc_api_key=get("NGC_API_KEY", "ngc", "api_key"),
         ssh_private_key_path=get("ISAAC_CLOUD_SSH_PRIVATE_KEY", "ssh", "private_key_path"),
         ssh_public_key_path=get("ISAAC_CLOUD_SSH_PUBLIC_KEY", "ssh", "public_key_path"),
-        agent_enabled=_bool(nested_get(data, "agent", "enabled"), True),
+        agent_enabled=_bool(nested_get(data, "isaac", "agent"), True),
         gui_enabled=_bool(nested_get(data, "gui", "enabled"), False),
         gui_resolution=nested_get(data, "gui", "resolution") or DEFAULT_GUI_RESOLUTION,
+        curobo_enabled=_bool(nested_get(data, "isaac", "curobo"), False),
         vast_query=nested_get(data, "vast", "query") or DEFAULT_VAST_QUERY,
         vast_whole_machine=_bool(
             nested_get(data, "vast", "whole_machine"), DEFAULT_VAST_WHOLE_MACHINE
@@ -544,6 +546,56 @@ def build_gui_setup_script(config: AppConfig) -> str:
     )
 
 
+def build_curobo_install_script() -> str:
+    """Install cuRobo into Isaac's bundled python, in the background.
+
+    Validated 2026-08: current cuRobo runs its kernels on warp-lang via the
+    cuda.core backend — no CUDA toolkit and no nvcc compile needed. Two traps:
+    the editable install (`pip -e`) mis-maps the package root, and without
+    `cuda-core[cu12]` collision kernels fail with "No curobo kernel backend".
+    Writes /root/curobo_install.log; final line is CUROBO_INSTALL_OK.
+    """
+    return dedent_script(
+        """\
+        #!/bin/bash
+        cat > /root/curobo_install.sh << 'EOS'
+        #!/bin/bash
+        set -e
+        if /isaac-sim/python.sh -c "import curobo" >/dev/null 2>&1; then
+            echo CUROBO_ALREADY_INSTALLED
+            exit 0
+        fi
+        command -v git >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq git; }
+        /isaac-sim/python.sh -m pip install --quiet ninja wheel
+        /isaac-sim/python.sh -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cu128
+        rm -rf /root/curobo
+        git clone --depth 1 https://github.com/NVlabs/curobo.git /root/curobo
+        cd /root/curobo
+        /isaac-sim/python.sh -m pip install . --no-build-isolation
+        /isaac-sim/python.sh -m pip install --quiet 'cuda-core[cu12]'
+        cd /root
+        /isaac-sim/python.sh -c "from curobo.motion_planner import MotionPlanner; print('CUROBO_INSTALL_OK')"
+        EOS
+        chmod +x /root/curobo_install.sh
+        nohup bash /root/curobo_install.sh > /root/curobo_install.log 2>&1 &
+        echo CUROBO_INSTALL_LAUNCHED
+        """
+    )
+
+
+def provision_curobo(config: AppConfig, info: InstanceInfo) -> None:
+    """Kick off the background cuRobo install (returns immediately)."""
+    assert info.ssh
+    output = run_ssh_script(
+        config, info.ssh, build_curobo_install_script(), in_container=True, timeout_seconds=60
+    )
+    typer.echo(output.splitlines()[-1] if output else "(no output)")
+    typer.echo(
+        "cuRobo installing in background (~5 min); check with: "
+        "tail /root/curobo_install.log (expects CUROBO_INSTALL_OK)"
+    )
+
+
 def build_container_probe_script() -> str:
     """Report readiness of everything we care about inside the container."""
     return dedent_script(
@@ -557,6 +609,9 @@ def build_container_probe_script() -> str:
                 grep -qm1 -E "Streaming App is loaded|app ready" "$log" && echo "$(basename $log): ready" || echo "$(basename $log): loading"
             fi
         done
+        if [ -f /root/curobo_install.log ]; then
+            grep -qm1 -E "CUROBO_INSTALL_OK|CUROBO_ALREADY_INSTALLED" /root/curobo_install.log && echo "curobo: ready" || echo "curobo: installing"
+        fi
         for p in {DEFAULT_AGENT_CONTROL_PORT} {DEFAULT_ISAAC_SIGNAL_PORT} {DEFAULT_RTSP_PORT} {DEFAULT_NOVNC_PORT}; do
             (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null && echo "port $p: open" || echo "port $p: closed"
         done
@@ -1483,6 +1538,11 @@ def launch(
     ),
     gui: bool = typer.Option(None, "--gui/--no-gui", help="Also start the noVNC GUI stack."),
     agent: bool = typer.Option(None, "--agent/--no-agent", help="Enable the agent control socket."),
+    curobo: bool = typer.Option(
+        None,
+        "--curobo/--no-curobo",
+        help="Install cuRobo into Isaac's python in the background after launch.",
+    ),
     project: str = typer.Option(
         None, "--project", help="Project namespace to rehydrate from / save to (default from config)."
     ),
@@ -1494,6 +1554,8 @@ def launch(
         config = replace(config, gui_enabled=gui)
     if agent is not None:
         config = replace(config, agent_enabled=agent)
+    if curobo is not None:
+        config = replace(config, curobo_enabled=curobo)
     prov = get_provider(config, provider)
     live_instance_id: str | None = None
     try:
@@ -1518,6 +1580,8 @@ def launch(
             typer.echo(snapshot_pull(config, prov, info, launch_project))
         typer.echo("Starting Isaac (first boot compiles shaders; allow several minutes)...")
         setup_isaac(config, info)
+        if config.curobo_enabled:
+            provision_curobo(config, info)
         print_access(config, info)
     except IsaacCloudError as exc:
         typer.echo(f"Error: {exc}")
