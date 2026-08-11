@@ -1463,10 +1463,15 @@ def snapshot_pull(
     snapshot: str | None = None,
     timeout_seconds: int = 3600,
 ) -> str:
-    """Restore a snapshot into the remote project directory via an atomic swap.
+    """Restore a snapshot into the remote project directory, mount-safely.
 
-    The live directory is only replaced after the archive has fully extracted,
-    so a dropped connection leaves the previous contents intact."""
+    The archive fully extracts into a sibling directory before anything is
+    deleted, so a dropped connection leaves the previous contents intact.
+    The live directory's *children* are then replaced rather than the
+    directory itself: on AWS it is a docker bind mount, and bind mounts track
+    the inode — swapping the directory would leave the container looking at
+    the orphaned old one (verified live; a `mv`-swap restore succeeded on the
+    VM while the container still saw stale contents)."""
     target = _require_reachable_ssh(info)
     snaps = list_snapshots(config, project)
     if snapshot:
@@ -1483,12 +1488,13 @@ def snapshot_pull(
     remote_path = provider.persistence_remote_path()
     sudo = provider.remote_sudo()
     incoming = remote_path + ".incoming"
-    old = remote_path + ".old"
     script = (
         f"set -e; rm -rf {shell_quote(incoming)}; mkdir -p {shell_quote(incoming)}; "
         f"tar -C {shell_quote(incoming)} -xzf -; "
-        f"rm -rf {shell_quote(old)}; mv {shell_quote(remote_path)} {shell_quote(old)} 2>/dev/null || true; "
-        f"mv {shell_quote(incoming)} {shell_quote(remote_path)}; rm -rf {shell_quote(old)}; "
+        f"mkdir -p {shell_quote(remote_path)}; "
+        f"find {shell_quote(remote_path)} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +; "
+        f"find {shell_quote(incoming)} -mindepth 1 -maxdepth 1 -exec mv -t {shell_quote(remote_path)} -- {{}} +; "
+        f"rmdir {shell_quote(incoming)}; "
         f"chmod -R a+rwX {shell_quote(remote_path)} || true"
     )
     remote_command = f"{sudo}bash -c {shell_quote(script)}"
@@ -1826,7 +1832,7 @@ def sync_pull(
         None, "--snapshot", help="Snapshot name/timestamp to restore (default: newest)."
     ),
 ) -> None:
-    """Restore a project snapshot from S3 into the instance (atomic swap)."""
+    """Restore a project snapshot from S3 into the instance."""
     config = _config()
     prov = get_provider(config, provider)
     info = prov.get(instance_id)

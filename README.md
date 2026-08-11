@@ -103,8 +103,9 @@ s3://<bucket>/<base>/projects/<project>/snapshots/<utc-timestamp>.tar.gz
 - the last `[persistence].keep_last` snapshots per project are retained
   (default 10); older ones are pruned after each successful save
 
-Saves never overwrite or delete existing snapshots, restores swap the remote
-directory atomically (a dropped connection can't leave it half-restored), and
+Saves never overwrite or delete existing snapshots, restores fully extract
+before deleting anything (a dropped connection can't leave the project
+half-restored, and the container bind mount on AWS is preserved), and
 pushing an empty project directory is skipped rather than saved. Transfers
 run **through your local machine** (SSH + tar + `aws s3 cp`): cloud instances
 never receive AWS credentials.
