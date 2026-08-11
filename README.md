@@ -64,6 +64,62 @@ tunnel in a spare terminal and every service above is on `localhost`.
 First boot compiles RTX shaders — allow 5–10 minutes before the sim is
 responsive. Warm restarts take under a minute.
 
+## Driving Isaac from Claude Code
+
+Two complementary integrations. Both assume an instance is up and the tunnel
+is running (`uv run python isaac_cloud.py tunnel --instance-id <ID>`), which
+puts Isaac's agent control socket at `localhost:8226`. The socket requires
+`[isaac].agent = true` (the default); `status` reports `port 8226: open`
+once Isaac has finished loading.
+
+### Live control — the `isaac-sim-remote` skill
+
+NVIDIA ships an official Claude Code skill in the Isaac Sim repo
+([`skills/isaac-sim-remote`](https://github.com/isaac-sim/IsaacSim/tree/main/skills/isaac-sim-remote))
+that executes Python inside the running sim over that socket: USD stage
+manipulation, play/pause/step, screenshots, annotator data (depth,
+segmentation), with named execution contexts that persist state between
+calls. Install it by checking out the skill directory and linking it into
+your skills folder:
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/isaac-sim/IsaacSim.git
+git -C IsaacSim sparse-checkout set skills/isaac-sim-remote
+
+ln -s "$PWD/IsaacSim/skills/isaac-sim-remote" ~/.claude/skills/isaac-sim-remote  # personal
+# or project-scoped, shared with the repo: cp -r IsaacSim/skills/isaac-sim-remote .claude/skills/
+```
+
+Claude Code follows symlinks and picks up skill changes without a restart.
+Invoke it with `/isaac-sim-remote` (or just describe what you want in the
+sim — the skill self-selects when relevant). On a cold instance, wait for
+the shader compile to finish (`status` probe shows the app ready) before
+driving it.
+
+### Reference lookup — the official Isaac Sim MCP server
+
+NVIDIA also publishes an [Isaac Sim MCP server](https://docs.isaacsim.omniverse.nvidia.com/latest/development_tools/isaac_sim_mcp.html)
+([source](https://github.com/NVIDIA-Omniverse/kit-usd-agents/tree/main/source/mcp/isaacsim_mcp)).
+Know what it is: a **documentation/knowledge server** — semantic search over
+Isaac extensions, code examples, and settings — not a control channel to
+your instance. It runs locally in Docker (needs an NVIDIA API key from
+build.nvidia.com):
+
+```bash
+git clone https://github.com/NVIDIA-Omniverse/kit-usd-agents.git
+cd kit-usd-agents/source/mcp/isaacsim_mcp && ./build-docker.sh
+docker run --rm -p 9904:9904 --env-file ../.env isaacsim-mcp:latest
+
+claude mcp add --transport http isaac-sim-mcp http://localhost:9904
+```
+
+Check it with `/mcp` inside a session, or `claude mcp list`. Pairing the two
+works well: the MCP server answers "how do I do X in Isaac", the skill then
+does X in your live sim.
+
+No official MCP server wraps the live `8226` socket — live control goes
+through the skill.
+
 ## GPU notes (important for video)
 
 **NVENC (hardware H.264) only works when the rented GPU is host GPU 0.**
