@@ -133,4 +133,4 @@ This tool previously targeted TensorDock, whose marketplace emptied out after
 the Voltage Park acquisition (2025–2026). The experiment logs from the
 migration — including why WebRTC browser streaming over SSH tunnels was
 abandoned in favor of noVNC, and the NVENC device-index discovery — live in
-`VAST_EXPERIMENT_RESULTS.md` and `GUI_TUNNEL_EXPERIMENT_PLAN.md`.
+`docs/VAST_EXPERIMENT_RESULTS.md` and `docs/GUI_TUNNEL_EXPERIMENT_PLAN.md`.

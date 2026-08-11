@@ -12,6 +12,7 @@ CLI. Nothing Isaac-related is ever exposed to the public internet.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -63,7 +64,7 @@ PROJECT_LABEL_PREFIX = "project="
 AWS_TAG_PROJECT = "IsaacCloudProject"
 
 # Vast provider defaults. NVENC requires the rented GPU to be host GPU 0
-# (see VAST_EXPERIMENT_RESULTS.md), which whole-machine offers guarantee.
+# (see docs/VAST_EXPERIMENT_RESULTS.md), which whole-machine offers guarantee.
 DEFAULT_VAST_QUERY = (
     'gpu_name in ["RTX_4090","L40S"] driver_version >= 580.95.05 '
     "verified=true rentable=true num_gpus=1 disk_space >= 80 inet_down >= 300"
@@ -73,7 +74,7 @@ DEFAULT_VAST_MIN_RELIABILITY = 0.99
 
 # Vast surfaces docker's own error text in `status_msg` while the instance sits
 # in "loading" forever (measured: bad registry login visible at +30s, missing
-# image tag at +50s; neither ever self-heals — see VAST_TIMEOUT_EXPERIMENT_RESULTS.md).
+# image tag at +50s; neither ever self-heals — see docs/VAST_TIMEOUT_EXPERIMENT_RESULTS.md).
 # Matching one of these means the provision is doomed: bail instead of waiting
 # out the timeout.
 VAST_FATAL_STATUS_PATTERNS = (
@@ -261,6 +262,67 @@ class InstanceInfo:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+class ProvisionMonitor:
+    """Per-launch provisioning failure detector used by wait_for_ssh.
+
+    The default accepts anything and lets the timeout be the only backstop;
+    providers with detectable failure modes override the hooks to raise
+    ProvisioningDoomed early."""
+
+    def check_status(self, info: InstanceInfo) -> None:
+        """Called with every polled instance state before SSH is attempted."""
+
+    def auth_denied(self, info: InstanceInfo) -> None:
+        """Called each time SSH pubkey auth is denied on a running instance."""
+
+    def auth_reset(self) -> None:
+        """Called when an SSH failure was something other than an auth denial."""
+
+
+class Provider:
+    """Shared provider interface: lifecycle methods are required, hooks are no-ops."""
+
+    name = "abstract"
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+
+    # --- required lifecycle ---
+    def launch(self, offer_id: str | None = None) -> InstanceInfo:
+        raise NotImplementedError
+
+    def list_instances(self) -> list[InstanceInfo]:
+        raise NotImplementedError
+
+    def get(self, instance_id: str) -> InstanceInfo:
+        raise NotImplementedError
+
+    def stop(self, instance_id: str) -> None:
+        raise NotImplementedError
+
+    def start(self, instance_id: str) -> None:
+        raise NotImplementedError
+
+    def destroy(self, instance_id: str) -> None:
+        raise NotImplementedError
+
+    def persistence_remote_path(self) -> str:
+        raise NotImplementedError
+
+    def remote_sudo(self) -> str:
+        raise NotImplementedError
+
+    # --- optional hooks ---
+    def set_project_label(self, instance_id: str, project: str) -> None:
+        """Record the project an instance was launched for (best-effort)."""
+
+    def attach_ssh_key(self, instance_id: str) -> None:
+        """Re-attach the user's SSH key to a running instance (best-effort)."""
+
+    def provision_monitor(self) -> ProvisionMonitor:
+        return ProvisionMonitor()
+
+
 def shell_quote(value: str) -> str:
     return shlex.quote(value)
 
@@ -279,6 +341,53 @@ def check_tcp_connectivity(host: str, port: int, timeout_seconds: float = 5.0) -
             return True
     except OSError:
         return False
+
+
+def run_cli(
+    cmd: list[str],
+    *,
+    timeout_seconds: int,
+    error_prefix: str,
+    env: dict[str, str] | None = None,
+    parse_json: bool = False,
+) -> Any:
+    """Run an external CLI, raising IsaacCloudError with its output on failure."""
+    completed = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout_seconds,
+        env=env,
+    )
+    if completed.returncode != 0:
+        output = ((completed.stderr or "") + "\n" + (completed.stdout or "")).strip()
+        _raise(f"{error_prefix}: {output[:600]}" if output else f"{error_prefix}.")
+    if not parse_json:
+        return (completed.stdout or "").strip()
+    if not completed.stdout.strip():
+        return {}
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        _raise(f"{error_prefix}: non-JSON output: {completed.stdout[:300]}")
+
+
+def run_cli_quiet(cmd: list[str], *, timeout_seconds: int) -> None:
+    """Best-effort external command: failures are deliberately swallowed."""
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout_seconds)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def read_public_key(config: AppConfig) -> str | None:
+    if not config.ssh_public_key_path:
+        return None
+    try:
+        return Path(config.ssh_public_key_path).expanduser().read_text().strip()
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +508,7 @@ def probe_local_tunnel(timeout_seconds: float = 5.0) -> str:
         sock.close()
 
 
-def run_supervised_tunnel(config: AppConfig, provider, instance_id: str) -> None:
+def run_supervised_tunnel(config: AppConfig, provider: Provider, instance_id: str) -> None:
     """Foreground self-healing tunnel: keepalives kill zombies within ~30s,
     then we reconnect with backoff, re-resolving the instance address in case
     it changed across a stop/start. Ctrl-C exits."""
@@ -464,8 +573,8 @@ def format_tunnel_command(config: AppConfig, target: SshTarget, forwards: list[t
 
 
 # ---------------------------------------------------------------------------
-# Container-side setup scripts (validated in VAST_EXPERIMENT_RESULTS.md and
-# GUI_TUNNEL_EXPERIMENT_PLAN.md; identical inside the Isaac image on every
+# Container-side setup scripts (validated in docs/VAST_EXPERIMENT_RESULTS.md and
+# docs/GUI_TUNNEL_EXPERIMENT_PLAN.md; identical inside the Isaac image on every
 # provider).
 # ---------------------------------------------------------------------------
 
@@ -637,26 +746,69 @@ def _vastai_bin() -> str:
 
 
 def run_vastai_json(args: list[str], *, timeout_seconds: int = 60) -> Any:
-    completed = subprocess.run(
+    return run_cli(
         [_vastai_bin(), *args, "--raw"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
+        timeout_seconds=timeout_seconds,
+        error_prefix=f"vastai {' '.join(args[:2])} failed",
+        parse_json=True,
     )
-    if completed.returncode != 0:
-        _raise(f"vastai {' '.join(args[:2])} failed: {(completed.stderr or completed.stdout)[:500]}")
-    try:
-        return json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        _raise(f"vastai returned non-JSON output: {completed.stdout[:300]}")
 
 
-class VastProvider:
+class VastProvisionMonitor(ProvisionMonitor):
+    """Fail-fast detection for Vast (measured: docs/VAST_TIMEOUT_EXPERIMENT_RESULTS.md).
+
+    Vast surfaces docker's own error text in status_msg while a doomed
+    instance sits in "loading" forever; auth denial after "running" means the
+    host missed the account-key injection and never self-heals."""
+
+    def __init__(self, provider: "VastProvider") -> None:
+        self.provider = provider
+        self._daemon_error_since: float | None = None
+        self._auth_denied_since: float | None = None
+        self._key_reattached = False
+
+    def check_status(self, info: InstanceInfo) -> None:
+        msg = str(info.raw.get("status_msg") or "").strip()
+        low = msg.lower()
+        if any(pat in low for pat in VAST_FATAL_STATUS_PATTERNS):
+            raise ProvisioningDoomed(
+                f"Provisioning of {info.instance_id} failed (image pull cannot succeed): "
+                f"{msg[:300]}. Retry with another offer (or fix credentials/image)."
+            )
+        if VAST_DAEMON_ERROR_MARKER in low:
+            self._daemon_error_since = self._daemon_error_since or time.time()
+            if time.time() - self._daemon_error_since >= VAST_DAEMON_ERROR_FATAL_S:
+                raise ProvisioningDoomed(
+                    f"Provisioning of {info.instance_id} stuck on a docker daemon error "
+                    f"for {VAST_DAEMON_ERROR_FATAL_S}s: {msg[:300]}"
+                )
+        else:
+            self._daemon_error_since = None
+
+    def auth_denied(self, info: InstanceInfo) -> None:
+        now = time.time()
+        self._auth_denied_since = self._auth_denied_since or now
+        denied_for = now - self._auth_denied_since
+        if not self._key_reattached and denied_for >= VAST_SSH_DENIED_ATTACH_S:
+            typer.echo(
+                "SSH key auth denied after instance start; "
+                "re-attaching the key to the instance..."
+            )
+            self.provider.attach_ssh_key(info.instance_id)
+            self._key_reattached = True
+        elif denied_for >= VAST_SSH_DENIED_GIVE_UP_S:
+            raise ProvisioningDoomed(
+                f"Instance {info.instance_id} is running but has refused pubkey "
+                f"auth for {int(denied_for)}s (host failed to inject the SSH "
+                f"key). This does not self-heal: rent another offer."
+            )
+
+    def auth_reset(self) -> None:
+        self._auth_denied_since = None
+
+
+class VastProvider(Provider):
     name = "vast"
-
-    def __init__(self, config: AppConfig) -> None:
-        self.config = config
 
     def _query(self) -> str:
         query = self.config.vast_query
@@ -723,20 +875,9 @@ class VastProvider:
     def _ensure_account_ssh_key(self) -> None:
         # Account-level keys are injected at container creation; per-instance
         # attach races the container start on some hosts.
-        pub_path = self.config.ssh_public_key_path
-        if not pub_path:
-            return
-        try:
-            pub = Path(pub_path).expanduser().read_text().strip()
-            subprocess.run(
-                [_vastai_bin(), "create", "ssh-key", pub],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30,
-            )
-        except OSError:
-            pass
+        pub = read_public_key(self.config)
+        if pub:
+            run_cli_quiet([_vastai_bin(), "create", "ssh-key", pub], timeout_seconds=30)
 
     def list_instances(self) -> list[InstanceInfo]:
         rows = run_vastai_json(["show", "instances"])
@@ -762,48 +903,22 @@ class VastProvider:
             raw=row,
         )
 
-    def provisioning_error(self, info: InstanceInfo) -> str | None:
-        """Return docker's error text when the provision is doomed (else None)."""
-        msg = str(info.raw.get("status_msg") or "").strip()
-        low = msg.lower()
-        if any(pat in low for pat in VAST_FATAL_STATUS_PATTERNS):
-            return msg
-        return None
-
-    def transient_daemon_error(self, info: InstanceInfo) -> str | None:
-        """Generic docker daemon error: fatal only if it persists across polls."""
-        msg = str(info.raw.get("status_msg") or "").strip()
-        if VAST_DAEMON_ERROR_MARKER in msg.lower():
-            return msg
-        return None
+    def provision_monitor(self) -> ProvisionMonitor:
+        return VastProvisionMonitor(self)
 
     def set_project_label(self, instance_id: str, project: str) -> None:
         # Best-effort: records which project this instance was launched for so
         # stop/destroy save back to the same project without --project.
-        subprocess.run(
+        run_cli_quiet(
             [_vastai_bin(), "label", "instance", instance_id, f"{PROJECT_LABEL_PREFIX}{project}"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
+            timeout_seconds=30,
         )
 
     def attach_ssh_key(self, instance_id: str) -> None:
         """Recovery for hosts that miss the account-key injection at create."""
-        pub_path = self.config.ssh_public_key_path
-        if not pub_path:
-            return
-        try:
-            pub = Path(pub_path).expanduser().read_text().strip()
-            subprocess.run(
-                [_vastai_bin(), "attach", "ssh", instance_id, pub],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=45,
-            )
-        except OSError:
-            pass
+        pub = read_public_key(self.config)
+        if pub:
+            run_cli_quiet([_vastai_bin(), "attach", "ssh", instance_id, pub], timeout_seconds=45)
 
     def stop(self, instance_id: str) -> None:
         run_vastai_json(["stop", "instance", instance_id])
@@ -812,13 +927,7 @@ class VastProvider:
         run_vastai_json(["start", "instance", instance_id])
 
     def destroy(self, instance_id: str) -> None:
-        subprocess.run(
-            [_vastai_bin(), "destroy", "instance", instance_id, "-y"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-        )
+        run_cli_quiet([_vastai_bin(), "destroy", "instance", instance_id, "-y"], timeout_seconds=60)
 
     def persistence_remote_path(self) -> str:
         # No volume mounts in the Vast container model; the project lives on
@@ -835,23 +944,16 @@ class VastProvider:
 
 
 def run_aws_json(config: AppConfig, args: list[str], *, timeout_seconds: int = 120) -> Any:
-    completed = subprocess.run(
+    return run_cli(
         ["aws", *args, "--region", config.aws_region, "--output", "json"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
+        timeout_seconds=timeout_seconds,
+        error_prefix=f"aws {' '.join(args[:3])} failed",
+        parse_json=True,
     )
-    if completed.returncode != 0:
-        _raise(f"aws {' '.join(args[:3])} failed: {(completed.stderr or completed.stdout)[:600]}")
-    return json.loads(completed.stdout) if completed.stdout.strip() else {}
 
 
-class AwsProvider:
+class AwsProvider(Provider):
     name = "aws"
-
-    def __init__(self, config: AppConfig) -> None:
-        self.config = config
 
     def resolve_ami(self) -> str:
         result = run_aws_json(
@@ -1057,14 +1159,11 @@ class AwsProvider:
 
     def set_project_label(self, instance_id: str, project: str) -> None:
         # Best-effort tag; read back by resolve_project via the raw Tags list.
-        subprocess.run(
+        run_cli_quiet(
             ["aws", "ec2", "create-tags", "--resources", instance_id,
              "--tags", f"Key={AWS_TAG_PROJECT},Value={project}",
              "--region", self.config.aws_region],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
+            timeout_seconds=60,
         )
 
     def stop(self, instance_id: str) -> None:
@@ -1086,7 +1185,7 @@ class AwsProvider:
 PROVIDERS = {"vast": VastProvider, "aws": AwsProvider}
 
 
-def get_provider(config: AppConfig, override: str | None = None):
+def get_provider(config: AppConfig, override: str | None = None) -> Provider:
     name = (override or config.provider).lower()
     if name not in PROVIDERS:
         _raise(f"Unknown provider '{name}'. Choose from: {', '.join(PROVIDERS)}")
@@ -1098,63 +1197,33 @@ def get_provider(config: AppConfig, override: str | None = None):
 # ---------------------------------------------------------------------------
 
 
-def wait_for_ssh(config: AppConfig, provider, instance_id: str, timeout_seconds: int = 900) -> InstanceInfo:
+def wait_for_ssh(
+    config: AppConfig, provider: Provider, instance_id: str, timeout_seconds: int = 900
+) -> InstanceInfo:
     """Wait for SSH, bailing early on provisioning failures the provider can detect.
 
-    Measured on Vast (VAST_TIMEOUT_EXPERIMENT_RESULTS.md): healthy launches are
+    Measured on Vast (docs/VAST_TIMEOUT_EXPERIMENT_RESULTS.md): healthy launches are
     SSH-ready in 1.5-10 min; every observed failure mode is detectable in under
     2 min via status_msg, or via persistent pubkey denial after "running".
+    The provider's ProvisionMonitor owns that detection and raises
+    ProvisioningDoomed; the timeout here is only the backstop for slow-but-alive
+    provisions.
     """
     deadline = time.time() + timeout_seconds
+    monitor = provider.provision_monitor()
     info: InstanceInfo | None = None
-    daemon_error_since: float | None = None
-    auth_denied_since: float | None = None
-    key_reattached = False
     while time.time() < deadline:
         info = provider.get(instance_id)
-        fatal = getattr(provider, "provisioning_error", lambda _info: None)(info)
-        if fatal:
-            raise ProvisioningDoomed(
-                f"Provisioning of {instance_id} failed (image pull cannot succeed): "
-                f"{fatal[:300]}. Retry with another offer (or fix credentials/image)."
-            )
-        transient = getattr(provider, "transient_daemon_error", lambda _info: None)(info)
-        if transient:
-            daemon_error_since = daemon_error_since or time.time()
-            if time.time() - daemon_error_since >= VAST_DAEMON_ERROR_FATAL_S:
-                raise ProvisioningDoomed(
-                    f"Provisioning of {instance_id} stuck on a docker daemon error "
-                    f"for {VAST_DAEMON_ERROR_FATAL_S}s: {transient[:300]}"
-                )
-        else:
-            daemon_error_since = None
+        monitor.check_status(info)
         if info.status in {"running"} and info.ssh:
             try:
                 run_ssh(config, info.ssh, "true", timeout_seconds=20)
                 return info
             except (IsaacCloudError, subprocess.TimeoutExpired) as exc:
                 if "permission denied" in str(exc).lower():
-                    auth_denied_since = auth_denied_since or time.time()
-                    denied_for = time.time() - auth_denied_since
-                    if (
-                        not key_reattached
-                        and denied_for >= VAST_SSH_DENIED_ATTACH_S
-                        and hasattr(provider, "attach_ssh_key")
-                    ):
-                        typer.echo(
-                            "SSH key auth denied after instance start; "
-                            "re-attaching the key to the instance..."
-                        )
-                        provider.attach_ssh_key(instance_id)
-                        key_reattached = True
-                    elif denied_for >= VAST_SSH_DENIED_GIVE_UP_S:
-                        raise ProvisioningDoomed(
-                            f"Instance {instance_id} is running but has refused pubkey "
-                            f"auth for {int(denied_for)}s (host failed to inject the SSH "
-                            f"key). This does not self-heal: rent another offer."
-                        )
+                    monitor.auth_denied(info)
                 else:
-                    auth_denied_since = None
+                    monitor.auth_reset()
         time.sleep(12)
     last_msg = str(info.raw.get("status_msg") or "").strip()[:200] if info else ""
     _raise(f"Instance {instance_id} did not become SSH-reachable within {timeout_seconds}s "
@@ -1271,18 +1340,12 @@ def build_local_aws_env(config: AppConfig) -> dict[str, str]:
 
 
 def run_local_aws(config: AppConfig, args: list[str], *, timeout_seconds: int = 3600) -> str:
-    completed = subprocess.run(
+    return run_cli(
         ["aws", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
+        timeout_seconds=timeout_seconds,
+        error_prefix=f"aws {' '.join(args[:3])} failed",
         env=build_local_aws_env(config),
     )
-    if completed.returncode != 0:
-        output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
-        _raise(output or f"aws {' '.join(args[:3])} failed.")
-    return (completed.stdout or "").strip()
 
 
 def list_snapshots(config: AppConfig, project: str) -> list[dict[str, Any]]:
@@ -1330,7 +1393,7 @@ def _require_reachable_ssh(info: InstanceInfo) -> SshTarget:
 
 def snapshot_push(
     config: AppConfig,
-    provider,
+    provider: Provider,
     info: InstanceInfo,
     project: str,
     *,
@@ -1383,7 +1446,7 @@ def snapshot_push(
 
 def snapshot_pull(
     config: AppConfig,
-    provider,
+    provider: Provider,
     info: InstanceInfo,
     project: str,
     *,
@@ -1476,50 +1539,67 @@ sync_app = typer.Typer(help="Save/restore project snapshots (append-only) betwee
 app.add_typer(sync_app, name="sync")
 
 PROVIDER_OPTION = typer.Option(None, "--provider", "-p", help="vast or aws (default from config).")
+INSTANCE_ID_OPTION = typer.Option(..., "--instance-id")
+PROJECT_OPTION = typer.Option(
+    None,
+    "--project",
+    help="Project namespace (default: the project the instance was launched with, else config).",
+)
 
 
 def _config() -> AppConfig:
     return load_app_config()
 
 
+def cli_errors(func):
+    """Print IsaacCloudError as `Error: ...` and exit 1 (shared by every command).
+
+    Commands needing extra failure-path output (launch's leftover-instance
+    hint, stop/destroy's not-stopped warnings) print it before re-raising."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except IsaacCloudError as exc:
+            typer.echo(f"Error: {exc}")
+            raise typer.Exit(1)
+
+    return wrapper
+
+
 @app.command()
+@cli_errors
 def catalog(provider: str = PROVIDER_OPTION) -> None:
     """List available GPU offers/instance options for the provider."""
     config = _config()
     prov = get_provider(config, provider)
-    try:
-        if prov.name == "vast":
-            offers = prov.catalog()
-            if not offers:
-                typer.echo("No matching offers.")
-                raise typer.Exit(1)
-            for o in offers:
-                typer.echo(
-                    f"offer={o['id']} machine={o.get('machine_id')} {o.get('gpu_name')} "
-                    f"driver={o.get('driver_version')} ${o.get('dph_total', 0):.3f}/hr "
-                    f"rel={o.get('reliability2', 0):.3f} inet={o.get('inet_down', 0):.0f}Mbps "
-                    f"{o.get('geolocation')}"
-                )
-        else:
-            ami = prov.resolve_ami()
+    if prov.name == "vast":
+        offers = prov.catalog()
+        if not offers:
+            typer.echo("No matching offers.")
+            raise typer.Exit(1)
+        for o in offers:
             typer.echo(
-                f"aws {config.aws_region}: instance_type={config.aws_instance_type} ami={ami}"
+                f"offer={o['id']} machine={o.get('machine_id')} {o.get('gpu_name')} "
+                f"driver={o.get('driver_version')} ${o.get('dph_total', 0):.3f}/hr "
+                f"rel={o.get('reliability2', 0):.3f} inet={o.get('inet_down', 0):.0f}Mbps "
+                f"{o.get('geolocation')}"
             )
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}")
-        raise typer.Exit(1)
+    else:
+        ami = prov.resolve_ami()
+        typer.echo(
+            f"aws {config.aws_region}: instance_type={config.aws_instance_type} ami={ami}"
+        )
 
 
 @app.command()
+@cli_errors
 def instances(provider: str = PROVIDER_OPTION) -> None:
     """List managed instances."""
     config = _config()
     prov = get_provider(config, provider)
-    try:
-        rows = prov.list_instances()
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}")
-        raise typer.Exit(1)
+    rows = prov.list_instances()
     if not rows:
         typer.echo("No instances found.")
         return
@@ -1543,9 +1623,7 @@ def launch(
         "--curobo/--no-curobo",
         help="Install cuRobo into Isaac's python in the background after launch.",
     ),
-    project: str = typer.Option(
-        None, "--project", help="Project namespace to rehydrate from / save to (default from config)."
-    ),
+    project: str = PROJECT_OPTION,
     timeout_seconds: int = typer.Option(1200, help="How long to wait for SSH readiness."),
 ) -> None:
     """Rent/launch an instance, start Isaac, and print SSH tunnel commands."""
@@ -1595,89 +1673,81 @@ def launch(
 
 
 @app.command()
+@cli_errors
 def status(
-    instance_id: str = typer.Option(..., "--instance-id"),
+    instance_id: str = INSTANCE_ID_OPTION,
     provider: str = PROVIDER_OPTION,
 ) -> None:
     """Show instance state plus in-container readiness probes."""
     config = _config()
     prov = get_provider(config, provider)
-    try:
-        info = prov.get(instance_id)
-        ssh = f"{info.ssh.user}@{info.ssh.host}:{info.ssh.port}" if info.ssh else "-"
-        typer.echo(f"{info.provider}:{info.instance_id} {info.status} {ssh}")
-        if info.ssh and check_tcp_connectivity(info.ssh.host, info.ssh.port):
-            probe = run_ssh_script(
-                config, info.ssh, build_container_probe_script(),
-                in_container=True, timeout_seconds=120,
-            )
-            typer.echo(probe)
-            typer.echo(probe_local_tunnel())
-            print_access(config, info)
-        else:
-            typer.echo("SSH not reachable yet.")
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}")
-        raise typer.Exit(1)
+    info = prov.get(instance_id)
+    ssh = f"{info.ssh.user}@{info.ssh.host}:{info.ssh.port}" if info.ssh else "-"
+    typer.echo(f"{info.provider}:{info.instance_id} {info.status} {ssh}")
+    if info.ssh and check_tcp_connectivity(info.ssh.host, info.ssh.port):
+        probe = run_ssh_script(
+            config, info.ssh, build_container_probe_script(),
+            in_container=True, timeout_seconds=120,
+        )
+        typer.echo(probe)
+        typer.echo(probe_local_tunnel())
+        print_access(config, info)
+    else:
+        typer.echo("SSH not reachable yet.")
 
 
 @app.command()
+@cli_errors
 def stop(
-    instance_id: str = typer.Option(..., "--instance-id"),
+    instance_id: str = INSTANCE_ID_OPTION,
     provider: str = PROVIDER_OPTION,
-    project: str = typer.Option(None, "--project", help="Project to save into (default: launch label, then config)."),
+    project: str = PROJECT_OPTION,
     skip_push: bool = typer.Option(False, "--skip-push", help="Skip the snapshot save before stopping."),
 ) -> None:
     """Stop an instance (saves a project snapshot to S3 first if enabled)."""
     config = _config()
     prov = get_provider(config, provider)
-    try:
-        if config.persistence_enabled and not skip_push:
-            info = prov.get(instance_id)
-            target_project = resolve_project(config, info, project)
-            typer.echo(f"Saving snapshot of project '{target_project}' to S3...")
-            try:
-                typer.echo(snapshot_push(config, prov, info, target_project))
-            except IsaacCloudError as exc:
-                typer.echo(f"Error: snapshot save failed: {exc}")
-                typer.echo(
-                    f"Instance {instance_id} was NOT stopped (it is still running and billing). "
-                    f"Retry, or stop without saving: ... stop --instance-id {instance_id} --skip-push"
-                )
-                raise typer.Exit(1)
-        prov.stop(instance_id)
-        typer.echo(f"Stopped {instance_id}.")
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}")
-        raise typer.Exit(1)
+    if config.persistence_enabled and not skip_push:
+        info = prov.get(instance_id)
+        target_project = resolve_project(config, info, project)
+        typer.echo(f"Saving snapshot of project '{target_project}' to S3...")
+        try:
+            typer.echo(snapshot_push(config, prov, info, target_project))
+        except IsaacCloudError as exc:
+            typer.echo(f"Error: snapshot save failed: {exc}")
+            typer.echo(
+                f"Instance {instance_id} was NOT stopped (it is still running and billing). "
+                f"Retry, or stop without saving: ... stop --instance-id {instance_id} --skip-push"
+            )
+            raise typer.Exit(1)
+    prov.stop(instance_id)
+    typer.echo(f"Stopped {instance_id}.")
 
 
 @app.command()
+@cli_errors
 def resume(
-    instance_id: str = typer.Option(..., "--instance-id"),
+    instance_id: str = INSTANCE_ID_OPTION,
     provider: str = PROVIDER_OPTION,
 ) -> None:
     """Start a stopped instance and relaunch Isaac."""
     config = _config()
     prov = get_provider(config, provider)
-    try:
-        prov.start(instance_id)
-        info = wait_for_ssh(config, prov, instance_id)
-        wait_for_container(config, info)
-        setup_isaac(config, info)
-        print_access(config, info)
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}")
-        raise typer.Exit(1)
+    prov.start(instance_id)
+    info = wait_for_ssh(config, prov, instance_id)
+    wait_for_container(config, info)
+    setup_isaac(config, info)
+    print_access(config, info)
 
 
 @app.command()
+@cli_errors
 def destroy(
     instance_id: str = typer.Option(None, "--instance-id"),
     provider: str = PROVIDER_OPTION,
     all_instances: bool = typer.Option(False, "--all"),
     yes: bool = typer.Option(False, "--yes", "-y"),
-    project: str = typer.Option(None, "--project", help="Project to save into (default: launch label, then config)."),
+    project: str = PROJECT_OPTION,
     skip_push: bool = typer.Option(False, "--skip-push", help="Destroy without saving a snapshot first."),
 ) -> None:
     """Destroy instance(s), saving a project snapshot to S3 first if enabled.
@@ -1687,44 +1757,41 @@ def destroy(
     --skip-push to destroy anyway."""
     config = _config()
     prov = get_provider(config, provider)
-    try:
-        targets = (
-            [i.instance_id for i in prov.list_instances()] if all_instances else [instance_id]
+    targets = (
+        [i.instance_id for i in prov.list_instances()] if all_instances else [instance_id]
+    )
+    targets = [t for t in targets if t]
+    if not targets:
+        typer.echo("Nothing to destroy.")
+        return
+    if not yes:
+        typer.confirm(f"Destroy {len(targets)} instance(s) on {prov.name}?", abort=True)
+    kept: list[str] = []
+    for tid in targets:
+        if config.persistence_enabled and not skip_push:
+            try:
+                info = prov.get(tid)
+                target_project = resolve_project(config, info, project)
+                typer.echo(f"Saving snapshot of project '{target_project}' from {tid}...")
+                typer.echo(snapshot_push(config, prov, info, target_project))
+            except IsaacCloudError as exc:
+                typer.echo(f"Not destroying {tid}: snapshot save failed: {exc}")
+                kept.append(tid)
+                continue
+        prov.destroy(tid)
+        typer.echo(f"Destroyed {tid}.")
+    if kept:
+        typer.echo(
+            f"{len(kept)} instance(s) kept (still running and billing): {', '.join(kept)}. "
+            f"Retry, or destroy without saving: ... destroy --skip-push"
         )
-        targets = [t for t in targets if t]
-        if not targets:
-            typer.echo("Nothing to destroy.")
-            return
-        if not yes:
-            typer.confirm(f"Destroy {len(targets)} instance(s) on {prov.name}?", abort=True)
-        kept: list[str] = []
-        for tid in targets:
-            if config.persistence_enabled and not skip_push:
-                try:
-                    info = prov.get(tid)
-                    target_project = resolve_project(config, info, project)
-                    typer.echo(f"Saving snapshot of project '{target_project}' from {tid}...")
-                    typer.echo(snapshot_push(config, prov, info, target_project))
-                except IsaacCloudError as exc:
-                    typer.echo(f"Not destroying {tid}: snapshot save failed: {exc}")
-                    kept.append(tid)
-                    continue
-            prov.destroy(tid)
-            typer.echo(f"Destroyed {tid}.")
-        if kept:
-            typer.echo(
-                f"{len(kept)} instance(s) kept (still running and billing): {', '.join(kept)}. "
-                f"Retry, or destroy without saving: ... destroy --skip-push"
-            )
-            raise typer.Exit(1)
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}")
         raise typer.Exit(1)
 
 
 @app.command()
+@cli_errors
 def tunnel(
-    instance_id: str = typer.Option(..., "--instance-id"),
+    instance_id: str = INSTANCE_ID_OPTION,
     provider: str = PROVIDER_OPTION,
 ) -> None:
     """Run a supervised SSH tunnel to the instance (auto-reconnects; Ctrl-C to stop).
@@ -1736,18 +1803,15 @@ def tunnel(
     """
     config = _config()
     prov = get_provider(config, provider)
-    try:
-        run_supervised_tunnel(config, prov, instance_id)
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}")
-        raise typer.Exit(1)
+    run_supervised_tunnel(config, prov, instance_id)
 
 
 @sync_app.command("pull")
+@cli_errors
 def sync_pull(
-    instance_id: str = typer.Option(..., "--instance-id"),
+    instance_id: str = INSTANCE_ID_OPTION,
     provider: str = PROVIDER_OPTION,
-    project: str = typer.Option(None, "--project", help="Project to restore from (default: launch label, then config)."),
+    project: str = PROJECT_OPTION,
     snapshot: str = typer.Option(
         None, "--snapshot", help="Snapshot name/timestamp to restore (default: newest)."
     ),
@@ -1755,20 +1819,17 @@ def sync_pull(
     """Restore a project snapshot from S3 into the instance (atomic swap)."""
     config = _config()
     prov = get_provider(config, provider)
-    try:
-        info = prov.get(instance_id)
-        target_project = resolve_project(config, info, project)
-        typer.echo(snapshot_pull(config, prov, info, target_project, snapshot=snapshot))
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}")
-        raise typer.Exit(1)
+    info = prov.get(instance_id)
+    target_project = resolve_project(config, info, project)
+    typer.echo(snapshot_pull(config, prov, info, target_project, snapshot=snapshot))
 
 
 @sync_app.command("push")
+@cli_errors
 def sync_push(
-    instance_id: str = typer.Option(..., "--instance-id"),
+    instance_id: str = INSTANCE_ID_OPTION,
     provider: str = PROVIDER_OPTION,
-    project: str = typer.Option(None, "--project", help="Project to save into (default: launch label, then config)."),
+    project: str = PROJECT_OPTION,
     allow_empty: bool = typer.Option(
         False, "--allow-empty", help="Save a snapshot even if the project directory is empty."
     ),
@@ -1776,34 +1837,27 @@ def sync_push(
     """Save the instance's project directory as a new snapshot in S3."""
     config = _config()
     prov = get_provider(config, provider)
-    try:
-        info = prov.get(instance_id)
-        target_project = resolve_project(config, info, project)
-        typer.echo(snapshot_push(config, prov, info, target_project, allow_empty=allow_empty))
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}")
-        raise typer.Exit(1)
+    info = prov.get(instance_id)
+    target_project = resolve_project(config, info, project)
+    typer.echo(snapshot_push(config, prov, info, target_project, allow_empty=allow_empty))
 
 
 @sync_app.command("list")
+@cli_errors
 def sync_list(
     project: str = typer.Option(None, "--project", help="List snapshots of this project only."),
 ) -> None:
     """List saved projects and their snapshots."""
     config = _config()
-    try:
-        projects = [validate_project_name(project)] if project else list_projects(config)
-        if not projects:
-            typer.echo("No saved projects.")
-            return
-        for name in projects:
-            snaps = list_snapshots(config, name)
-            typer.echo(f"{name}: {len(snaps)} snapshot(s)")
-            for snap in snaps:
-                typer.echo(f"  {snap['name']:32s} {snap['size'] / 1e6:8.1f} MB")
-    except IsaacCloudError as exc:
-        typer.echo(f"Error: {exc}")
-        raise typer.Exit(1)
+    projects = [validate_project_name(project)] if project else list_projects(config)
+    if not projects:
+        typer.echo("No saved projects.")
+        return
+    for name in projects:
+        snaps = list_snapshots(config, name)
+        typer.echo(f"{name}: {len(snaps)} snapshot(s)")
+        for snap in snaps:
+            typer.echo(f"  {snap['name']:32s} {snap['size'] / 1e6:8.1f} MB")
 
 
 if __name__ == "__main__":
