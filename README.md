@@ -49,8 +49,9 @@ uv run python isaac_cloud.py launch --provider aws
 uv run python isaac_cloud.py instances
 uv run python isaac_cloud.py status  --instance-id <ID>
 uv run python isaac_cloud.py tunnel  --instance-id <ID>   # supervised, auto-reconnecting
-uv run python isaac_cloud.py sync pull --instance-id <ID>
-uv run python isaac_cloud.py sync push --instance-id <ID>
+uv run python isaac_cloud.py sync list                   # saved projects + snapshots
+uv run python isaac_cloud.py sync pull --instance-id <ID> [--project P] [--snapshot TS]
+uv run python isaac_cloud.py sync push --instance-id <ID> [--project P]
 uv run python isaac_cloud.py stop    --instance-id <ID>
 uv run python isaac_cloud.py resume  --instance-id <ID>
 uv run python isaac_cloud.py destroy --instance-id <ID> --yes
@@ -82,14 +83,30 @@ exact driver-matched libraries automatically.
 ## Persistence
 
 When `[persistence].enabled = true`, the project directory
-(`/isaac-sim/project` in the container) is synced with S3:
+(`/isaac-sim/project` in the container) is saved to S3 as **append-only
+snapshots**, namespaced by project:
 
-- restored from S3 automatically on `launch`
-- pushed to S3 automatically on `stop` / `destroy`
-- manual `sync pull` / `sync push` anytime
+```
+s3://<bucket>/<base>/projects/<project>/snapshots/<utc-timestamp>.tar.gz
+```
 
-Sync runs **through your local machine** (SSH + tar + `aws s3 sync`): cloud
-instances never receive AWS credentials.
+- `launch` rehydrates the newest snapshot of the chosen project (a project
+  with no snapshots just starts fresh)
+- `stop` / `destroy` save a new snapshot first — and **refuse to proceed if
+  the save fails** (`--skip-push` overrides)
+- `sync push` / `sync pull` anytime; `sync pull --snapshot <name>` rolls
+  back to an older save; `sync list` shows what's stored
+- choose the namespace per run with `--project` (different users or
+  workstreams use different names); instances remember the project they were
+  launched with, so `stop`/`destroy` save back to the right one
+- the last `[persistence].keep_last` snapshots per project are retained
+  (default 10); older ones are pruned after each successful save
+
+Saves never overwrite or delete existing snapshots, restores swap the remote
+directory atomically (a dropped connection can't leave it half-restored), and
+pushing an empty project directory is skipped rather than saved. Transfers
+run **through your local machine** (SSH + tar + `aws s3 cp`): cloud instances
+never receive AWS credentials.
 
 On AWS the project directory also lives on the VM at
 `/home/ubuntu/isaac-cloud/project` (bind-mounted into the container), so it
@@ -104,7 +121,8 @@ See `config.example.toml`. Highlights:
 - `[gui].enabled` / `resolution` — noVNC GUI stack (default off; `--gui` per launch).
 - `[vast].whole_machine` / `min_reliability` / `query` — offer selection.
 - `[aws].region` / `instance_type` — defaults `us-west-2` / `g6e.xlarge`.
-- `[persistence].s3_uri` — `s3://bucket/path/` workspace location.
+- `[persistence].s3_uri` — `s3://bucket/path/` base for snapshot storage.
+- `[persistence].project` / `keep_last` — default namespace, snapshots kept.
 
 ## Background
 

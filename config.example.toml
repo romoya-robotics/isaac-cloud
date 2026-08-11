@@ -41,7 +41,14 @@ instance_type = "g6e.xlarge"
 # security_group = "isaac-cloud-ssh"
 # key_name = "isaac-cloud"
 
+# Save/restore your Isaac project directory as append-only snapshots in S3:
+# <s3_uri>projects/<project>/snapshots/<utc-timestamp>.tar.gz
+# `launch` rehydrates the newest snapshot of the chosen project; `stop` and
+# `destroy` save a new one first. Pick the project per-run with --project
+# (different users or workstreams just use different project names).
 [persistence]
 enabled = false
-s3_uri = "s3://your-bucket/projects/your-project/"
+s3_uri = "s3://your-bucket/isaac-cloud/"
 aws_region = "us-west-2"
+# project = "default"     # default project namespace; override with --project
+# keep_last = 10          # snapshots kept per project (older ones are pruned)

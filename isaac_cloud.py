@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -22,6 +23,7 @@ import tempfile
 import textwrap
 import time
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,16 @@ DEFAULT_DISK_GB = 100
 
 # Container-side paths (identical on both providers: same Isaac image).
 CONTAINER_PERSISTENCE_DIR = "/isaac-sim/project"
+
+# Persistence: append-only snapshots under <s3_uri>projects/<project>/snapshots/.
+DEFAULT_PERSISTENCE_PROJECT = "default"
+DEFAULT_PERSISTENCE_KEEP_LAST = 10
+# Millisecond resolution keeps names unique (append-only) for back-to-back
+# saves; zero-padded fields keep lexicographic order == chronological order.
+SNAPSHOT_TIME_FMT = "%Y-%m-%dT%H-%M-%S.%fZ"
+SNAPSHOT_SUFFIX = ".tar.gz"
+PROJECT_LABEL_PREFIX = "project="
+AWS_TAG_PROJECT = "IsaacCloudProject"
 
 # Vast provider defaults. NVENC requires the rented GPU to be host GPU 0
 # (see VAST_EXPERIMENT_RESULTS.md), which whole-machine offers guarantee.
@@ -142,6 +154,8 @@ class AppConfig:
     persistence_enabled: bool
     persistence_s3_uri: str | None
     persistence_aws_region: str | None
+    persistence_project: str
+    persistence_keep_last: int
 
 
 def load_toml(path: Path) -> dict[str, Any]:
@@ -212,6 +226,11 @@ def load_app_config(config_path: Path | None = None) -> AppConfig:
         or nested_get(data, "aws", "s3_uri"),
         persistence_aws_region=nested_get(data, "persistence", "aws_region")
         or get("AWS_REGION", "aws", "region"),
+        persistence_project=get("ISAAC_CLOUD_PROJECT", "persistence", "project")
+        or DEFAULT_PERSISTENCE_PROJECT,
+        persistence_keep_last=int(
+            nested_get(data, "persistence", "keep_last") or DEFAULT_PERSISTENCE_KEEP_LAST
+        ),
     )
 
 
@@ -703,6 +722,17 @@ class VastProvider:
             return msg
         return None
 
+    def set_project_label(self, instance_id: str, project: str) -> None:
+        # Best-effort: records which project this instance was launched for so
+        # stop/destroy save back to the same project without --project.
+        subprocess.run(
+            [_vastai_bin(), "label", "instance", instance_id, f"{PROJECT_LABEL_PREFIX}{project}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
     def attach_ssh_key(self, instance_id: str) -> None:
         """Recovery for hosts that miss the account-key injection at create."""
         pub_path = self.config.ssh_public_key_path
@@ -970,6 +1000,18 @@ class AwsProvider:
             raw=inst,
         )
 
+    def set_project_label(self, instance_id: str, project: str) -> None:
+        # Best-effort tag; read back by resolve_project via the raw Tags list.
+        subprocess.run(
+            ["aws", "ec2", "create-tags", "--resources", instance_id,
+             "--tags", f"Key={AWS_TAG_PROJECT},Value={project}",
+             "--region", self.config.aws_region],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
     def stop(self, instance_id: str) -> None:
         run_aws_json(self.config, ["ec2", "stop-instances", "--instance-ids", instance_id])
 
@@ -1124,17 +1166,44 @@ def print_access(config: AppConfig, info: InstanceInfo) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Persistence (local-credential S3 sync over SSH; no cloud creds on instances)
+# Persistence (append-only project snapshots in S3, streamed over SSH from the
+# local machine; instances never hold cloud credentials).
+#
+# Layout: <s3_uri>projects/<project>/snapshots/<utc-timestamp>.tar.gz
+# Push uploads a new snapshot (never deletes or overwrites saved work); pull
+# restores the newest — or a named — snapshot with an atomic remote directory
+# swap. An empty S3 prefix therefore means "no saved work yet", not "delete
+# everything", which the previous mirror sync (`aws s3 sync --delete`) got
+# fatally wrong in both directions.
 # ---------------------------------------------------------------------------
 
 
-def build_persistence_remote_uri(config: AppConfig) -> str:
+def build_persistence_base_uri(config: AppConfig) -> str:
     if not config.persistence_s3_uri:
         _raise("Missing [persistence].s3_uri.")
     uri = config.persistence_s3_uri.strip()
     if not uri.startswith("s3://") or uri == "s3://":
         _raise("[persistence].s3_uri must look like s3://bucket/path/")
     return uri if uri.endswith("/") else uri + "/"
+
+
+def validate_project_name(project: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", project or ""):
+        _raise(
+            f"Invalid project name {project!r}: use letters, digits, '.', '_' or '-' "
+            f"(must start with a letter or digit)."
+        )
+    return project
+
+
+def snapshot_prefix_uri(config: AppConfig, project: str) -> str:
+    return f"{build_persistence_base_uri(config)}projects/{validate_project_name(project)}/snapshots/"
+
+
+def parse_s3_uri(uri: str) -> tuple[str, str]:
+    rest = uri.removeprefix("s3://")
+    bucket, _, key = rest.partition("/")
+    return bucket, key
 
 
 def build_local_aws_env(config: AppConfig) -> dict[str, str]:
@@ -1146,127 +1215,197 @@ def build_local_aws_env(config: AppConfig) -> dict[str, str]:
     return env
 
 
-def run_local_aws_sync(config: AppConfig, source: str, destination: str) -> str:
+def run_local_aws(config: AppConfig, args: list[str], *, timeout_seconds: int = 3600) -> str:
     completed = subprocess.run(
-        ["aws", "s3", "sync", source, destination, "--delete"],
+        ["aws", *args],
         capture_output=True,
         text=True,
         check=False,
+        timeout=timeout_seconds,
         env=build_local_aws_env(config),
     )
-    output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
     if completed.returncode != 0:
-        _raise(output or f"aws s3 sync failed for {source} -> {destination}.")
-    return output
+        output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
+        _raise(output or f"aws {' '.join(args[:3])} failed.")
+    return (completed.stdout or "").strip()
 
 
-def copy_remote_directory_to_local(
+def list_snapshots(config: AppConfig, project: str) -> list[dict[str, Any]]:
+    """Snapshots for a project, oldest first (timestamped names sort correctly)."""
+    bucket, key_prefix = parse_s3_uri(snapshot_prefix_uri(config, project))
+    out = run_local_aws(
+        config,
+        ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", key_prefix,
+         "--output", "json"],
+        timeout_seconds=120,
+    )
+    contents = (json.loads(out).get("Contents") if out else None) or []
+    snaps = [
+        {
+            "name": c["Key"].rsplit("/", 1)[-1],
+            "key": c["Key"],
+            "size": c.get("Size", 0),
+            "uri": f"s3://{bucket}/{c['Key']}",
+        }
+        for c in contents
+        if c["Key"].endswith(SNAPSHOT_SUFFIX)
+    ]
+    return sorted(snaps, key=lambda s: s["name"])
+
+
+def list_projects(config: AppConfig) -> list[str]:
+    bucket, key_prefix = parse_s3_uri(build_persistence_base_uri(config) + "projects/")
+    out = run_local_aws(
+        config,
+        ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", key_prefix,
+         "--delimiter", "/", "--output", "json"],
+        timeout_seconds=120,
+    )
+    prefixes = (json.loads(out).get("CommonPrefixes") if out else None) or []
+    return [p["Prefix"].removeprefix(key_prefix).rstrip("/") for p in prefixes]
+
+
+def _require_reachable_ssh(info: InstanceInfo) -> SshTarget:
+    if not info.ssh:
+        _raise("Instance does not expose SSH, so persistence is unavailable.")
+    if not check_tcp_connectivity(info.ssh.host, info.ssh.port):
+        _raise("SSH is unreachable, so persistence is unavailable.")
+    return info.ssh
+
+
+def snapshot_push(
     config: AppConfig,
-    target: SshTarget,
+    provider,
+    info: InstanceInfo,
+    project: str,
     *,
-    sudo: str,
-    remote_path: str,
-    local_path: str,
+    allow_empty: bool = False,
     timeout_seconds: int = 3600,
-) -> None:
+) -> str:
+    """Save the remote project directory as a new snapshot. Never deletes saved work."""
+    target = _require_reachable_ssh(info)
+    remote_path = provider.persistence_remote_path()
+    sudo = provider.remote_sudo()
+    if not allow_empty:
+        probe = run_ssh(
+            config, target,
+            f"{sudo}find {shell_quote(remote_path)} -mindepth 1 -print -quit 2>/dev/null",
+            check=False,
+        )
+        if not probe.strip():
+            return (
+                f"Project directory {remote_path} is empty; skipping snapshot "
+                f"(use --allow-empty to save an empty checkpoint)."
+            )
+    name = datetime.now(timezone.utc).strftime(SNAPSHOT_TIME_FMT) + SNAPSHOT_SUFFIX
+    uri = snapshot_prefix_uri(config, project) + name
     remote_command = (
         f"{sudo}mkdir -p {shell_quote(remote_path)} && "
-        f"{sudo}tar -C {shell_quote(remote_path)} -cf - ."
+        f"{sudo}tar -C {shell_quote(remote_path)} -czf - ."
     )
-    ssh_command = ssh_base_args(config, target) + [remote_command]
-    os.makedirs(local_path, exist_ok=True)
-    with subprocess.Popen(ssh_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as ssh_proc:
-        try:
-            extract = subprocess.run(
-                ["tar", "-C", local_path, "-xf", "-"],
-                stdin=ssh_proc.stdout,
-                capture_output=True,
-                check=False,
-                timeout=timeout_seconds,
-            )
-        finally:
-            if ssh_proc.stdout is not None:
-                ssh_proc.stdout.close()
-        stderr_bytes = ssh_proc.stderr.read() if ssh_proc.stderr is not None else b""
-        ssh_returncode = ssh_proc.wait(timeout=timeout_seconds)
-    if ssh_returncode != 0:
-        _raise(stderr_bytes.decode("utf-8", errors="replace").strip() or "SSH download failed.")
-    if extract.returncode != 0:
-        _raise((extract.stderr or b"").decode("utf-8", errors="replace").strip() or "tar extract failed.")
+    with tempfile.TemporaryDirectory(prefix="isaac-cloud-snap-") as staging_dir:
+        staging_file = os.path.join(staging_dir, name)
+        with open(staging_file, "wb") as handle:
+            with subprocess.Popen(
+                ssh_base_args(config, target) + [remote_command],
+                stdout=handle,
+                stderr=subprocess.PIPE,
+            ) as ssh_proc:
+                stderr_bytes = ssh_proc.stderr.read() if ssh_proc.stderr is not None else b""
+                if ssh_proc.wait(timeout=timeout_seconds) != 0:
+                    _raise(
+                        "Snapshot archive creation failed: "
+                        + (stderr_bytes.decode("utf-8", errors="replace").strip() or "(no stderr)")
+                    )
+        size_mb = os.path.getsize(staging_file) / 1e6
+        run_local_aws(config, ["s3", "cp", staging_file, uri], timeout_seconds=timeout_seconds)
+    pruned = prune_snapshots(config, project, keep_last=config.persistence_keep_last)
+    message = f"Saved {uri} ({size_mb:.1f} MB)."
+    if pruned:
+        message += f" Pruned {pruned} old snapshot(s) (keep_last={config.persistence_keep_last})."
+    return message
 
 
-def replace_remote_directory_from_local(
+def snapshot_pull(
     config: AppConfig,
-    target: SshTarget,
+    provider,
+    info: InstanceInfo,
+    project: str,
     *,
-    sudo: str,
-    local_path: str,
-    remote_path: str,
+    snapshot: str | None = None,
     timeout_seconds: int = 3600,
-) -> None:
-    remote_command = (
-        f"{sudo}mkdir -p {shell_quote(remote_path)} "
-        f"&& {sudo}find {shell_quote(remote_path)} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} + "
-        f"&& {sudo}tar -C {shell_quote(remote_path)} -xf - "
-        f"; {sudo}chmod -R a+rwX {shell_quote(remote_path)} || true"
+) -> str:
+    """Restore a snapshot into the remote project directory via an atomic swap.
+
+    The live directory is only replaced after the archive has fully extracted,
+    so a dropped connection leaves the previous contents intact."""
+    target = _require_reachable_ssh(info)
+    snaps = list_snapshots(config, project)
+    if snapshot:
+        wanted = snapshot if snapshot.endswith(SNAPSHOT_SUFFIX) else snapshot + SNAPSHOT_SUFFIX
+        matches = [s for s in snaps if s["name"] == wanted]
+        if not matches:
+            available = ", ".join(s["name"] for s in snaps[-5:]) or "(none)"
+            _raise(f"Snapshot {snapshot!r} not found for project '{project}'. Newest: {available}")
+        chosen = matches[0]
+    elif snaps:
+        chosen = snaps[-1]
+    else:
+        return f"No snapshots for project '{project}'; starting fresh."
+    remote_path = provider.persistence_remote_path()
+    sudo = provider.remote_sudo()
+    incoming = remote_path + ".incoming"
+    old = remote_path + ".old"
+    script = (
+        f"set -e; rm -rf {shell_quote(incoming)}; mkdir -p {shell_quote(incoming)}; "
+        f"tar -C {shell_quote(incoming)} -xzf -; "
+        f"rm -rf {shell_quote(old)}; mv {shell_quote(remote_path)} {shell_quote(old)} 2>/dev/null || true; "
+        f"mv {shell_quote(incoming)} {shell_quote(remote_path)}; rm -rf {shell_quote(old)}; "
+        f"chmod -R a+rwX {shell_quote(remote_path)} || true"
     )
-    with subprocess.Popen(
-        ["tar", "-C", local_path, "-cf", "-", "."],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    ) as tar_proc:
-        ssh_command = ssh_base_args(config, target) + [remote_command]
-        try:
-            ssh_run = subprocess.run(
-                ssh_command,
-                stdin=tar_proc.stdout,
+    remote_command = f"{sudo}bash -c {shell_quote(script)}"
+    with tempfile.TemporaryDirectory(prefix="isaac-cloud-snap-") as staging_dir:
+        staging_file = os.path.join(staging_dir, chosen["name"])
+        run_local_aws(config, ["s3", "cp", chosen["uri"], staging_file], timeout_seconds=timeout_seconds)
+        with open(staging_file, "rb") as handle:
+            completed = subprocess.run(
+                ssh_base_args(config, target) + [remote_command],
+                stdin=handle,
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=timeout_seconds,
             )
-        finally:
-            if tar_proc.stdout is not None:
-                tar_proc.stdout.close()
-        tar_stderr = (tar_proc.stderr.read() or b"").decode("utf-8", errors="replace").strip()
-        tar_returncode = tar_proc.wait(timeout=timeout_seconds)
-    if tar_returncode != 0:
-        _raise(tar_stderr or "Local tar archive creation failed.")
-    if ssh_run.returncode != 0:
-        _raise(((ssh_run.stdout or "") + "\n" + (ssh_run.stderr or "")).strip() or "SSH upload failed.")
+    if completed.returncode != 0:
+        output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
+        _raise(f"Snapshot restore failed (previous contents kept): {output[:800]}")
+    return f"Restored {chosen['uri']} into {remote_path}."
 
 
-def run_persistence_sync(
-    config: AppConfig,
-    provider,
-    info: InstanceInfo,
-    *,
-    direction: str,
-    timeout_seconds: int = 3600,
-) -> str:
-    if direction not in {"pull", "push"}:
-        _raise(f"Unsupported sync direction: {direction}")
-    if not info.ssh:
-        _raise("Instance does not expose SSH, so persistence sync is unavailable.")
-    if not check_tcp_connectivity(info.ssh.host, info.ssh.port):
-        _raise("SSH is unreachable, so persistence sync is unavailable.")
-    remote_path = provider.persistence_remote_path()
-    sudo = provider.remote_sudo()
-    remote_uri = build_persistence_remote_uri(config)
-    with tempfile.TemporaryDirectory(prefix="isaac-cloud-sync-") as staging_dir:
-        if direction == "pull":
-            aws_output = run_local_aws_sync(config, remote_uri, staging_dir)
-            replace_remote_directory_from_local(
-                config, info.ssh, sudo=sudo, local_path=staging_dir,
-                remote_path=remote_path, timeout_seconds=timeout_seconds,
-            )
-        else:
-            copy_remote_directory_to_local(
-                config, info.ssh, sudo=sudo, remote_path=remote_path,
-                local_path=staging_dir, timeout_seconds=timeout_seconds,
-            )
-            aws_output = run_local_aws_sync(config, staging_dir, remote_uri)
-    return aws_output
+def prune_snapshots(config: AppConfig, project: str, *, keep_last: int) -> int:
+    if keep_last <= 0:
+        return 0
+    snaps = list_snapshots(config, project)
+    excess = snaps[:-keep_last] if len(snaps) > keep_last else []
+    for snap in excess:
+        run_local_aws(config, ["s3", "rm", snap["uri"]], timeout_seconds=120)
+    return len(excess)
+
+
+def resolve_project(config: AppConfig, info: InstanceInfo | None = None, override: str | None = None) -> str:
+    """Explicit --project beats the label the instance was launched with, beats config."""
+    if override:
+        return validate_project_name(override)
+    if info is not None:
+        labeled = getattr(info, "label", "") or ""
+        if labeled.startswith(PROJECT_LABEL_PREFIX):
+            return validate_project_name(labeled.removeprefix(PROJECT_LABEL_PREFIX))
+        tags = info.raw.get("Tags") if isinstance(info.raw, dict) else None
+        if isinstance(tags, list):
+            for tag in tags:
+                if tag.get("Key") == AWS_TAG_PROJECT and tag.get("Value"):
+                    return validate_project_name(tag["Value"])
+    return validate_project_name(config.persistence_project)
 
 
 # ---------------------------------------------------------------------------
@@ -1278,7 +1417,7 @@ app = typer.Typer(
     help="Launch and manage NVIDIA Isaac Sim on Vast.ai or AWS EC2, accessed over SSH only.",
     no_args_is_help=True,
 )
-sync_app = typer.Typer(help="Sync the durable Isaac project directory to or from S3.")
+sync_app = typer.Typer(help="Save/restore project snapshots (append-only) between the instance and S3.")
 app.add_typer(sync_app, name="sync")
 
 PROVIDER_OPTION = typer.Option(None, "--provider", "-p", help="vast or aws (default from config).")
@@ -1344,6 +1483,9 @@ def launch(
     ),
     gui: bool = typer.Option(None, "--gui/--no-gui", help="Also start the noVNC GUI stack."),
     agent: bool = typer.Option(None, "--agent/--no-agent", help="Enable the agent control socket."),
+    project: str = typer.Option(
+        None, "--project", help="Project namespace to rehydrate from / save to (default from config)."
+    ),
     timeout_seconds: int = typer.Option(1200, help="How long to wait for SSH readiness."),
 ) -> None:
     """Rent/launch an instance, start Isaac, and print SSH tunnel commands."""
@@ -1355,8 +1497,11 @@ def launch(
     prov = get_provider(config, provider)
     live_instance_id: str | None = None
     try:
+        launch_project = resolve_project(config, override=project)
         info = prov.launch(offer_id=offer_id)
         live_instance_id = info.instance_id
+        if config.persistence_enabled:
+            prov.set_project_label(info.instance_id, launch_project)
         typer.echo(f"Created {info.provider}:{info.instance_id}; waiting for SSH...")
         try:
             info = wait_for_ssh(config, prov, info.instance_id, timeout_seconds=timeout_seconds)
@@ -1369,8 +1514,8 @@ def launch(
         typer.echo("SSH reachable.")
         wait_for_container(config, info)
         if config.persistence_enabled:
-            typer.echo("Restoring project workspace from S3...")
-            run_persistence_sync(config, prov, info, direction="pull")
+            typer.echo(f"Rehydrating project '{launch_project}' from S3...")
+            typer.echo(snapshot_pull(config, prov, info, launch_project))
         typer.echo("Starting Isaac (first boot compiles shaders; allow several minutes)...")
         setup_isaac(config, info)
         print_access(config, info)
@@ -1416,16 +1561,26 @@ def status(
 def stop(
     instance_id: str = typer.Option(..., "--instance-id"),
     provider: str = PROVIDER_OPTION,
-    skip_push: bool = typer.Option(False, "--skip-push", help="Skip the S3 push before stopping."),
+    project: str = typer.Option(None, "--project", help="Project to save into (default: launch label, then config)."),
+    skip_push: bool = typer.Option(False, "--skip-push", help="Skip the snapshot save before stopping."),
 ) -> None:
-    """Stop an instance (pushes the project workspace to S3 first if enabled)."""
+    """Stop an instance (saves a project snapshot to S3 first if enabled)."""
     config = _config()
     prov = get_provider(config, provider)
     try:
         if config.persistence_enabled and not skip_push:
             info = prov.get(instance_id)
-            typer.echo("Pushing project workspace to S3...")
-            run_persistence_sync(config, prov, info, direction="push")
+            target_project = resolve_project(config, info, project)
+            typer.echo(f"Saving snapshot of project '{target_project}' to S3...")
+            try:
+                typer.echo(snapshot_push(config, prov, info, target_project))
+            except IsaacCloudError as exc:
+                typer.echo(f"Error: snapshot save failed: {exc}")
+                typer.echo(
+                    f"Instance {instance_id} was NOT stopped (it is still running and billing). "
+                    f"Retry, or stop without saving: ... stop --instance-id {instance_id} --skip-push"
+                )
+                raise typer.Exit(1)
         prov.stop(instance_id)
         typer.echo(f"Stopped {instance_id}.")
     except IsaacCloudError as exc:
@@ -1458,9 +1613,14 @@ def destroy(
     provider: str = PROVIDER_OPTION,
     all_instances: bool = typer.Option(False, "--all"),
     yes: bool = typer.Option(False, "--yes", "-y"),
-    skip_push: bool = typer.Option(False, "--skip-push", help="Skip the S3 push before destroying."),
+    project: str = typer.Option(None, "--project", help="Project to save into (default: launch label, then config)."),
+    skip_push: bool = typer.Option(False, "--skip-push", help="Destroy without saving a snapshot first."),
 ) -> None:
-    """Destroy instance(s) (pushes the project workspace to S3 first if enabled)."""
+    """Destroy instance(s), saving a project snapshot to S3 first if enabled.
+
+    If the snapshot cannot be taken (SSH unreachable, save fails), the instance
+    is NOT destroyed — destroying would silently discard the work. Use
+    --skip-push to destroy anyway."""
     config = _config()
     prov = get_provider(config, provider)
     try:
@@ -1473,17 +1633,26 @@ def destroy(
             return
         if not yes:
             typer.confirm(f"Destroy {len(targets)} instance(s) on {prov.name}?", abort=True)
+        kept: list[str] = []
         for tid in targets:
             if config.persistence_enabled and not skip_push:
                 try:
                     info = prov.get(tid)
-                    if info.ssh and check_tcp_connectivity(info.ssh.host, info.ssh.port):
-                        typer.echo(f"Pushing workspace from {tid} to S3...")
-                        run_persistence_sync(config, prov, info, direction="push")
+                    target_project = resolve_project(config, info, project)
+                    typer.echo(f"Saving snapshot of project '{target_project}' from {tid}...")
+                    typer.echo(snapshot_push(config, prov, info, target_project))
                 except IsaacCloudError as exc:
-                    typer.echo(f"Warning: pre-destroy push failed for {tid}: {exc}")
+                    typer.echo(f"Not destroying {tid}: snapshot save failed: {exc}")
+                    kept.append(tid)
+                    continue
             prov.destroy(tid)
             typer.echo(f"Destroyed {tid}.")
+        if kept:
+            typer.echo(
+                f"{len(kept)} instance(s) kept (still running and billing): {', '.join(kept)}. "
+                f"Retry, or destroy without saving: ... destroy --skip-push"
+            )
+            raise typer.Exit(1)
     except IsaacCloudError as exc:
         typer.echo(f"Error: {exc}")
         raise typer.Exit(1)
@@ -1514,14 +1683,18 @@ def tunnel(
 def sync_pull(
     instance_id: str = typer.Option(..., "--instance-id"),
     provider: str = PROVIDER_OPTION,
+    project: str = typer.Option(None, "--project", help="Project to restore from (default: launch label, then config)."),
+    snapshot: str = typer.Option(
+        None, "--snapshot", help="Snapshot name/timestamp to restore (default: newest)."
+    ),
 ) -> None:
-    """S3 -> instance project directory."""
+    """Restore a project snapshot from S3 into the instance (atomic swap)."""
     config = _config()
     prov = get_provider(config, provider)
     try:
         info = prov.get(instance_id)
-        output = run_persistence_sync(config, prov, info, direction="pull")
-        typer.echo(output or "Pull complete.")
+        target_project = resolve_project(config, info, project)
+        typer.echo(snapshot_pull(config, prov, info, target_project, snapshot=snapshot))
     except IsaacCloudError as exc:
         typer.echo(f"Error: {exc}")
         raise typer.Exit(1)
@@ -1531,14 +1704,39 @@ def sync_pull(
 def sync_push(
     instance_id: str = typer.Option(..., "--instance-id"),
     provider: str = PROVIDER_OPTION,
+    project: str = typer.Option(None, "--project", help="Project to save into (default: launch label, then config)."),
+    allow_empty: bool = typer.Option(
+        False, "--allow-empty", help="Save a snapshot even if the project directory is empty."
+    ),
 ) -> None:
-    """Instance project directory -> S3."""
+    """Save the instance's project directory as a new snapshot in S3."""
     config = _config()
     prov = get_provider(config, provider)
     try:
         info = prov.get(instance_id)
-        output = run_persistence_sync(config, prov, info, direction="push")
-        typer.echo(output or "Push complete.")
+        target_project = resolve_project(config, info, project)
+        typer.echo(snapshot_push(config, prov, info, target_project, allow_empty=allow_empty))
+    except IsaacCloudError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1)
+
+
+@sync_app.command("list")
+def sync_list(
+    project: str = typer.Option(None, "--project", help="List snapshots of this project only."),
+) -> None:
+    """List saved projects and their snapshots."""
+    config = _config()
+    try:
+        projects = [validate_project_name(project)] if project else list_projects(config)
+        if not projects:
+            typer.echo("No saved projects.")
+            return
+        for name in projects:
+            snaps = list_snapshots(config, name)
+            typer.echo(f"{name}: {len(snaps)} snapshot(s)")
+            for snap in snaps:
+                typer.echo(f"  {snap['name']:32s} {snap['size'] / 1e6:8.1f} MB")
     except IsaacCloudError as exc:
         typer.echo(f"Error: {exc}")
         raise typer.Exit(1)
