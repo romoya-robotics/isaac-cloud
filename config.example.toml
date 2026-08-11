@@ -45,6 +45,7 @@ region = "us-west-2"
 instance_type = "g6e.xlarge"
 # security_group = "isaac-cloud-ssh"
 # key_name = "isaac-cloud"
+# ami_ssm_param = "/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id"
 
 # Save/restore your Isaac project directory as append-only snapshots in S3:
 # <s3_uri>projects/<project>/snapshots/<utc-timestamp>.tar.gz
