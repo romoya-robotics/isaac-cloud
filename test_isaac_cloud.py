@@ -80,6 +80,16 @@ def test_config_defaults(tmp_path):
     assert cfg.persistence_project == ic.DEFAULT_PERSISTENCE_PROJECT
     assert cfg.persistence_keep_last == ic.DEFAULT_PERSISTENCE_KEEP_LAST
     assert cfg.persistence_enabled is False
+    assert cfg.isaac_version == ic.DEFAULT_ISAAC_VERSION
+
+
+def test_config_isaac_section(tmp_path):
+    toml = tmp_path / "config.toml"
+    toml.write_text("[isaac]\nversion = \"7.1.0\"\nagent = false\ncurobo = true\n")
+    cfg = ic.load_app_config(toml)
+    assert cfg.isaac_version == "7.1.0"
+    assert cfg.agent_enabled is False
+    assert cfg.curobo_enabled is True
 
 
 def test_config_project_env_override(tmp_path, monkeypatch):

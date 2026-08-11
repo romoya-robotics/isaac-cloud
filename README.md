@@ -119,6 +119,7 @@ additionally survives container restarts.
 See `config.example.toml`. Highlights:
 
 - `[defaults].provider` — `vast` or `aws`; `--provider` overrides per command.
+- `[isaac].version` — Isaac Sim image tag (default `6.0.1`).
 - `[isaac].agent` — agent control socket (default true).
 - `[gui].enabled` / `resolution` — noVNC GUI stack (default off; `--gui` per launch).
 - `[isaac].curobo` — install cuRobo into Isaac's python after launch (default off;

@@ -1,7 +1,6 @@
 [defaults]
 # "vast" (Vast.ai marketplace, cheap, instant) or "aws" (EC2 g6e, reliable, ~6x price)
 provider = "vast"
-isaac_version = "6.0.1"
 instance_name_prefix = "isaac-cloud"
 disk_gb = 100
 
@@ -20,6 +19,7 @@ public_key_path = "/home/you/.ssh/id_ed25519.pub"
 #           launch. Background, ~5 min: torch cu128 + cuRobo (warp kernels, no
 #           CUDA toolkit needed) + cuda-core. `status` reports "curobo: ready".
 [isaac]
+version = "6.0.1"
 agent = true
 curobo = false
 

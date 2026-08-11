@@ -197,7 +197,7 @@ def load_app_config(config_path: Path | None = None) -> AppConfig:
 
     return AppConfig(
         provider=(get("ISAAC_CLOUD_PROVIDER", "defaults", "provider") or DEFAULT_PROVIDER).lower(),
-        isaac_version=get("ISAAC_CLOUD_ISAAC_VERSION", "defaults", "isaac_version")
+        isaac_version=get("ISAAC_CLOUD_ISAAC_VERSION", "isaac", "version")
         or DEFAULT_ISAAC_VERSION,
         instance_name_prefix=get(
             "ISAAC_CLOUD_INSTANCE_NAME_PREFIX", "defaults", "instance_name_prefix"
