@@ -921,10 +921,20 @@ class VastProvider(Provider):
             run_cli_quiet([_vastai_bin(), "attach", "ssh", instance_id, pub], timeout_seconds=45)
 
     def stop(self, instance_id: str) -> None:
-        run_vastai_json(["stop", "instance", instance_id])
+        # `vastai stop instance` prints plain text even with --raw; don't parse
+        # JSON, but do surface failures — a silently-failed stop keeps billing.
+        run_cli(
+            [_vastai_bin(), "stop", "instance", instance_id],
+            timeout_seconds=60,
+            error_prefix=f"vastai stop instance {instance_id} failed",
+        )
 
     def start(self, instance_id: str) -> None:
-        run_vastai_json(["start", "instance", instance_id])
+        run_cli(
+            [_vastai_bin(), "start", "instance", instance_id],
+            timeout_seconds=60,
+            error_prefix=f"vastai start instance {instance_id} failed",
+        )
 
     def destroy(self, instance_id: str) -> None:
         run_cli_quiet([_vastai_bin(), "destroy", "instance", instance_id, "-y"], timeout_seconds=60)

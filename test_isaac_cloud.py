@@ -408,6 +408,21 @@ def test_vast_to_info_port_mapping(config):
     assert prov._to_info({"id": 2, "actual_status": "loading"}).ssh is None
 
 
+def test_vast_stop_start_surface_failures(config, monkeypatch):
+    """stop/start tolerate vastai's plain-text output but must not swallow
+    real failures — a silently-failed stop keeps billing."""
+    prov = ic.VastProvider(config)
+
+    def fail(cmd, **kwargs):
+        raise ic.IsaacCloudError("vastai stop instance failed: host unreachable")
+
+    monkeypatch.setattr(ic, "run_cli", fail)
+    with pytest.raises(ic.IsaacCloudError):
+        prov.stop("123")
+    with pytest.raises(ic.IsaacCloudError):
+        prov.start("123")
+
+
 def test_cli_errors_decorator():
     @ic.cli_errors
     def boom():
