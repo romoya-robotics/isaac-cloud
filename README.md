@@ -46,6 +46,7 @@ uv run python isaac_cloud.py catalog                     # browse offers
 uv run python isaac_cloud.py launch                      # headless + agent socket
 uv run python isaac_cloud.py launch --gui                # + noVNC GUI
 uv run python isaac_cloud.py launch --curobo             # + cuRobo motion planning (bg install)
+uv run python isaac_cloud.py launch --lab                # + Isaac Lab (bg install)
 uv run python isaac_cloud.py launch --provider aws
 uv run python isaac_cloud.py instances
 uv run python isaac_cloud.py status  --instance-id <ID>
@@ -180,6 +181,14 @@ See `config.example.toml`. Highlights:
 - `[gui].enabled` / `resolution` — noVNC GUI stack (default off; `--gui` per launch).
 - `[isaac].curobo` — install cuRobo into Isaac's python after launch (default off;
   `--curobo` per launch). Background, ~5 min; `status` probe reports `curobo: ready`.
+- `[isaac].lab` — install Isaac Lab into Isaac's python after launch (default off;
+  `--lab` per launch). Background, ~15 min; `status` probe reports `isaac_lab: ready`.
+- `[isaac].lab_ref` — IsaacLab git ref (tag or branch) to install (default
+  `v3.0.0-beta2.patch1`, the release built for Isaac Sim 6.0.1). Lab releases are
+  paired with Isaac Sim versions — bump together with `[isaac].version`.
+  Lab scripts launch their own SimulationApp: stop the streaming Isaac first
+  (`pkill -f kit/kit` in the container), and keep outputs under `/isaac-sim/project`
+  so stop/destroy snapshots capture them.
 - `[vast].whole_machine` / `min_reliability` / `query` — offer selection.
 - `[aws].region` / `instance_type` — defaults `us-west-2` / `g6e.xlarge`.
 - `[persistence].s3_uri` — `s3://bucket/path/` base for snapshot storage.

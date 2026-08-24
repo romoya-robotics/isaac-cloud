@@ -50,6 +50,11 @@ DEFAULT_GUI_RESOLUTION = "1920x1080"
 DEFAULT_INSTANCE_NAME_PREFIX = "isaac-cloud"
 DEFAULT_DISK_GB = 100
 
+# Isaac Lab releases are paired to specific Isaac Sim versions; this git ref
+# (tag or branch) is the release built for Isaac Sim 6.0.1. Bump it together
+# with [isaac].version, or override per-config with [isaac].lab_ref.
+DEFAULT_ISAAC_LAB_REF = "v3.0.0-beta2.patch1"
+
 # Container-side paths (identical on both providers: same Isaac image).
 CONTAINER_PERSISTENCE_DIR = "/isaac-sim/project"
 
@@ -142,6 +147,8 @@ class AppConfig:
     gui_enabled: bool
     gui_resolution: str
     curobo_enabled: bool
+    lab_enabled: bool
+    lab_ref: str
     # vast
     vast_query: str
     vast_whole_machine: bool
@@ -211,6 +218,8 @@ def load_app_config(config_path: Path | None = None) -> AppConfig:
         gui_enabled=_bool(nested_get(data, "gui", "enabled"), False),
         gui_resolution=nested_get(data, "gui", "resolution") or DEFAULT_GUI_RESOLUTION,
         curobo_enabled=_bool(nested_get(data, "isaac", "curobo"), False),
+        lab_enabled=_bool(nested_get(data, "isaac", "lab"), False),
+        lab_ref=nested_get(data, "isaac", "lab_ref") or DEFAULT_ISAAC_LAB_REF,
         vast_query=nested_get(data, "vast", "query") or DEFAULT_VAST_QUERY,
         vast_whole_machine=_bool(
             nested_get(data, "vast", "whole_machine"), DEFAULT_VAST_WHOLE_MACHINE
@@ -705,6 +714,60 @@ def provision_curobo(config: AppConfig, info: InstanceInfo) -> None:
     )
 
 
+def build_lab_install_script(lab_ref: str) -> str:
+    """Install Isaac Lab into Isaac's bundled python, in the background.
+
+    Clones IsaacLab at `lab_ref` (a git tag or branch, paired with the Isaac
+    Sim version — see [isaac].lab_ref) and runs its own installer against
+    /isaac-sim (found via the _isaac_sim symlink). Note the usage model: Lab scripts launch their own SimulationApp,
+    so stop the streaming kit process (pkill -f kit/kit) before running Lab
+    workloads, and keep outputs under /isaac-sim/project to be snapshotted.
+    Writes /root/isaac_lab_install.log; final line is ISAAC_LAB_INSTALL_OK.
+    """
+    return dedent_script(
+        f"""\
+        #!/bin/bash
+        cat > /root/isaac_lab_install.sh << 'EOS'
+        #!/bin/bash
+        set -e
+        if /isaac-sim/python.sh -c "import isaaclab" >/dev/null 2>&1; then
+            echo ISAAC_LAB_ALREADY_INSTALLED
+            exit 0
+        fi
+        command -v git >/dev/null 2>&1 || {{ apt-get update -qq && apt-get install -y -qq git; }}
+        rm -rf /root/IsaacLab
+        git clone --depth 1 --branch {shell_quote(lab_ref)} \\
+            https://github.com/isaac-sim/IsaacLab.git /root/IsaacLab
+        ln -sfn /isaac-sim /root/IsaacLab/_isaac_sim
+        cd /root/IsaacLab
+        export ISAACSIM_PATH=/isaac-sim
+        ./isaaclab.sh --install
+        /isaac-sim/python.sh -c "import isaaclab; print('ISAAC_LAB_INSTALL_OK')"
+        EOS
+        chmod +x /root/isaac_lab_install.sh
+        nohup bash /root/isaac_lab_install.sh > /root/isaac_lab_install.log 2>&1 &
+        echo ISAAC_LAB_INSTALL_LAUNCHED
+        """
+    )
+
+
+def provision_lab(config: AppConfig, info: InstanceInfo) -> None:
+    """Kick off the background Isaac Lab install (returns immediately)."""
+    assert info.ssh
+    output = run_ssh_script(
+        config,
+        info.ssh,
+        build_lab_install_script(config.lab_ref),
+        in_container=True,
+        timeout_seconds=60,
+    )
+    typer.echo(output.splitlines()[-1] if output else "(no output)")
+    typer.echo(
+        "Isaac Lab installing in background (~15 min); check with: "
+        "tail /root/isaac_lab_install.log (expects ISAAC_LAB_INSTALL_OK)"
+    )
+
+
 def build_container_probe_script() -> str:
     """Report readiness of everything we care about inside the container."""
     return dedent_script(
@@ -720,6 +783,9 @@ def build_container_probe_script() -> str:
         done
         if [ -f /root/curobo_install.log ]; then
             grep -qm1 -E "CUROBO_INSTALL_OK|CUROBO_ALREADY_INSTALLED" /root/curobo_install.log && echo "curobo: ready" || echo "curobo: installing"
+        fi
+        if [ -f /root/isaac_lab_install.log ]; then
+            grep -qm1 -E "ISAAC_LAB_INSTALL_OK|ISAAC_LAB_ALREADY_INSTALLED" /root/isaac_lab_install.log && echo "isaac_lab: ready" || echo "isaac_lab: installing"
         fi
         for p in {DEFAULT_AGENT_CONTROL_PORT} {DEFAULT_ISAAC_SIGNAL_PORT} {DEFAULT_RTSP_PORT} {DEFAULT_NOVNC_PORT}; do
             (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null && echo "port $p: open" || echo "port $p: closed"
@@ -1639,6 +1705,12 @@ def launch(
         "--curobo/--no-curobo",
         help="Install cuRobo into Isaac's python in the background after launch.",
     ),
+    lab: bool = typer.Option(
+        None,
+        "--lab/--no-lab",
+        help="Install Isaac Lab into Isaac's python in the background after launch "
+        "(run Lab workloads manually over SSH; they need the streaming Isaac stopped).",
+    ),
     project: str = PROJECT_OPTION,
     timeout_seconds: int = typer.Option(1200, help="How long to wait for SSH readiness."),
 ) -> None:
@@ -1650,6 +1722,8 @@ def launch(
         config = replace(config, agent_enabled=agent)
     if curobo is not None:
         config = replace(config, curobo_enabled=curobo)
+    if lab is not None:
+        config = replace(config, lab_enabled=lab)
     prov = get_provider(config, provider)
     live_instance_id: str | None = None
     try:
@@ -1676,6 +1750,8 @@ def launch(
         setup_isaac(config, info)
         if config.curobo_enabled:
             provision_curobo(config, info)
+        if config.lab_enabled:
+            provision_lab(config, info)
         print_access(config, info)
     except IsaacCloudError as exc:
         typer.echo(f"Error: {exc}")

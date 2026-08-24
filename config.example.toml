@@ -18,10 +18,20 @@ public_key_path = "/home/you/.ssh/id_ed25519.pub"
 #   curobo: install cuRobo (GPU motion planning) into Isaac's python after
 #           launch. Background, ~5 min: torch cu128 + cuRobo (warp kernels, no
 #           CUDA toolkit needed) + cuda-core. `status` reports "curobo: ready".
+#   lab:    install Isaac Lab (robot-learning framework) into Isaac's python
+#           after launch. Background, ~15 min; clones IsaacLab at `lab_ref`
+#           into /root/IsaacLab. `status` reports "isaac_lab: ready". Lab
+#           scripts start their own SimulationApp, so stop the streaming Isaac
+#           process before running them, and keep outputs under
+#           /isaac-sim/project so snapshots capture them.
+#   lab_ref: IsaacLab git ref (tag or branch) to install. Lab releases are
+#           paired with Isaac Sim versions — bump together with `version`.
 [isaac]
 version = "6.0.1"
 agent = true
 curobo = false
+lab = false
+# lab_ref = "v3.0.0-beta2.patch1"   # default; the release built for Isaac Sim 6.0.1
 
 # Full interactive GUI via noVNC (Isaac GUI -> Xvfb -> x11vnc -> one TCP port).
 # Works on any host, NVENC not required. Open http://localhost:6080/vnc.html
