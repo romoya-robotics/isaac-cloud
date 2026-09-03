@@ -417,6 +417,8 @@ def ssh_base_args(config: AppConfig, target: SshTarget) -> list[str]:
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=15",
         "-p",
         str(target.port),
     ]
@@ -478,7 +480,7 @@ def run_ssh_script(
     )
     output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
     if completed.returncode != 0:
-        _raise(f"Remote script failed ({completed.returncode}): {output[:1200]}")
+        _raise(f"Remote script failed ({completed.returncode}): {output[-1200:]}")
     return (completed.stdout or "").strip()
 
 
@@ -489,16 +491,21 @@ SERVICE_PORTS: list[tuple[int, str]] = [
 ]
 
 
-def probe_local_tunnel(timeout_seconds: float = 5.0) -> str:
+def probe_local_tunnel(
+    timeout_seconds: float = 5.0, local_port: int = DEFAULT_AGENT_CONTROL_PORT
+) -> str:
     """End-to-end health of a local tunnel, zombie-aware.
 
     A dead ssh forward can still accept() locally, so port-open checks lie.
     The agent socket gives a true round trip: send a no-op, expect JSON back.
     """
     try:
-        sock = socket.create_connection(("127.0.0.1", DEFAULT_AGENT_CONTROL_PORT), timeout=2.0)
+        sock = socket.create_connection(("127.0.0.1", local_port), timeout=2.0)
     except OSError:
-        return "tunnel: not running locally (start one with: isaac_cloud.py tunnel)"
+        return (
+            f"tunnel: not running locally on {local_port} "
+            "(start one with: isaac_cloud.py tunnel)"
+        )
     try:
         sock.settimeout(timeout_seconds)
         sock.sendall(b"pass")
@@ -517,11 +524,24 @@ def probe_local_tunnel(timeout_seconds: float = 5.0) -> str:
         sock.close()
 
 
-def run_supervised_tunnel(config: AppConfig, provider: Provider, instance_id: str) -> None:
+def tunnel_forwards(local_ports: dict[int, int] | None = None) -> list[tuple[int, int]]:
+    """(local, remote) pairs for every service; `local_ports` remaps remote -> local
+    so tunnels to two boxes can coexist (e.g. {6080: 16080, 8226: 18226})."""
+    local_ports = local_ports or {}
+    return [(local_ports.get(port, port), port) for port, _ in SERVICE_PORTS]
+
+
+def run_supervised_tunnel(
+    config: AppConfig,
+    provider: Provider,
+    instance_id: str,
+    local_ports: dict[int, int] | None = None,
+) -> None:
     """Foreground self-healing tunnel: keepalives kill zombies within ~30s,
     then we reconnect with backoff, re-resolving the instance address in case
     it changed across a stop/start. Ctrl-C exits."""
-    forwards = [(port, port) for port, _ in SERVICE_PORTS]
+    forwards = tunnel_forwards(local_ports)
+    local_of = dict((remote, local) for local, remote in forwards)
     drops = 0
     backoff = 3
     while True:
@@ -535,7 +555,7 @@ def run_supervised_tunnel(config: AppConfig, provider: Provider, instance_id: st
             typer.echo(f"Tunnel to {info.provider}:{instance_id} ({target.host}:{target.port}):")
             for port, label in SERVICE_PORTS:
                 suffix = "/vnc.html (browser)" if port == DEFAULT_NOVNC_PORT else ""
-                typer.echo(f"  {label:14s} -> localhost:{port}{suffix}")
+                typer.echo(f"  {label:14s} -> localhost:{local_of[port]}{suffix}")
             typer.echo("Ctrl-C to stop.")
         args = ssh_base_args(config, target)
         args[1:1] = [
@@ -585,82 +605,369 @@ def format_tunnel_command(config: AppConfig, target: SshTarget, forwards: list[t
 # Container-side setup scripts (validated in docs/VAST_EXPERIMENT_RESULTS.md and
 # docs/GUI_TUNNEL_EXPERIMENT_PLAN.md; identical inside the Isaac image on every
 # provider).
+#
+# Shell text is kept in plain (non f-) strings; per-launch values are passed as
+# shell variables in a small generated header (see build_*_script).
 # ---------------------------------------------------------------------------
+
+GUI_X_DISPLAY = ":1"
+GUI_VNC_PORT = 5901
+GUI_STACK_PATH = "/root/gui_stack.sh"
+GUI_KIT_LOG = "/root/isaac_gui.log"
+GUI_SCREENSHOT_PATH = "/root/gui_screen.png"
+# GUI kit readiness = a mapped "Isaac Sim" window (+ agent port when enabled).
+# Cold boots that compile shaders map the window well before 8226 opens; the
+# overall budget is generous, the window budget is not (a kit that has run this
+# long without mapping raced the X display and never will).
+GUI_STACK_TIMEOUT_S = 600
+GUI_WINDOW_TIMEOUT_S = 240
+# Hosts on driver 580 could not present Vulkan on the X display (measured
+# 2026-09-01: kit "vkCreateSwapchainKHR failed", black GUI, headless fine).
+GUI_MIN_DRIVER_MAJOR = 590
+
+NVIDIA_USERLAND_SH = """\
+ensure_nvidia_userland() {
+    # A minority of Vast hosts inject compute-only NVIDIA libraries (no
+    # Vulkan/GLX/NVENC userland). Side-load the exact driver-matched libs from
+    # the Ubuntu archive once, and re-export the env on every run.
+    ls /usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0 >/dev/null 2>&1 && return 0
+    local LIBDIR=/opt/nvgl/usr/lib/x86_64-linux-gnu
+    if [ ! -f /opt/nvgl/icd.json ]; then
+        local DRIVER MAJOR deb
+        DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d " ")
+        MAJOR=${DRIVER%%.*}
+        apt-get update -qq >/dev/null 2>&1
+        (cd /tmp && apt-get download -qq libnvidia-gl-$MAJOR libnvidia-encode-$MAJOR libnvidia-decode-$MAJOR 2>/dev/null)
+        mkdir -p /opt/nvgl
+        for deb in /tmp/libnvidia-*-$MAJOR*.deb; do dpkg -x "$deb" /opt/nvgl; done
+        printf '{"file_format_version":"1.0.0","ICD":{"library_path":"%s/libGLX_nvidia.so.0","api_version":"1.3.194"}}' "$LIBDIR" > /opt/nvgl/icd.json
+        echo "$LIBDIR" > /etc/ld.so.conf.d/zz-nvgl.conf && ldconfig
+    fi
+    export VK_DRIVER_FILES=/opt/nvgl/icd.json VK_ICD_FILENAMES=/opt/nvgl/icd.json LD_LIBRARY_PATH=$LIBDIR
+}
+"""
+
+# Shared by /root/gui_stack.sh (bring-up) and the status probe (checks only).
+# Expects the header variables X_DISPLAY, VNC_PORT, NOVNC_PORT, AGENT_PORT,
+# AGENT_ENABLED, GUI_RES, KIT_LOG, SCREENSHOT.
+#
+# Process guards: match the binary (`pgrep -x`) or a bracketed `-f` pattern,
+# and never run a guard and the start it protects from ONE `ssh host '...'`
+# command line: `pgrep -f "Xvf[b] :1" || Xvfb :1 ...` matches the remote
+# shell's own argv (it contains "Xvfb :1"), so the service is silently never
+# started. Likewise a `pkill -f x11vnc` in the same command line as the new
+# supervisor's start text kills the new supervisor. These functions run from a
+# script file (`bash /root/gui_stack.sh`) or `bash -s` on stdin, whose argv
+# contains none of the service names, so the guards and kills here are safe.
+GUI_FUNCTIONS_SH = """\
+log() { echo "[gui_stack $(date +%H:%M:%S)] $*"; }
+port_open() { timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+x_up() { DISPLAY=$X_DISPLAY xdpyinfo >/dev/null 2>&1; }
+kit_pids() { pgrep -f "[k]it/kit"; }
+headless_kit_pids() { pgrep -f "[k]it/kit.*exp\\.full\\.streaming|[r]unheadless\\.sh"; }
+kit_age() { ps -o etimes= -p "$(kit_pids | head -1)" 2>/dev/null | tr -d ' '; }
+gui_window() {
+    # Prints the id of a MAPPED "Isaac Sim" window. A kit that raced the X
+    # display keeps an IsUnMapped window (and answers on the agent port), so
+    # port 8226 alone is not readiness.
+    local w
+    for w in $(DISPLAY=$X_DISPLAY xdotool search --name "Isaac Sim" 2>/dev/null); do
+        if DISPLAY=$X_DISPLAY xwininfo -id "$w" 2>/dev/null | grep -q "Map State: IsViewable"; then
+            echo "$w"; return 0
+        fi
+    done
+    return 1
+}
+vulkan_present_check() {
+    # 0 = can present on the X display, 1 = cannot (dud for GUI work), 2 = unknown
+    local out
+    out=$(DISPLAY=$X_DISPLAY timeout 60 vulkaninfo --summary 2>&1)
+    echo "$out" | grep -q "vkGetPhysicalDeviceSurfacePresentModesKHR failed" && return 1
+    echo "$out" | grep -qi "deviceName\\|GPU id" && return 0
+    return 2
+}
+screen_stats() {
+    # Prints "<mean gray 0..1> <unique gray levels>" of the root window.
+    command -v import >/dev/null 2>&1 || return 1
+    DISPLAY=$X_DISPLAY timeout 30 import -window root "$SCREENSHOT" 2>/dev/null || return 1
+    convert "$SCREENSHOT" -colorspace Gray -format "%[fx:mean] %k" info: 2>/dev/null
+}
+screen_is_lit() { awk -v m="${1:-0}" 'BEGIN{exit !(m > 0.01)}'; }
+gui_check() {
+    # One line per check; returns non-zero when a hard check fails.
+    local ok=0 w stats
+    if x_up; then
+        echo "gui_x: up ($X_DISPLAY $(DISPLAY=$X_DISPLAY xdpyinfo 2>/dev/null | awk '/dimensions/{print $2}'))"
+    else
+        echo "gui_x: DOWN"; ok=1
+    fi
+    if x_up; then
+        vulkan_present_check
+        case $? in
+            0) echo "gui_vulkan: can present on $X_DISPLAY";;
+            1) echo "gui_vulkan: CANNOT PRESENT on $X_DISPLAY (driver too old; relaunch on driver >= 590)"; ok=1;;
+            *) echo "gui_vulkan: unknown (vulkaninfo enumerated no GPU)";;
+        esac
+    fi
+    if port_open $VNC_PORT; then
+        if pgrep -f "[x]11vnc_loop" >/dev/null; then
+            echo "gui_vnc: port $VNC_PORT open (supervised)"
+        else
+            echo "gui_vnc: port $VNC_PORT open (UNSUPERVISED x11vnc: dies on the first XIO error)"
+        fi
+    else
+        echo "gui_vnc: port $VNC_PORT CLOSED"; ok=1
+    fi
+    if port_open $NOVNC_PORT; then echo "gui_novnc: port $NOVNC_PORT open"; else echo "gui_novnc: port $NOVNC_PORT CLOSED"; ok=1; fi
+    if [ -z "$(kit_pids)" ]; then
+        echo "gui_kit: NOT RUNNING"; ok=1
+    elif [ -n "$(headless_kit_pids)" ]; then
+        echo "gui_kit: headless streaming kit is running (no GUI window)"; ok=1
+    elif w=$(gui_window); then
+        echo "gui_kit: window mapped (id $w)"
+    else
+        echo "gui_kit: running, window NOT MAPPED$(grep -aq 'backbuffers are not initialized' "$KIT_LOG" 2>/dev/null && echo ' (raced the X display: backbuffers not initialized)')"; ok=1
+    fi
+    if [ "$AGENT_ENABLED" = 1 ]; then
+        if port_open $AGENT_PORT; then echo "gui_agent: port $AGENT_PORT open"; else echo "gui_agent: port $AGENT_PORT CLOSED"; ok=1; fi
+    fi
+    if x_up && stats=$(screen_stats) && [ -n "$stats" ]; then
+        set -- $stats
+        if screen_is_lit "$1"; then
+            echo "gui_screen: non-black (mean $1, $2 gray levels) $SCREENSHOT"
+        else
+            echo "gui_screen: BLACK (mean $1) $SCREENSHOT"; ok=1
+        fi
+    else
+        echo "gui_screen: unavailable (X down or imagemagick missing)"
+    fi
+    return $ok
+}
+"""
+
+GUI_STACK_MAIN_SH = """\
+start_gui_kit() {
+    [ -f "$KIT_LOG" ] && mv -f "$KIT_LOG" "$KIT_LOG.prev"
+    log "starting the GUI kit on $X_DISPLAY"
+    (
+        export ACCEPT_EULA=Y PRIVACY_CONSENT=Y OMNI_KIT_ALLOW_ROOT=1 DISPLAY=$X_DISPLAY
+        setsid nohup /isaac-sim/isaac-sim.sh --allow-root $KIT_EXTRA_ARGS </dev/null >"$KIT_LOG" 2>&1 &
+    )
+}
+stop_kits() {
+    pkill -f "[k]it/kit" 2>/dev/null
+    local i
+    for i in $(seq 1 20); do [ -z "$(kit_pids)" ] && return 0; sleep 1; done
+    pkill -9 -f "[k]it/kit" 2>/dev/null; sleep 1
+}
+gui_stack_up() {
+    local i w stats missing="" reason="" restarted=0 deadline
+    export DEBIAN_FRONTEND=noninteractive
+    for i in Xvfb x11vnc websockify xdotool xdpyinfo xwininfo vulkaninfo import; do
+        command -v $i >/dev/null 2>&1 || missing="$missing $i"
+    done
+    [ -d /usr/share/novnc ] || missing="$missing novnc"
+    if [ -n "$missing" ]; then
+        log "installing GUI packages (missing:$missing)"
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y -qq xvfb x11vnc novnc websockify xdotool x11-utils x11-apps vulkan-tools imagemagick >/dev/null 2>&1 \\
+            || { log "FAIL: apt-get install of the GUI packages failed"; return 1; }
+    fi
+    ensure_nvidia_userland
+
+    # 1. X display FIRST. A kit started before it exists answers on the agent
+    #    port but never maps its window ("backbuffers are not initialized",
+    #    "Hotkeys cannot be setup without a default window"; black VNC view).
+    if ! x_up; then
+        if pgrep -x Xvfb >/dev/null; then
+            log "Xvfb is running but $X_DISPLAY does not answer; restarting it"
+            pkill -x Xvfb; sleep 1
+        fi
+        log "starting Xvfb $X_DISPLAY ${GUI_RES}x24"
+        setsid Xvfb $X_DISPLAY -screen 0 ${GUI_RES}x24 </dev/null >/var/log/xvfb.log 2>&1 &
+        for i in $(seq 1 30); do x_up && break; sleep 1; done
+        x_up || { log "FAIL: Xvfb $X_DISPLAY did not come up (see /var/log/xvfb.log)"; return 1; }
+    fi
+    log "X display $X_DISPLAY up"
+
+    # 2. Vulkan presentation preflight: fail fast instead of composing into a black window.
+    vulkan_present_check
+    case $? in
+        1)
+            log "FAIL: Vulkan cannot present on this host's X display (vulkaninfo: vkGetPhysicalDeviceSurfacePresentModesKHR failed)."
+            log "Seen on driver 580 hosts: headless works, the GUI stays black. Relaunch on a driver >= 590 host."
+            echo GUI_STACK_VULKAN_PRESENT_FAILED
+            return 2;;
+        2) log "warning: vulkaninfo enumerated no GPU; continuing";;
+        *) log "Vulkan presentation preflight ok";;
+    esac
+
+    # 3. websockify serves noVNC on NOVNC_PORT and bridges to the VNC port.
+    if ! port_open $NOVNC_PORT; then
+        pkill -x websockify 2>/dev/null
+        log "starting websockify $NOVNC_PORT -> $VNC_PORT"
+        setsid websockify --web /usr/share/novnc 127.0.0.1:$NOVNC_PORT localhost:$VNC_PORT </dev/null >/var/log/websockify.log 2>&1 &
+        for i in $(seq 1 15); do port_open $NOVNC_PORT && break; sleep 1; done
+        port_open $NOVNC_PORT || { log "FAIL: websockify did not open $NOVNC_PORT (see /var/log/websockify.log)"; return 1; }
+    fi
+    log "noVNC on $NOVNC_PORT"
+
+    # 4. x11vnc under supervision: a bare x11vnc dies on the first XIO error
+    #    and freezes the viewer; -noxdamage matters for the kit's GL surface.
+    if ! pgrep -f "[x]11vnc_loop" >/dev/null || ! port_open $VNC_PORT; then
+        # Kills the bare launcher x11vnc and any older supervisor loop. Safe
+        # here because this script's argv contains no "x11vnc" (see header).
+        pkill -f "x11vnc" 2>/dev/null; sleep 1
+        cat > /root/x11vnc_loop.sh <<EOS
+#!/bin/bash
+# supervised x11vnc (generated by isaac_cloud.py gui_stack.sh)
+while true; do
+    x11vnc -display $X_DISPLAY -localhost -forever -shared -nopw -noxdamage -rfbport $VNC_PORT </dev/null >>/var/log/x11vnc.log 2>&1
+    sleep 2
+done
+EOS
+        chmod +x /root/x11vnc_loop.sh
+        log "starting supervised x11vnc on $VNC_PORT"
+        setsid nohup /root/x11vnc_loop.sh </dev/null >/dev/null 2>&1 &
+        for i in $(seq 1 15); do port_open $VNC_PORT && break; sleep 1; done
+        port_open $VNC_PORT || { log "FAIL: x11vnc did not open $VNC_PORT (see /var/log/x11vnc.log)"; return 1; }
+    fi
+    log "VNC on $VNC_PORT (supervised)"
+
+    # 5. The GUI kit. One GPU and one agent port: the headless streaming kit
+    #    must not run alongside it.
+    if [ -n "$(headless_kit_pids)" ]; then
+        log "stopping the headless streaming kit (the GUI kit replaces it)"
+        stop_kits
+    fi
+    [ -z "$(kit_pids)" ] && start_gui_kit
+    deadline=$(( $(date +%s) + GUI_TIMEOUT ))
+    while :; do
+        if w=$(gui_window); then
+            if [ "$AGENT_ENABLED" != 1 ] || port_open $AGENT_PORT; then break; fi
+        elif [ -z "$(kit_pids)" ]; then
+            reason="exited (tail $KIT_LOG)"
+        elif grep -aq "backbuffers are not initialized" "$KIT_LOG" 2>/dev/null; then
+            reason="never mapped its window (backbuffers not initialized: it raced the X display)"
+        elif [ "$(kit_age)" -gt "$WINDOW_TIMEOUT" ] 2>/dev/null; then
+            reason="has no mapped window after ${WINDOW_TIMEOUT}s"
+        fi
+        if [ -n "$reason" ]; then
+            if [ "$restarted" = 1 ]; then
+                log "FAIL: GUI kit $reason, even after a restart; see $KIT_LOG"; return 1
+            fi
+            log "GUI kit $reason; restarting it"
+            restarted=1; reason=""
+            stop_kits
+            start_gui_kit
+            continue
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            log "FAIL: GUI kit not ready within ${GUI_TIMEOUT}s (window $(gui_window >/dev/null && echo mapped || echo unmapped), agent port $(port_open $AGENT_PORT && echo open || echo closed)); see $KIT_LOG"
+            return 1
+        fi
+        sleep 5
+    done
+    log "GUI kit ready: window $w mapped$([ "$AGENT_ENABLED" = 1 ] && echo ", agent port $AGENT_PORT open")"
+    DISPLAY=$X_DISPLAY xdotool windowmove "$w" 0 0 windowsize "$w" ${GUI_RES%x*} ${GUI_RES#*x} 2>/dev/null
+    for i in $(seq 1 12); do
+        stats=$(screen_stats); set -- $stats
+        screen_is_lit "${1:-0}" && break
+        sleep 5
+    done
+    if gui_check; then echo GUI_STACK_READY; return 0; fi
+    log "FAIL: post-start checks failed (see above)"
+    return 1
+}
+case "${1:-up}" in
+    up) gui_stack_up;;
+    check) gui_check;;
+    *) echo "usage: $0 [up|check]"; exit 64;;
+esac
+"""
+
+
+def build_gui_header(config: AppConfig) -> str:
+    """Shell variables the GUI functions read; one place for every per-launch value."""
+    agent_flag = "--enable isaacsim.code_editor.python_server" if config.agent_enabled else ""
+    return dedent_script(
+        f"""\
+        X_DISPLAY={GUI_X_DISPLAY}
+        VNC_PORT={GUI_VNC_PORT}
+        NOVNC_PORT={DEFAULT_NOVNC_PORT}
+        AGENT_PORT={DEFAULT_AGENT_CONTROL_PORT}
+        AGENT_ENABLED={1 if config.agent_enabled else 0}
+        GUI_RES={config.gui_resolution}
+        KIT_LOG={GUI_KIT_LOG}
+        SCREENSHOT={GUI_SCREENSHOT_PATH}
+        KIT_EXTRA_ARGS="{agent_flag}"
+        GUI_TIMEOUT=${{GUI_STACK_TIMEOUT:-{GUI_STACK_TIMEOUT_S}}}
+        WINDOW_TIMEOUT=${{GUI_STACK_WINDOW_TIMEOUT:-{GUI_WINDOW_TIMEOUT_S}}}
+        """
+    )
+
+
+def build_gui_stack_script(config: AppConfig) -> str:
+    """The contents of /root/gui_stack.sh: idempotent, ordered GUI bring-up.
+
+    `gui_stack.sh [up]` brings the stack up (or verifies it if already up):
+      apt deps -> Xvfb :1 (wait for xdpyinfo) -> Vulkan present preflight
+      -> websockify/noVNC -> supervised x11vnc -> GUI kit (killing a headless
+      kit first) -> wait for 8226 AND a mapped window -> checks.
+    `gui_stack.sh check` runs only the checks (what `status` reports).
+
+    Every step is guarded by a process/port check so re-running (resume, the
+    project's own relaunch scripts) only starts what is missing. Each failure
+    mode encoded here was observed live on Vast hosts, 2026-09-01..03.
+    """
+    return (
+        "#!/bin/bash\n"
+        "# Generated by isaac_cloud.py -- the noVNC GUI stack for the Isaac container.\n"
+        "set -u\n"
+        + build_gui_header(config)
+        + NVIDIA_USERLAND_SH
+        + GUI_FUNCTIONS_SH
+        + GUI_STACK_MAIN_SH
+    )
+
+
+def build_gui_stack_install_script(config: AppConfig) -> str:
+    """Write /root/gui_stack.sh on the box and run it in the foreground."""
+    body = build_gui_stack_script(config)
+    assert "GUI_STACK_EOF" not in body
+    return (
+        "#!/bin/bash\n"
+        f"cat > {GUI_STACK_PATH} <<'GUI_STACK_EOF'\n"
+        f"{body}"
+        "GUI_STACK_EOF\n"
+        f"chmod +x {GUI_STACK_PATH}\n"
+        f"exec bash {GUI_STACK_PATH} up\n"
+    )
 
 
 def build_isaac_container_launch_script(config: AppConfig) -> str:
     """Launch headless streaming Isaac inside the container.
 
-    Handles the two container quirks found on Vast hosts: env vars must be
-    exported in-shell, and a minority of hosts inject compute-only NVIDIA
-    libraries (no Vulkan/GLX/NVENC), which we fix by side-loading the exact
-    driver-matched userland libs from the Ubuntu archive.
+    Env vars must be exported in-shell on Vast hosts, and compute-only hosts
+    need the NVIDIA userland side-loaded (ensure_nvidia_userland).
     """
     agent_flag = " --enable isaacsim.code_editor.python_server" if config.agent_enabled else ""
-    return dedent_script(
-        f"""\
-        #!/bin/bash
-        set -x
-        export ACCEPT_EULA=Y PRIVACY_CONSENT=Y OMNI_KIT_ALLOW_ROOT=1
-        export ISAACSIM_HOST=127.0.0.1
-        export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
-        export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
-
-        # Side-load Vulkan/GLX/NVENC userland libs when the host runtime only
-        # injected compute libraries. Version must match the host kernel driver.
-        if ! ls /usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0 >/dev/null 2>&1; then
-            DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d " ")
-            MAJOR=${{DRIVER%%.*}}
-            apt-get update -qq >/dev/null 2>&1
-            cd /tmp && apt-get download -qq \\
-                libnvidia-gl-$MAJOR libnvidia-encode-$MAJOR libnvidia-decode-$MAJOR 2>/dev/null
-            mkdir -p /opt/nvgl
-            for deb in libnvidia-*-$MAJOR*.deb; do dpkg -x "$deb" /opt/nvgl; done
-            LIBDIR=/opt/nvgl/usr/lib/x86_64-linux-gnu
-            printf '{{"file_format_version":"1.0.0","ICD":{{"library_path":"%s/libGLX_nvidia.so.0","api_version":"1.3.194"}}}}' "$LIBDIR" > /opt/nvgl/icd.json
-            export VK_DRIVER_FILES=/opt/nvgl/icd.json VK_ICD_FILENAMES=/opt/nvgl/icd.json
-            export LD_LIBRARY_PATH=$LIBDIR
-            echo "$LIBDIR" > /etc/ld.so.conf.d/zz-nvgl.conf && ldconfig
-        fi
-
-        pkill -f "[k]it/kit" 2>/dev/null; sleep 2
-        nohup /isaac-sim/runheadless.sh -v{agent_flag} > /root/isaac.log 2>&1 &
-        echo LAUNCHED
-        """
-    )
-
-
-def build_gui_setup_script(config: AppConfig) -> str:
-    """noVNC GUI stack: Isaac GUI -> Xvfb -> x11vnc -> websockify, one TCP port.
-
-    Community-validated approach for TCP-only access (works regardless of the
-    NVENC lottery on fractional hosts).
-    """
-    agent_flag = " --enable isaacsim.code_editor.python_server" if config.agent_enabled else ""
-    return dedent_script(
-        f"""\
-        #!/bin/bash
-        set -x
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq >/dev/null 2>&1
-        apt-get install -y -qq xvfb x11vnc novnc websockify >/dev/null 2>&1
-
-        pkill -f "Xvf[b] :1" 2>/dev/null; pkill -f "x11vn[c]" 2>/dev/null
-        pkill -f "[k]it/kit" 2>/dev/null; sleep 2
-        setsid Xvfb :1 -screen 0 {config.gui_resolution}x24 </dev/null >/var/log/xvfb.log 2>&1 &
-        sleep 2
-        setsid x11vnc -display :1 -localhost -forever -shared -nopw -rfbport 5901 </dev/null >/var/log/x11vnc.log 2>&1 &
-        sleep 1
-        pgrep -f "websockif[y]" >/dev/null || setsid websockify --web /usr/share/novnc 127.0.0.1:{DEFAULT_NOVNC_PORT} localhost:5901 </dev/null >/var/log/websockify.log 2>&1 &
-        sleep 1
-
-        export ACCEPT_EULA=Y PRIVACY_CONSENT=Y OMNI_KIT_ALLOW_ROOT=1 DISPLAY=:1
-        nohup /isaac-sim/isaac-sim.sh --allow-root{agent_flag} > /root/isaac_gui.log 2>&1 &
-        echo GUI_LAUNCHED
-        for p in 5901 {DEFAULT_NOVNC_PORT}; do
-            (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null && echo "port $p: open" || echo "port $p: closed"
-        done
-        """
+    return (
+        "#!/bin/bash\n"
+        + NVIDIA_USERLAND_SH
+        + dedent_script(
+            f"""\
+            set -x
+            export ACCEPT_EULA=Y PRIVACY_CONSENT=Y OMNI_KIT_ALLOW_ROOT=1
+            export ISAACSIM_HOST=127.0.0.1
+            export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
+            export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
+            ensure_nvidia_userland
+            pkill -f "[k]it/kit" 2>/dev/null; sleep 2
+            nohup /isaac-sim/runheadless.sh -v{agent_flag} > /root/isaac.log 2>&1 &
+            echo LAUNCHED
+            """
+        )
     )
 
 
@@ -768,30 +1075,57 @@ def provision_lab(config: AppConfig, info: InstanceInfo) -> None:
     )
 
 
-def build_container_probe_script() -> str:
-    """Report readiness of everything we care about inside the container."""
-    return dedent_script(
-        f"""\
-        #!/bin/bash
-        echo "gpu: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1)"
-        echo "gpu_minor: $(nvidia-smi -q 2>/dev/null | grep -i 'Minor Number' | awk '{{print $NF}}' | head -1)"
-        echo "kit_procs: $(pgrep -c '[k]it' 2>/dev/null || echo 0)"
-        for log in /root/isaac.log /root/isaac_gui.log; do
-            if [ -f "$log" ]; then
-                grep -qm1 -E "Streaming App is loaded|app ready" "$log" && echo "$(basename $log): ready" || echo "$(basename $log): loading"
+def build_container_probe_script(config: AppConfig) -> str:
+    """Report readiness of everything we care about inside the container.
+
+    When the GUI stack was ever installed on the box (or an Xvfb is running),
+    also runs the stack's own checks: X up, Vulkan can present, VNC and noVNC
+    ports open, kit window mapped, agent port, non-black screenshot.
+    """
+    return (
+        "#!/bin/bash\n"
+        + build_gui_header(config)
+        + GUI_FUNCTIONS_SH
+        + dedent_script(
+            f"""\
+            echo "gpu: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1)"
+            echo "gpu_minor: $(nvidia-smi -q 2>/dev/null | grep -i 'Minor Number' | awk '{{print $NF}}' | head -1)"
+            echo "kit_procs: $(pgrep -c '[k]it' 2>/dev/null || echo 0)"
+            for log in /root/isaac.log {GUI_KIT_LOG}; do
+                if [ -f "$log" ]; then
+                    grep -qm1 -E "Streaming App is loaded|app ready" "$log" && echo "$(basename $log): ready" || echo "$(basename $log): loading"
+                fi
+            done
+            if [ -f /root/curobo_install.log ]; then
+                grep -qm1 -E "CUROBO_INSTALL_OK|CUROBO_ALREADY_INSTALLED" /root/curobo_install.log && echo "curobo: ready" || echo "curobo: installing"
             fi
-        done
-        if [ -f /root/curobo_install.log ]; then
-            grep -qm1 -E "CUROBO_INSTALL_OK|CUROBO_ALREADY_INSTALLED" /root/curobo_install.log && echo "curobo: ready" || echo "curobo: installing"
-        fi
-        if [ -f /root/isaac_lab_install.log ]; then
-            grep -qm1 -E "ISAAC_LAB_INSTALL_OK|ISAAC_LAB_ALREADY_INSTALLED" /root/isaac_lab_install.log && echo "isaac_lab: ready" || echo "isaac_lab: installing"
-        fi
-        for p in {DEFAULT_AGENT_CONTROL_PORT} {DEFAULT_ISAAC_SIGNAL_PORT} {DEFAULT_RTSP_PORT} {DEFAULT_NOVNC_PORT}; do
-            (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null && echo "port $p: open" || echo "port $p: closed"
-        done
-        """
+            if [ -f /root/isaac_lab_install.log ]; then
+                grep -qm1 -E "ISAAC_LAB_INSTALL_OK|ISAAC_LAB_ALREADY_INSTALLED" /root/isaac_lab_install.log && echo "isaac_lab: ready" || echo "isaac_lab: installing"
+            fi
+            for p in {DEFAULT_AGENT_CONTROL_PORT} {DEFAULT_ISAAC_SIGNAL_PORT} {DEFAULT_RTSP_PORT} {DEFAULT_NOVNC_PORT}; do
+                (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null && echo "port $p: open" || echo "port $p: closed"
+            done
+            if [ -x {GUI_STACK_PATH} ] || pgrep -x Xvfb >/dev/null 2>&1; then
+                echo "gui_stack: $([ -x {GUI_STACK_PATH} ] && echo installed || echo 'not installed (Xvfb running from an older launcher)')"
+                gui_check
+            fi
+            exit 0
+            """
+        )
     )
+
+
+def remote_gui_stack_installed(config: AppConfig, info: InstanceInfo) -> bool:
+    """Was this box brought up with the GUI stack? (/root persists across stop/start.)"""
+    assert info.ssh
+    out = run_ssh(
+        config,
+        info.ssh,
+        f"test -x {GUI_STACK_PATH} && echo yes || echo no",
+        in_container=True,
+        check=False,
+    )
+    return out.strip().endswith("yes")
 
 
 # ---------------------------------------------------------------------------
@@ -873,6 +1207,12 @@ class VastProvisionMonitor(ProvisionMonitor):
         self._auth_denied_since = None
 
 
+def driver_major(version: Any) -> int:
+    """'580.95.05' -> 580; unparseable -> 0."""
+    match = re.match(r"\s*(\d+)", str(version or ""))
+    return int(match.group(1)) if match else 0
+
+
 class VastProvider(Provider):
     name = "vast"
 
@@ -889,6 +1229,11 @@ class VastProvider(Provider):
             for o in offers
             if float(o.get("reliability2", 0)) >= self.config.vast_min_reliability
         ]
+        if self.config.gui_enabled:
+            # GUI work needs Vulkan presentation on the X display, which driver
+            # 580 hosts could not do; rank driver >= 590 first (price order kept
+            # within each group).
+            offers.sort(key=lambda o: driver_major(o.get("driver_version")) < GUI_MIN_DRIVER_MAJOR)
         return offers[:limit]
 
     def launch(self, offer_id: str | None = None) -> InstanceInfo:
@@ -911,6 +1256,15 @@ class VastProvider(Provider):
                 f"driver {offer.get('driver_version')} at ${offer.get('dph_total', 0):.3f}/hr "
                 f"({offer.get('geolocation')})"
             )
+            if (
+                self.config.gui_enabled
+                and driver_major(offer.get("driver_version")) < GUI_MIN_DRIVER_MAJOR
+            ):
+                typer.echo(
+                    f"Warning: no driver >= {GUI_MIN_DRIVER_MAJOR} offer matched; driver "
+                    f"{offer.get('driver_version')} hosts may be unable to present the GUI "
+                    "(the Vulkan preflight will abort the launch if so)."
+                )
         image = build_isaac_image_ref(self.config.isaac_version)
         result = run_vastai_json(
             [
@@ -1327,13 +1681,39 @@ def wait_for_container(config: AppConfig, info: InstanceInfo, timeout_seconds: i
 
 
 def setup_isaac(config: AppConfig, info: InstanceInfo) -> None:
+    """Start Isaac on the box: the GUI stack (foreground, verified) or the
+    headless streaming kit (background)."""
     assert info.ssh
-    if config.gui_enabled:
-        script = build_gui_setup_script(config)
-    else:
-        script = build_isaac_container_launch_script(config)
-    output = run_ssh_script(config, info.ssh, script, in_container=True, timeout_seconds=900)
-    typer.echo(output.splitlines()[-1] if output else "(no output)")
+    if not config.gui_enabled:
+        output = run_ssh_script(
+            config, info.ssh, build_isaac_container_launch_script(config),
+            in_container=True, timeout_seconds=900,
+        )
+        typer.echo(output.splitlines()[-1] if output else "(no output)")
+        return
+    typer.echo(
+        f"Bringing up the GUI stack via {GUI_STACK_PATH} (Xvfb -> Vulkan preflight -> "
+        "noVNC -> supervised x11vnc -> GUI kit; waits for a mapped window)..."
+    )
+    try:
+        output = run_ssh_script(
+            config, info.ssh, build_gui_stack_install_script(config),
+            in_container=True, timeout_seconds=GUI_STACK_TIMEOUT_S + 600,
+        )
+    except IsaacCloudError as exc:
+        if "GUI_STACK_VULKAN_PRESENT_FAILED" in str(exc):
+            raise IsaacCloudError(
+                "This host cannot present Vulkan on an X display (vulkaninfo: "
+                "vkGetPhysicalDeviceSurfacePresentModesKHR failed) -- a dud for GUI work; "
+                f"headless would still run. Destroy it and relaunch on a driver >= "
+                f"{GUI_MIN_DRIVER_MAJOR} host (`catalog --gui` ranks those first)."
+            ) from exc
+        raise IsaacCloudError(
+            f"GUI stack failed to come up: {exc}\n"
+            f"Re-run it on the box with `{GUI_STACK_PATH}` (idempotent) or `resume`; "
+            f"kit log: {GUI_KIT_LOG}"
+        ) from exc
+    typer.echo(output)
 
 
 def print_access(config: AppConfig, info: InstanceInfo) -> None:
@@ -1362,6 +1742,10 @@ def print_access(config: AppConfig, info: InstanceInfo) -> None:
     typer.echo(f"  rtsp cameras   -> rtsp://127.0.0.1:{DEFAULT_RTSP_PORT}/stream (once a writer is attached)")
     if config.gui_enabled:
         typer.echo(f"  gui (noVNC)    -> http://localhost:{DEFAULT_NOVNC_PORT}/vnc.html")
+        typer.echo(
+            f"  GUI stack: {GUI_STACK_PATH} on the box (re-run to repair; `check` for the "
+            "probes); `status` reports the gui_* checks."
+        )
     typer.echo("All ports are localhost-only on the remote side; SSH is the only ingress.")
 
 
@@ -1627,6 +2011,11 @@ PROJECT_OPTION = typer.Option(
     "--project",
     help="Project namespace (default: the project the instance was launched with, else config).",
 )
+AGENT_PORT_OPTION = typer.Option(
+    DEFAULT_AGENT_CONTROL_PORT,
+    "--agent-port",
+    help="Local port the agent control socket is tunnelled to (remote side is always 8226).",
+)
 
 
 def _config() -> AppConfig:
@@ -1652,15 +2041,26 @@ def cli_errors(func):
 
 @app.command()
 @cli_errors
-def catalog(provider: str = PROVIDER_OPTION) -> None:
+def catalog(
+    provider: str = PROVIDER_OPTION,
+    gui: bool = typer.Option(
+        None,
+        "--gui/--no-gui",
+        help=f"Rank driver >= {GUI_MIN_DRIVER_MAJOR} hosts first (GUI presentation needs them).",
+    ),
+) -> None:
     """List available GPU offers/instance options for the provider."""
     config = _config()
+    if gui is not None:
+        config = replace(config, gui_enabled=gui)
     prov = get_provider(config, provider)
     if prov.name == "vast":
         offers = prov.catalog()
         if not offers:
             typer.echo("No matching offers.")
             raise typer.Exit(1)
+        if config.gui_enabled:
+            typer.echo(f"(--gui: driver >= {GUI_MIN_DRIVER_MAJOR} hosts ranked first)")
         for o in offers:
             typer.echo(
                 f"offer={o['id']} machine={o.get('machine_id')} {o.get('gpu_name')} "
@@ -1769,8 +2169,12 @@ def launch(
 def status(
     instance_id: str = INSTANCE_ID_OPTION,
     provider: str = PROVIDER_OPTION,
+    agent_port: int = AGENT_PORT_OPTION,
 ) -> None:
-    """Show instance state plus in-container readiness probes."""
+    """Show instance state plus in-container readiness probes.
+
+    On a box brought up with --gui the probe also runs the GUI stack's checks
+    (gui_x, gui_vulkan, gui_vnc, gui_novnc, gui_kit, gui_agent, gui_screen)."""
     config = _config()
     prov = get_provider(config, provider)
     info = prov.get(instance_id)
@@ -1778,11 +2182,13 @@ def status(
     typer.echo(f"{info.provider}:{info.instance_id} {info.status} {ssh}")
     if info.ssh and check_tcp_connectivity(info.ssh.host, info.ssh.port):
         probe = run_ssh_script(
-            config, info.ssh, build_container_probe_script(),
-            in_container=True, timeout_seconds=120,
+            config, info.ssh, build_container_probe_script(config),
+            in_container=True, timeout_seconds=180,
         )
         typer.echo(probe)
-        typer.echo(probe_local_tunnel())
+        if "gui_stack:" in probe:
+            config = replace(config, gui_enabled=True)
+        typer.echo(probe_local_tunnel(local_port=agent_port))
         print_access(config, info)
     else:
         typer.echo("SSH not reachable yet.")
@@ -1821,13 +2227,30 @@ def stop(
 def resume(
     instance_id: str = INSTANCE_ID_OPTION,
     provider: str = PROVIDER_OPTION,
+    gui: bool = typer.Option(
+        None,
+        "--gui/--no-gui",
+        help="Bring up the noVNC GUI stack (default: whatever the box was launched with).",
+    ),
+    agent: bool = typer.Option(None, "--agent/--no-agent", help="Enable the agent control socket."),
 ) -> None:
-    """Start a stopped instance and relaunch Isaac."""
+    """Start a stopped instance and relaunch Isaac (the GUI stack if the box had one)."""
     config = _config()
+    if agent is not None:
+        config = replace(config, agent_enabled=agent)
     prov = get_provider(config, provider)
-    prov.start(instance_id)
+    info = prov.get(instance_id)
+    if info.status != "running":
+        prov.start(instance_id)
     info = wait_for_ssh(config, prov, instance_id)
     wait_for_container(config, info)
+    if gui is None:
+        gui = remote_gui_stack_installed(config, info)
+        typer.echo(
+            f"GUI stack {'found' if gui else 'not found'} on the box "
+            f"({GUI_STACK_PATH}); resuming {'with the GUI' if gui else 'headless'}."
+        )
+    config = replace(config, gui_enabled=gui)
     setup_isaac(config, info)
     print_access(config, info)
 
@@ -1885,17 +2308,30 @@ def destroy(
 def tunnel(
     instance_id: str = INSTANCE_ID_OPTION,
     provider: str = PROVIDER_OPTION,
+    agent_port: int = AGENT_PORT_OPTION,
+    rtsp_port: int = typer.Option(
+        DEFAULT_RTSP_PORT, "--rtsp-port", help="Local port for the RTSP cameras."
+    ),
+    novnc_port: int = typer.Option(
+        DEFAULT_NOVNC_PORT, "--novnc-port", help="Local port for the noVNC GUI."
+    ),
 ) -> None:
     """Run a supervised SSH tunnel to the instance (auto-reconnects; Ctrl-C to stop).
 
-    Forwards agent control (8226), RTSP (8554), and noVNC (6080) to localhost.
+    Forwards agent control (8226), RTSP (8554), and noVNC (6080) to localhost;
+    the local ports are configurable so tunnels to two boxes can coexist.
     SSH keepalives detect dead/zombie connections within ~30s and the tunnel
     re-establishes itself with backoff, so client sessions (noVNC, agent
     scripts, RTSP players) see a brief blip instead of needing manual repair.
     """
     config = _config()
     prov = get_provider(config, provider)
-    run_supervised_tunnel(config, prov, instance_id)
+    local_ports = {
+        DEFAULT_AGENT_CONTROL_PORT: agent_port,
+        DEFAULT_RTSP_PORT: rtsp_port,
+        DEFAULT_NOVNC_PORT: novnc_port,
+    }
+    run_supervised_tunnel(config, prov, instance_id, local_ports)
 
 
 @sync_app.command("pull")

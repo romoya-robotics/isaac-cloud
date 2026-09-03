@@ -448,3 +448,119 @@ def test_cli_errors_decorator():
     with pytest.raises(typer.Exit) as excinfo:
         boom()
     assert excinfo.value.exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# GUI stack: generated scripts, catalog ranking, tunnel port remapping
+# ---------------------------------------------------------------------------
+
+
+def _index(text, needle):
+    i = text.find(needle)
+    assert i >= 0, f"missing: {needle!r}"
+    return i
+
+
+def test_gui_stack_script_is_ordered_x_before_kit(config):
+    """The kit must never start before the X display answers (a kit that raced
+    Xvfb answers on 8226 but never maps its window)."""
+    script = ic.build_gui_stack_script(config)
+    xvfb = _index(script, "setsid Xvfb $X_DISPLAY")
+    xwait = _index(script, "x_up && break")
+    vulkan = _index(script, "# 2. Vulkan presentation preflight")
+    websockify = _index(script, "setsid websockify")
+    x11vnc = _index(script, "setsid nohup /root/x11vnc_loop.sh")
+    kit = _index(script, "start_gui_kit\n    deadline")
+    assert xvfb < xwait < vulkan < websockify < x11vnc < kit
+    assert "GUI_STACK_VULKAN_PRESENT_FAILED" in script
+    # readiness = mapped window AND agent port, never 8226 alone
+    assert "Map State: IsViewable" in script
+    assert 'w=$(gui_window)' in script
+    assert "GUI_STACK_READY" in script
+
+
+def test_gui_stack_script_process_guards(config):
+    script = ic.build_gui_stack_script(config)
+    # binary-name guards, not -f patterns that also appear in a start command
+    assert "pgrep -x Xvfb" in script
+    assert "pkill -x websockify" in script
+    assert 'pgrep -f "Xvf[b]' not in script
+    assert 'pgrep -f "websockif[y]' not in script
+    # supervised x11vnc with -noxdamage
+    assert "-noxdamage" in script
+    assert "while true; do\n    x11vnc -display" in script
+    # the headless kit is stopped before the GUI kit starts
+    assert "stopping the headless streaming kit" in script
+    # settings flow from config
+    assert "GUI_RES=1920x1080" in script
+    assert "isaacsim.code_editor.python_server" in script
+    headless_only = ic.build_gui_stack_script(replace(config, agent_enabled=False))
+    assert 'KIT_EXTRA_ARGS=""' in headless_only
+    assert "AGENT_ENABLED=0" in headless_only
+
+
+def test_gui_stack_install_wraps_in_quoted_heredoc(config):
+    script = ic.build_gui_stack_install_script(config)
+    assert script.startswith("#!/bin/bash\ncat > /root/gui_stack.sh <<'GUI_STACK_EOF'\n")
+    assert script.rstrip().endswith("exec bash /root/gui_stack.sh up")
+    assert script.count("GUI_STACK_EOF") == 2
+
+
+def test_probe_script_includes_gui_checks_conditionally(config):
+    probe = ic.build_container_probe_script(config)
+    assert "gui_check()" in probe
+    assert "if [ -x /root/gui_stack.sh ] || pgrep -x Xvfb" in probe
+    assert probe.rstrip().endswith("exit 0")
+    assert "port 8226" in probe.replace("{", "").replace("}", "") or "8226" in probe
+
+
+def test_headless_script_side_loads_and_kills_previous_kit(config):
+    script = ic.build_isaac_container_launch_script(config)
+    assert "ensure_nvidia_userland()" in script
+    assert 'pkill -f "[k]it/kit"' in script
+    assert "runheadless.sh -v --enable isaacsim.code_editor.python_server" in script
+
+
+def test_driver_major():
+    assert ic.driver_major("580.95.05") == 580
+    assert ic.driver_major("590.10") == 590
+    assert ic.driver_major(None) == 0
+    assert ic.driver_major("garbage") == 0
+
+
+def test_catalog_prefers_new_drivers_for_gui(config, monkeypatch):
+    offers = [
+        {"id": 1, "driver_version": "580.95.05", "dph_total": 0.30, "reliability2": 0.999},
+        {"id": 2, "driver_version": "590.10.01", "dph_total": 0.35, "reliability2": 0.999},
+        {"id": 3, "driver_version": "575.64", "dph_total": 0.20, "reliability2": 0.5},
+        {"id": 4, "driver_version": "595.00", "dph_total": 0.40, "reliability2": 0.999},
+    ]
+    monkeypatch.setattr(ic, "run_vastai_json", lambda args, **kw: list(offers))
+    # headless: cheapest first (reliability filter still applies)
+    ids = [o["id"] for o in ic.VastProvider(config).catalog()]
+    assert ids == [1, 2, 4]
+    # gui: driver >= 590 first, price order kept within each group
+    gui = ic.VastProvider(replace(config, gui_enabled=True)).catalog()
+    assert [o["id"] for o in gui] == [2, 4, 1]
+
+
+def test_tunnel_forwards_remap_local_ports():
+    default = ic.tunnel_forwards()
+    assert (8226, 8226) in default and (6080, 6080) in default and (8554, 8554) in default
+    remapped = dict(
+        (remote, local) for local, remote in ic.tunnel_forwards({6080: 16080, 8226: 18226})
+    )
+    assert remapped == {8226: 18226, 8554: 8554, 6080: 16080}
+
+
+def test_ssh_base_args_keepalive(config):
+    args = ic.ssh_base_args(config, ic.SshTarget(host="h", port=22, user="root"))
+    assert "ServerAliveInterval=15" in args
+
+
+def test_remote_gui_stack_installed(config, monkeypatch):
+    info = vast_info(status="running", ssh=ic.SshTarget(host="h", port=22, user="root"))
+    monkeypatch.setattr(ic, "run_ssh", lambda *a, **k: "yes")
+    assert ic.remote_gui_stack_installed(config, info) is True
+    monkeypatch.setattr(ic, "run_ssh", lambda *a, **k: "no")
+    assert ic.remote_gui_stack_installed(config, info) is False

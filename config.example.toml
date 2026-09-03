@@ -34,8 +34,11 @@ lab = false
 # lab_ref = "v3.0.0-beta2.patch1"   # default; the release built for Isaac Sim 6.0.1
 
 # Full interactive GUI via noVNC (Isaac GUI -> Xvfb -> x11vnc -> one TCP port).
-# Works on any host, NVENC not required. Open http://localhost:6080/vnc.html
-# through the tunnel.
+# Works on any host with a driver that can present Vulkan on an X display
+# (driver >= 590; `catalog --gui` ranks those first, the launch preflight
+# aborts otherwise). NVENC not required. Brought up by /root/gui_stack.sh on
+# the box (idempotent; `status` reports its gui_* checks). Open
+# http://localhost:6080/vnc.html through the tunnel.
 [gui]
 enabled = false
 resolution = "1920x1080"

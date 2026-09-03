@@ -24,7 +24,9 @@ internet, and your SSH key is the only authentication that exists:
   notes below).
 - **Full GUI** (`http://localhost:6080/vnc.html`, `--gui`) — the native Isaac
   Sim application rendered into a virtual display and served with noVNC over a
-  single TCP port. Works on any host; NVENC not required.
+  single TCP port. Works on any host; NVENC not required. Needs a host whose
+  driver can present Vulkan on an X display (driver >= 590 in practice; see
+  [The GUI stack](#the-gui-stack)).
 
 ## Setup
 
@@ -42,7 +44,7 @@ cp config.example.toml config.toml   # then fill in [ngc] and [ssh]
 ## Usage
 
 ```bash
-uv run python isaac_cloud.py catalog                     # browse offers
+uv run python isaac_cloud.py catalog [--gui]             # browse offers (--gui ranks driver >= 590 first)
 uv run python isaac_cloud.py launch                      # headless + agent socket
 uv run python isaac_cloud.py launch --gui                # + noVNC GUI
 uv run python isaac_cloud.py launch --curobo             # + cuRobo motion planning (bg install)
@@ -51,11 +53,12 @@ uv run python isaac_cloud.py launch --provider aws
 uv run python isaac_cloud.py instances
 uv run python isaac_cloud.py status  --instance-id <ID>
 uv run python isaac_cloud.py tunnel  --instance-id <ID>   # supervised, auto-reconnecting
+uv run python isaac_cloud.py tunnel  --instance-id <ID2> --novnc-port 16080 --agent-port 18226   # second box
 uv run python isaac_cloud.py sync list                   # saved projects + snapshots
 uv run python isaac_cloud.py sync pull --instance-id <ID> [--project P] [--snapshot TS]
 uv run python isaac_cloud.py sync push --instance-id <ID> [--project P]
 uv run python isaac_cloud.py stop    --instance-id <ID>
-uv run python isaac_cloud.py resume  --instance-id <ID>
+uv run python isaac_cloud.py resume  --instance-id <ID>  # relaunches the GUI stack if the box had one
 uv run python isaac_cloud.py destroy --instance-id <ID> --yes
 ```
 
@@ -64,6 +67,67 @@ tunnel in a spare terminal and every service above is on `localhost`.
 
 First boot compiles RTX shaders — allow 5–10 minutes before the sim is
 responsive. Warm restarts take under a minute.
+
+## The GUI stack
+
+`launch --gui` (and `resume` on a box that had it) writes `/root/gui_stack.sh`
+into the container and runs it in the foreground. The script is idempotent
+and strictly ordered — each step is guarded by its own process or port check,
+so re-running it (a repair, `resume`, a project's own relaunch hook) only
+starts what is missing:
+
+1. apt deps: `xvfb x11vnc novnc websockify xdotool x11-utils x11-apps vulkan-tools imagemagick`
+2. `Xvfb :1` at `[gui].resolution`, then **wait until `DISPLAY=:1 xdpyinfo` answers**
+3. Vulkan presentation preflight (`DISPLAY=:1 vulkaninfo --summary`); aborts
+   the launch with a clear message if the host cannot present
+4. `websockify --web /usr/share/novnc 127.0.0.1:6080 localhost:5901`
+5. `x11vnc -display :1 -localhost -forever -shared -nopw -noxdamage -rfbport 5901`
+   inside a supervision loop (`/root/x11vnc_loop.sh`) that restarts it on exit
+6. the GUI kit (`isaac-sim.sh --allow-root`, plus the agent extension when
+   `[isaac].agent`), after stopping any headless streaming kit — one GPU, one
+   agent port
+7. **wait for a mapped "Isaac Sim" window AND port 8226** (8226 alone is not
+   readiness), then `xdotool windowmove 0 0 windowsize <res>`
+8. the checks below; the last line is `GUI_STACK_READY`
+
+`status` (and `/root/gui_stack.sh check` on the box) reports the same checks:
+
+```
+gui_x: up (:1 1920x1080)
+gui_vulkan: can present on :1
+gui_vnc: port 5901 open (supervised)
+gui_novnc: port 6080 open
+gui_kit: window mapped (id 41943041)
+gui_agent: port 8226 open
+gui_screen: non-black (mean 0.137, 212 gray levels) /root/gui_screen.png
+```
+
+Failure modes the script encodes (all observed on Vast hosts, 2026-09-01..03):
+
+- **Kit started before the X display existed.** It answers on 8226 and looks
+  ready, but its window never maps; `/root/isaac_gui.log` says
+  "backbuffers are not initialized" and the VNC view is black. The stack waits
+  for `xdpyinfo` before starting the kit, and restarts a kit whose window is
+  unmapped with that signature in its log.
+- **Bare `x11vnc` dies on the first XIO error** and the viewer freezes. It runs
+  under a supervisor, with `-noxdamage`.
+- **`pgrep -f "Xvf[b] :1" || Xvfb :1 ...` in one `ssh box '...'` command
+  matches the remote shell's own argv**, so the guard is always true and the
+  service is silently never started; likewise a `pkill -f x11vnc` in the same
+  command line as the new supervisor's start kills the new supervisor. The
+  stack runs from a script file whose argv contains none of the service
+  names, and guards with `pgrep -x`. Keep it that way if you edit it.
+- **Driver 580 hosts cannot present Vulkan on the X display** (kit logs
+  "vkCreateSwapchainKHR failed", GUI black, headless fine). The preflight
+  aborts with `GUI_STACK_VULKAN_PRESENT_FAILED`; `catalog --gui` and
+  `launch --gui` rank driver >= 590 offers first and warn otherwise.
+- **Headless and GUI kits cannot coexist**; the stack stops the headless kit
+  before starting the GUI one.
+
+Set `GUI_STACK_TIMEOUT` (default 600 s) on the box to change how long the
+script waits for the kit. Two boxes at once: give the second tunnel its own
+local ports (`tunnel --novnc-port 16080 --agent-port 18226`; `status
+--agent-port 18226` probes that tunnel).
 
 ## Driving Isaac from Claude Code
 
@@ -178,7 +242,8 @@ See `config.example.toml`. Highlights:
 - `[defaults].provider` — `vast` or `aws`; `--provider` overrides per command.
 - `[isaac].version` — Isaac Sim image tag (default `6.0.1`).
 - `[isaac].agent` — agent control socket (default true).
-- `[gui].enabled` / `resolution` — noVNC GUI stack (default off; `--gui` per launch).
+- `[gui].enabled` / `resolution` — noVNC GUI stack (default off; `--gui` per launch;
+  see [The GUI stack](#the-gui-stack)).
 - `[isaac].curobo` — install cuRobo into Isaac's python after launch (default off;
   `--curobo` per launch). Background, ~5 min; `status` probe reports `curobo: ready`.
 - `[isaac].lab` — install Isaac Lab into Isaac's python after launch (default off;
