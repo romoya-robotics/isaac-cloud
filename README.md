@@ -77,6 +77,8 @@ so re-running it (a repair, `resume`, a project's own relaunch hook) only
 starts what is missing:
 
 1. apt deps: `xvfb x11vnc novnc websockify xdotool x11-utils x11-apps vulkan-tools imagemagick`
+   plus the video tools every launch path installs: `ffmpeg` (with `ffprobe`) and
+   `libx264`, used to capture clips of the robot from the sim
 2. `Xvfb :1` at `[gui].resolution`, then **wait until `DISPLAY=:1 xdpyinfo` answers**
 3. Vulkan presentation preflight (`DISPLAY=:1 vulkaninfo --summary`); aborts
    the launch with a clear message if the host cannot present

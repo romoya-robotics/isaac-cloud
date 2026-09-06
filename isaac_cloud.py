@@ -647,6 +647,26 @@ ensure_nvidia_userland() {
 }
 """
 
+# ffmpeg (which ships ffprobe) with the libx264 encoder: projects capture video
+# clips of the robot from the sim with it. Installed on every launch/resume
+# path (headless and GUI); a no-op once present.
+VIDEO_TOOLS_SH = """\
+video_tools_ready() {
+    command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1 \\
+        && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "libx264"
+}
+ensure_video_tools() {
+    video_tools_ready && return 0
+    echo "installing video tools (ffmpeg, ffprobe, libx264)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq ffmpeg libx264-dev >/dev/null 2>&1 \\
+        || { echo "WARN: apt-get install of ffmpeg/libx264 failed; video capture unavailable"; return 1; }
+    video_tools_ready || { echo "WARN: ffmpeg installed but libx264 encoder or ffprobe missing"; return 1; }
+    echo "video tools ready: $(ffmpeg -version 2>/dev/null | head -1)"
+}
+"""
+
 # Shared by /root/gui_stack.sh (bring-up) and the status probe (checks only).
 # Expects the header variables X_DISPLAY, VNC_PORT, NOVNC_PORT, AGENT_PORT,
 # AGENT_ENABLED, GUI_RES, KIT_LOG, SCREENSHOT.
@@ -773,6 +793,7 @@ gui_stack_up() {
         apt-get install -y -qq xvfb x11vnc novnc websockify xdotool x11-utils x11-apps vulkan-tools imagemagick >/dev/null 2>&1 \\
             || { log "FAIL: apt-get install of the GUI packages failed"; return 1; }
     fi
+    ensure_video_tools || true
     ensure_nvidia_userland
 
     # 1. X display FIRST. A kit started before it exists answers on the agent
@@ -911,7 +932,7 @@ def build_gui_stack_script(config: AppConfig) -> str:
     """The contents of /root/gui_stack.sh: idempotent, ordered GUI bring-up.
 
     `gui_stack.sh [up]` brings the stack up (or verifies it if already up):
-      apt deps -> Xvfb :1 (wait for xdpyinfo) -> Vulkan present preflight
+      apt deps (+ ffmpeg/libx264) -> Xvfb :1 (wait for xdpyinfo) -> Vulkan present preflight
       -> websockify/noVNC -> supervised x11vnc -> GUI kit (killing a headless
       kit first) -> wait for 8226 AND a mapped window -> checks.
     `gui_stack.sh check` runs only the checks (what `status` reports).
@@ -926,6 +947,7 @@ def build_gui_stack_script(config: AppConfig) -> str:
         "set -u\n"
         + build_gui_header(config)
         + NVIDIA_USERLAND_SH
+        + VIDEO_TOOLS_SH
         + GUI_FUNCTIONS_SH
         + GUI_STACK_MAIN_SH
     )
@@ -955,6 +977,7 @@ def build_isaac_container_launch_script(config: AppConfig) -> str:
     return (
         "#!/bin/bash\n"
         + NVIDIA_USERLAND_SH
+        + VIDEO_TOOLS_SH
         + dedent_script(
             f"""\
             set -x
@@ -962,6 +985,7 @@ def build_isaac_container_launch_script(config: AppConfig) -> str:
             export ISAACSIM_HOST=127.0.0.1
             export ISAACSIM_SIGNAL_PORT={DEFAULT_ISAAC_SIGNAL_PORT}
             export ISAACSIM_STREAM_PORT={DEFAULT_ISAAC_STREAM_PORT}
+            ensure_video_tools || true
             ensure_nvidia_userland
             pkill -f "[k]it/kit" 2>/dev/null; sleep 2
             nohup /isaac-sim/runheadless.sh -v{agent_flag} > /root/isaac.log 2>&1 &
@@ -1085,6 +1109,7 @@ def build_container_probe_script(config: AppConfig) -> str:
     return (
         "#!/bin/bash\n"
         + build_gui_header(config)
+        + VIDEO_TOOLS_SH
         + GUI_FUNCTIONS_SH
         + dedent_script(
             f"""\
@@ -1102,6 +1127,7 @@ def build_container_probe_script(config: AppConfig) -> str:
             if [ -f /root/isaac_lab_install.log ]; then
                 grep -qm1 -E "ISAAC_LAB_INSTALL_OK|ISAAC_LAB_ALREADY_INSTALLED" /root/isaac_lab_install.log && echo "isaac_lab: ready" || echo "isaac_lab: installing"
             fi
+            video_tools_ready && echo "video_tools: ready (ffmpeg/ffprobe with libx264)" || echo "video_tools: MISSING (ffmpeg/ffprobe/libx264)"
             for p in {DEFAULT_AGENT_CONTROL_PORT} {DEFAULT_ISAAC_SIGNAL_PORT} {DEFAULT_RTSP_PORT} {DEFAULT_NOVNC_PORT}; do
                 (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null && echo "port $p: open" || echo "port $p: closed"
             done

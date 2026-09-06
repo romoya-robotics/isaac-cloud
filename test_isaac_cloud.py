@@ -521,6 +521,26 @@ def test_headless_script_side_loads_and_kills_previous_kit(config):
     assert "runheadless.sh -v --enable isaacsim.code_editor.python_server" in script
 
 
+def test_video_tools_installed_on_every_launch_path(config):
+    """ffmpeg/ffprobe/libx264 (robot video capture) must be installed by the
+    headless launch, the GUI stack, and reported by the status probe."""
+    for script in (
+        ic.build_isaac_container_launch_script(config),
+        ic.build_gui_stack_script(config),
+    ):
+        assert "ensure_video_tools()" in script
+        assert "apt-get install -y -qq ffmpeg libx264-dev" in script
+        assert "ensure_video_tools || true" in script
+        # readiness is the encoder actually being usable, not just the binary
+        assert 'ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "libx264"' in script
+        assert "command -v ffprobe" in script
+    headless = ic.build_isaac_container_launch_script(config)
+    assert _index(headless, "ensure_video_tools || true") < _index(headless, "runheadless.sh")
+    probe = ic.build_container_probe_script(config)
+    assert "video_tools_ready()" in probe
+    assert 'echo "video_tools: ready' in probe
+
+
 def test_driver_major():
     assert ic.driver_major("580.95.05") == 580
     assert ic.driver_major("590.10") == 590
