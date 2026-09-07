@@ -2039,7 +2039,7 @@ def print_access(config: AppConfig, info: InstanceInfo) -> None:
         )
     if uses_webrtc(info):
         typer.echo(
-            f"WebRTC browser: uv run python isaac_cloud.py view "
+            f"WebRTC browser: uv run python isaac_cloud.py webrtc-view "
             f"--provider {info.provider} --instance-id {info.instance_id}"
         )
         typer.echo("WebRTC uses SSH signaling + direct, source-IP-restricted UDP media.")
@@ -2651,9 +2651,10 @@ def tunnel(
 
 
 @app.command("webrtc", hidden=True)
-@app.command("view")
+@app.command("view", hidden=True)
+@app.command("webrtc-view")
 @cli_errors
-def view(
+def webrtc_view(
     instance_id: str = INSTANCE_ID_OPTION,
     provider: str = PROVIDER_OPTION,
     viewer_port: int = typer.Option(DEFAULT_WEBRTC_VIEWER_PORT, min=1024, max=65535),

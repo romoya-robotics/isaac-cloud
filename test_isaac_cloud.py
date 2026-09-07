@@ -676,7 +676,7 @@ def test_webrtc_launch_overrides_config_gui(config, monkeypatch, webrtc_info):
     result = CliRunner().invoke(ic.app, ["launch", "--webrtc"])
     assert result.exit_code == 0, result.output
     assert setups[0].webrtc_enabled and not setups[0].gui_enabled
-    assert "isaac_cloud.py view" in result.output
+    assert "isaac_cloud.py webrtc-view" in result.output
     assert "SSH is the only ingress" not in result.output
 
 
@@ -809,7 +809,7 @@ def test_webrtc_missing_viewer_build(tmp_path):
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt(), OSError("tunnel failed"),
                                      ic.IsaacCloudError("relay failed")])
-@pytest.mark.parametrize("command", ["view", "webrtc"])
+@pytest.mark.parametrize("command", ["webrtc-view", "view", "webrtc"])
 def test_webrtc_command_cleans_up_relay(config, monkeypatch, webrtc_info, tmp_path, failure, command):
     (tmp_path / "index.html").write_text("viewer")
     monkeypatch.setattr(ic, "_config", lambda: config)
@@ -974,7 +974,7 @@ def test_aws_viewer_cleans_ingress_on_failures(config, aws_webrtc_info, tmp_path
     monkeypatch.setattr(ic, "start_webrtc_relay", start)
     monkeypatch.setattr(ic, "stop_webrtc_relay", stop)
     monkeypatch.setattr(ic, "run_supervised_tunnel", tunnel)
-    result = CliRunner().invoke(ic.app, ["view", "--provider", "aws", "--instance-id", "i-test",
+    result = CliRunner().invoke(ic.app, ["webrtc-view", "--provider", "aws", "--instance-id", "i-test",
                                        "--client-ip", "198.51.100.10"])
     assert result.exit_code == (1 if stage == "relay_start" else 0), result.output
     expected = [("open", "198.51.100.10"), ("close", "198.51.100.10")]
