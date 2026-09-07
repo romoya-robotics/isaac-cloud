@@ -60,7 +60,7 @@ uv run python isaac_cloud.py status  --instance-id <ID>
 uv run python isaac_cloud.py tunnel  --instance-id <ID>   # supervised, auto-reconnecting
 uv run python isaac_cloud.py tunnel  --instance-id <ID2> --novnc-port 16080 --agent-port 18226   # second box
 
-uv run python isaac_cloud.py webrtc  --provider vast --instance-id <ID>  # viewer + signaling tunnel
+uv run python isaac_cloud.py view  --provider vast --instance-id <ID>  # viewer + signaling tunnel
 uv run python isaac_cloud.py sync list                   # saved projects + snapshots
 uv run python isaac_cloud.py sync pull --instance-id <ID> [--project P] [--snapshot TS]
 uv run python isaac_cloud.py sync push --instance-id <ID> [--project P]
@@ -155,7 +155,7 @@ Launch a **new** instance, then connect using its printed ID (use `--provider aw
 
 ```bash
 UV_CACHE=/home/keenb/projects/gpu-orchestrator/.venv uv run python isaac_cloud.py launch --provider vast --webrtc
-UV_CACHE=/home/keenb/projects/gpu-orchestrator/.venv uv run python isaac_cloud.py webrtc --provider vast --instance-id <ID>
+UV_CACHE=/home/keenb/projects/gpu-orchestrator/.venv uv run python isaac_cloud.py view --provider vast --instance-id <ID>
 ```
 
 Open **http://127.0.0.1:8210** in Chrome or Edge and click **Connect** once
@@ -164,7 +164,9 @@ Isaac log readiness and signaling port. Only one streaming client should be
 connected at a time. The viewer reports **Connected** when video starts
 playing, rather than treating a signaling handshake as working video.
 
-The `webrtc` command includes the agent/RTSP SSH forwards, so stop an existing
+The previous command name, `webrtc`, remains available as a compatibility alias.
+
+The `view` command includes the agent/RTSP SSH forwards, so stop an existing
 `tunnel` command before running it. Use `--viewer-port <PORT>` if 8210 is busy.
 Ctrl-C closes the local viewer server and tunnel and attempts to stop its
 remote media relay; the GPU instance continues running and billing. Stop or
@@ -186,10 +188,10 @@ absent inside the Vast container. The browser SDK's `mediaServer` and
 directly; it does not encapsulate video in TCP or SSH.
 
 The relay allows only the public IPv4 seen by SSH. If a VPN or different UDP
-route changes that address, pass `webrtc --client-ip <YOUR_PUBLIC_IPV4>`.
+route changes that address, pass `view --client-ip <YOUR_PUBLIC_IPV4>`.
 The relay is started when you connect, and the endpoint is refreshed on SSH
 reconnect. After stopping/resuming the instance or changing networks, restart
-the `webrtc` command and reload the browser page. A WebRTC instance's UDP
+the `view` command and reload the browser page. A WebRTC instance's UDP
 mapping also preserves its mode across `resume`, even if `--webrtc` was only
 specified at launch.
 
@@ -197,7 +199,7 @@ On AWS, the existing Docker container uses host networking. The viewer sends
 UDP to the instance's public IPv4 on port `47999`; the same container relay
 forwards it to Isaac on `127.0.0.1:47998`. Signaling still uses SSH.
 
-The AWS `webrtc` command temporarily adds UDP `47999` ingress for your public
+The AWS `view` command temporarily adds UDP `47999` ingress for your public
 IPv4 (`/32`) to the first attached security group. It removes the rule it
 created on exit, including if relay startup fails, and refreshes access on
 reconnect. Your local AWS credentials need `ec2:AuthorizeSecurityGroupIngress`

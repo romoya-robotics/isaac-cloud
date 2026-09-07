@@ -2039,7 +2039,7 @@ def print_access(config: AppConfig, info: InstanceInfo) -> None:
         )
     if uses_webrtc(info):
         typer.echo(
-            f"WebRTC browser: uv run python isaac_cloud.py webrtc "
+            f"WebRTC browser: uv run python isaac_cloud.py view "
             f"--provider {info.provider} --instance-id {info.instance_id}"
         )
         typer.echo("WebRTC uses SSH signaling + direct, source-IP-restricted UDP media.")
@@ -2650,15 +2650,16 @@ def tunnel(
     run_supervised_tunnel(config, prov, instance_id, local_ports)
 
 
-@app.command()
+@app.command("webrtc", hidden=True)
+@app.command("view")
 @cli_errors
-def webrtc(
+def view(
     instance_id: str = INSTANCE_ID_OPTION,
     provider: str = PROVIDER_OPTION,
     viewer_port: int = typer.Option(DEFAULT_WEBRTC_VIEWER_PORT, min=1024, max=65535),
     client_ip: str = typer.Option(None, help="Public IPv4 allowed for UDP (default: address seen by SSH)."),
 ) -> None:
-    """Serve the local WebRTC browser viewer and tunnel signaling; Ctrl-C to stop.
+    """Start the local WebRTC browser viewer and tunnel signaling; Ctrl-C to stop.
 
     Requires an instance launched with --webrtc. Video travels directly over
     UDP, not through SSH. Close any existing tunnel before running this command.
