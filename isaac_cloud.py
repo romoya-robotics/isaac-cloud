@@ -54,7 +54,7 @@ DEFAULT_WEBRTC_VIEWER_PORT = 8210
 # A separate UDP ingress forwards to Isaac's loopback-only media socket.
 # Mapping the socket itself would fail: Vast DNAT targets the container IP.
 DEFAULT_WEBRTC_RELAY_PORT = 47999
-WEBRTC_VIEWER_DIST = Path(__file__).resolve().parent / "web-viewer" / "dist"
+WEBRTC_VIEWER_DIST = Path(__file__).resolve().parent / "webrtc-viewer" / "dist"
 
 DEFAULT_INSTANCE_NAME_PREFIX = "isaac-cloud"
 DEFAULT_DISK_GB = 100
@@ -759,8 +759,8 @@ def make_webrtc_http_server(
 ) -> ThreadingHTTPServer:
     """Serve only compiled viewer assets and current connection info on loopback."""
     if not (directory / "index.html").is_file():
-        _raise("Build the browser viewer first: npm --prefix web-viewer ci --ignore-scripts "
-               "&& npm --prefix web-viewer run build")
+        _raise("Build the browser viewer first: npm --prefix webrtc-viewer ci --ignore-scripts "
+               "&& npm --prefix webrtc-viewer run build")
 
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):

@@ -47,7 +47,7 @@ resolution = "1920x1080"
 # Use `launch --webrtc` for one launch, or enable here with [gui].enabled=false.
 # Launch a NEW instance with --webrtc. Vast also requires whole_machine=true.
 # `webrtc --instance-id ID` serves the browser client, tunnels signaling, and
-# restricts direct UDP media to your public IPv4. Build web-viewer first;
+# restricts direct UDP media to your public IPv4. Build webrtc-viewer first;
 # see README.md. This is an experimental streaming workflow.
 [webrtc]
 enabled = false

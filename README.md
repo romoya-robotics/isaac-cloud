@@ -147,8 +147,8 @@ Omniverse WebRTC SDK. This does not require a local Isaac Sim installation.
 Build the local viewer once, using Node.js 22.12+ and npm:
 
 ```bash
-npm --prefix web-viewer ci --ignore-scripts
-npm --prefix web-viewer run build
+npm --prefix webrtc-viewer ci --ignore-scripts
+npm --prefix webrtc-viewer run build
 ```
 
 Launch a **new** instance, then connect using its printed ID (use `--provider aws` in both commands for AWS):
