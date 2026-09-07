@@ -4,15 +4,16 @@ Providers:
   - vast: Vast.ai marketplace containers (the Isaac image IS the instance).
   - aws:  EC2 GPU VMs (g6e/L40S) running the Isaac container under Docker.
 
-Access model is SSH-only on every provider: the agent control socket (8226),
-RTSP camera streams (8554), and the noVNC GUI (6080) are all bound to
-localhost on the remote side and reached through SSH tunnels printed by the
-CLI. Nothing Isaac-related is ever exposed to the public internet.
+Agent control, RTSP, and noVNC use SSH tunnels to remote loopback services.
+Opt-in WebRTC keeps signaling on SSH and uses a source-IP-restricted
+UDP relay for media; Isaac's own endpoints remain on remote loopback.
 """
 
 from __future__ import annotations
 
+import base64
 import functools
+import ipaddress
 import json
 import os
 import re
@@ -22,9 +23,12 @@ import socket
 import subprocess
 import tempfile
 import textwrap
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +50,11 @@ DEFAULT_AGENT_CONTROL_PORT = 8226  # isaacsim.code_editor.python_server, fixed u
 DEFAULT_RTSP_PORT = 8554
 DEFAULT_NOVNC_PORT = 6080
 DEFAULT_GUI_RESOLUTION = "1920x1080"
+DEFAULT_WEBRTC_VIEWER_PORT = 8210
+# A separate UDP ingress forwards to Isaac's loopback-only media socket.
+# Mapping the socket itself would fail: Vast DNAT targets the container IP.
+DEFAULT_WEBRTC_RELAY_PORT = 47999
+WEBRTC_VIEWER_DIST = Path(__file__).resolve().parent / "web-viewer" / "dist"
 
 DEFAULT_INSTANCE_NAME_PREFIX = "isaac-cloud"
 DEFAULT_DISK_GB = 100
@@ -110,6 +119,7 @@ DEFAULT_AWS_AMI_SSM_PARAM = (
     "/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id"
 )
 AWS_TAG_MANAGED = "IsaacCloudManaged"
+AWS_TAG_WEBRTC = "IsaacCloudWebRTC"
 
 ISAAC_MINIMUM_GPU_CLASSES = {"rtx4080", "rtx4090", "l40", "l40s"}
 
@@ -165,6 +175,7 @@ class AppConfig:
     persistence_aws_region: str | None
     persistence_project: str
     persistence_keep_last: int
+    webrtc_enabled: bool = False
 
 
 def load_toml(path: Path) -> dict[str, Any]:
@@ -220,6 +231,7 @@ def load_app_config(config_path: Path | None = None) -> AppConfig:
         curobo_enabled=_bool(nested_get(data, "isaac", "curobo"), False),
         lab_enabled=_bool(nested_get(data, "isaac", "lab"), False),
         lab_ref=nested_get(data, "isaac", "lab_ref") or DEFAULT_ISAAC_LAB_REF,
+        webrtc_enabled=_bool(nested_get(data, "webrtc", "enabled"), False),
         vast_query=nested_get(data, "vast", "query") or DEFAULT_VAST_QUERY,
         vast_whole_machine=_bool(
             nested_get(data, "vast", "whole_machine"), DEFAULT_VAST_WHOLE_MACHINE
@@ -322,6 +334,10 @@ class Provider:
         raise NotImplementedError
 
     # --- optional hooks ---
+    def open_webrtc_access(self, info: InstanceInfo, client_ip: str) -> Callable[[], None]:
+        """Open provider ingress for one viewer; return its cleanup function."""
+        return lambda: None
+
     def set_project_label(self, instance_id: str, project: str) -> None:
         """Record the project an instance was launched for (best-effort)."""
 
@@ -432,7 +448,7 @@ def wrap_container_command(target: SshTarget, command: str) -> str:
     """Return a shell command that runs `command` inside the Isaac container."""
     if not target.container_via_docker:
         return command
-    return f"sudo docker exec isaac-sim bash -c {shell_quote(command)}"
+    return f"sudo docker exec -i isaac-sim bash -c {shell_quote(command)}"
 
 
 def run_ssh(
@@ -524,11 +540,16 @@ def probe_local_tunnel(
         sock.close()
 
 
-def tunnel_forwards(local_ports: dict[int, int] | None = None) -> list[tuple[int, int]]:
+def tunnel_forwards(
+    local_ports: dict[int, int] | None = None,
+    *,
+    service_ports: list[tuple[int, str]] | None = None,
+) -> list[tuple[int, int]]:
     """(local, remote) pairs for every service; `local_ports` remaps remote -> local
     so tunnels to two boxes can coexist (e.g. {6080: 16080, 8226: 18226})."""
     local_ports = local_ports or {}
-    return [(local_ports.get(port, port), port) for port, _ in SERVICE_PORTS]
+    service_ports = SERVICE_PORTS if service_ports is None else service_ports
+    return [(local_ports.get(port, port), port) for port, _ in service_ports]
 
 
 def run_supervised_tunnel(
@@ -536,11 +557,19 @@ def run_supervised_tunnel(
     provider: Provider,
     instance_id: str,
     local_ports: dict[int, int] | None = None,
+    *,
+    service_ports: list[tuple[int, str]] | None = None,
+    on_connect: Callable[[InstanceInfo], None] | None = None,
 ) -> None:
     """Foreground self-healing tunnel: keepalives kill zombies within ~30s,
     then we reconnect with backoff, re-resolving the instance address in case
-    it changed across a stop/start. Ctrl-C exits."""
-    forwards = tunnel_forwards(local_ports)
+    it changed across a stop/start. Ctrl-C exits.
+
+    `on_connect` prepares remote services before each tunnel attempt; it does
+    not indicate that the tunnel is already listening or that Isaac is ready.
+    """
+    service_ports = SERVICE_PORTS if service_ports is None else service_ports
+    forwards = tunnel_forwards(local_ports, service_ports=service_ports)
     local_of = dict((remote, local) for local, remote in forwards)
     drops = 0
     backoff = 3
@@ -551,9 +580,11 @@ def run_supervised_tunnel(
             time.sleep(15)
             continue
         target = info.ssh
+        if on_connect is not None:
+            on_connect(info)
         if drops == 0:
             typer.echo(f"Tunnel to {info.provider}:{instance_id} ({target.host}:{target.port}):")
-            for port, label in SERVICE_PORTS:
+            for port, label in service_ports:
                 suffix = "/vnc.html (browser)" if port == DEFAULT_NOVNC_PORT else ""
                 typer.echo(f"  {label:14s} -> localhost:{local_of[port]}{suffix}")
             typer.echo("Ctrl-C to stop.")
@@ -568,7 +599,7 @@ def run_supervised_tunnel(
             "ExitOnForwardFailure=yes",
         ]
         for local_port, remote_port in forwards:
-            args[1:1] = ["-L", f"{local_port}:127.0.0.1:{remote_port}"]
+            args[1:1] = ["-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}"]
         started = time.time()
         try:
             completed = subprocess.run(args, check=False)
@@ -599,6 +630,189 @@ def format_tunnel_command(config: AppConfig, target: SshTarget, forwards: list[t
         f"ssh{key_flag} -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -N "
         f"{fw} -p {target.port} {target.user}@{target.host}"
     )
+
+
+def has_webrtc_mapping(info: InstanceInfo) -> bool:
+    return bool((info.raw.get("ports") or {}).get(f"{DEFAULT_WEBRTC_RELAY_PORT}/udp"))
+
+
+def uses_webrtc(info: InstanceInfo) -> bool:
+    if info.provider == "aws":
+        return any(tag.get("Key") == AWS_TAG_WEBRTC and tag.get("Value") == "true"
+                   for tag in info.raw.get("Tags", []))
+    return has_webrtc_mapping(info)
+
+
+def validate_webrtc_config(config: AppConfig, provider: str, *, selecting_offer: bool = False) -> None:
+    if not config.webrtc_enabled:
+        return
+    if config.gui_enabled:
+        _raise("WebRTC and noVNC run different Isaac apps. Choose --webrtc --no-gui or --gui --no-webrtc.")
+    if provider == "vast" and selecting_offer and not config.vast_whole_machine:
+        _raise("WebRTC requires [vast].whole_machine = true for NVENC. Explicit offers are checked at boot.")
+
+
+def webrtc_connection(info: InstanceInfo) -> dict[str, Any]:
+    """Resolve the public media endpoint; signaling always stays on SSH."""
+    mappings = (info.raw.get("ports") or {}).get(f"{DEFAULT_WEBRTC_RELAY_PORT}/udp")
+    if info.provider == "vast" and not mappings:
+        _raise("Instance has no WebRTC UDP mapping. Launch a new instance with --webrtc; "
+               "existing SSH-only instances cannot add the required port in place.")
+    try:
+        if info.provider == "aws":
+            if not uses_webrtc(info):
+                _raise("AWS instance is not configured for WebRTC. Launch it with --webrtc.")
+            host = str(ipaddress.IPv4Address(info.raw.get("PublicIpAddress")))
+            port = DEFAULT_WEBRTC_RELAY_PORT
+        elif info.provider == "vast":
+            host = str(ipaddress.IPv4Address(info.raw.get("public_ipaddr")))
+            port = int(mappings[0]["HostPort"])
+        else:
+            _raise(f"WebRTC is unsupported for provider {info.provider}.")
+        if not 1 <= port <= 65535:
+            raise ValueError("out of range")
+    except (ValueError, TypeError, KeyError, IndexError) as exc:
+        _raise(f"{info.provider} returned an invalid WebRTC public IP/UDP port: {exc}")
+    return {
+        "signalingServer": "127.0.0.1",
+        "signalingPort": DEFAULT_ISAAC_SIGNAL_PORT,
+        "mediaServer": host,
+        "mediaPort": port,
+    }
+
+
+def build_webrtc_check_script() -> str:
+    return dedent_script(
+        """\
+        #!/bin/bash
+        set -e
+        minors=$(nvidia-smi -q | awk '/Minor Number/ {print $NF}')
+        if ! echo "$minors" | grep -qx 0; then
+            echo "WebRTC requires host GPU minor 0 for NVENC; select a whole-machine offer."
+            exit 1
+        fi
+        command -v socat >/dev/null || {
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat
+        }
+        echo WEBRTC_PREREQUISITES_OK
+        """
+    )
+
+
+def build_webrtc_relay_script(client_ip: str) -> str:
+    # The SDK overrides the advertised loopback ICE address/port in the client.
+    # A UDP-to-UDP relay avoids binding Isaac to the unavailable host public IP
+    # inside Vast's Docker namespace. No media is encapsulated in TCP or SSH.
+    try:
+        client_ip = str(ipaddress.IPv4Address(client_ip))
+    except ipaddress.AddressValueError:
+        _raise("WebRTC client IP must be an IPv4 address (the public IP used for UDP).")
+    relay = f"socat -T 60 UDP4-LISTEN:{DEFAULT_WEBRTC_RELAY_PORT},"
+    return dedent_script(
+        f"""\
+        #!/bin/bash
+        set -e
+        command -v socat >/dev/null || {{ echo 'socat missing; resume this WebRTC instance first.'; exit 1; }}
+        pkill -f {shell_quote('^' + relay)} 2>/dev/null || true
+        setsid socat -T 60 \\
+            UDP4-LISTEN:{DEFAULT_WEBRTC_RELAY_PORT},bind=0.0.0.0,reuseaddr,fork,range={client_ip}/32 \\
+            UDP4:127.0.0.1:{DEFAULT_ISAAC_STREAM_PORT} \\
+            </dev/null >/root/isaac_webrtc_relay.log 2>&1 &
+        relay_pid=$!
+        sleep 1
+        kill -0 "$relay_pid" 2>/dev/null || {{ cat /root/isaac_webrtc_relay.log; exit 1; }}
+        echo "$relay_pid"
+        """
+    )
+
+
+def start_webrtc_relay(config: AppConfig, info: InstanceInfo, client_ip: str | None) -> int:
+    assert info.ssh
+    if client_ip is None:
+        # This is the address seen by SSH, avoiding a third-party IP lookup.
+        client_ip = run_ssh(config, info.ssh, 'printf "%s" "${SSH_CONNECTION%% *}"')
+    script = build_webrtc_relay_script(client_ip)
+    output = run_ssh_script(config, info.ssh, script, in_container=True, timeout_seconds=30)
+    try:
+        pid = int(output.splitlines()[-1])
+        if pid <= 1:
+            raise ValueError("invalid PID")
+    except (ValueError, IndexError):
+        _raise("Could not determine WebRTC relay PID; check /root/isaac_webrtc_relay.log.")
+    typer.echo(f"WebRTC UDP access restricted to {client_ip}; use --client-ip if your UDP egress differs.")
+    return pid
+
+
+def stop_webrtc_relay(config: AppConfig, target: SshTarget, pid: int) -> None:
+    # Kill only this session's process group, including socat's forked peers.
+    pattern = shell_quote(f"^socat -T 60 UDP4-LISTEN:{DEFAULT_WEBRTC_RELAY_PORT},")
+    run_ssh(
+        config, target,
+        f"if ps -p {pid} -o args= | grep -q {pattern}; then kill -- -{pid}; fi",
+        in_container=True, timeout_seconds=20,
+    )
+
+
+def make_webrtc_http_server(
+    port: int, connection: Callable[[], dict[str, Any]], directory: Path = WEBRTC_VIEWER_DIST,
+) -> ThreadingHTTPServer:
+    """Serve only compiled viewer assets and current connection info on loopback."""
+    if not (directory / "index.html").is_file():
+        _raise("Build the browser viewer first: npm --prefix web-viewer ci --ignore-scripts "
+               "&& npm --prefix web-viewer run build")
+
+    class Handler(SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(directory), **kwargs)
+
+        def do_GET(self):
+            self.serve_request(send_body=True)
+
+        def do_HEAD(self):
+            self.serve_request(send_body=False)
+
+        def serve_request(self, *, send_body: bool):
+            # Reject DNS rebinding to the local viewer/config endpoint.
+            bound_port = self.server.server_port
+            if self.headers.get("Host") not in {f"127.0.0.1:{bound_port}", f"localhost:{bound_port}"}:
+                self.send_error(403)
+                return
+            if self.path == "/connection.json":
+                payload = json.dumps(connection()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(payload)
+            else:
+                if send_body:
+                    super().do_GET()
+                else:
+                    super().do_HEAD()
+
+        def list_directory(self, path):
+            self.send_error(404)
+            return None
+
+        def end_headers(self):
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            super().end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    class ViewerServer(ThreadingHTTPServer):
+        # One viewer owns its port, including on Python versions that enable
+        # SO_REUSEPORT by default in ThreadingHTTPServer.
+        allow_reuse_port = False
+
+    try:
+        return ViewerServer(("127.0.0.1", port), Handler)
+    except OSError as exc:
+        _raise(f"Cannot start viewer on 127.0.0.1:{port}: {exc}. Use --viewer-port to change it.")
 
 
 # ---------------------------------------------------------------------------
@@ -1128,6 +1342,9 @@ def build_container_probe_script(config: AppConfig) -> str:
                 grep -qm1 -E "ISAAC_LAB_INSTALL_OK|ISAAC_LAB_ALREADY_INSTALLED" /root/isaac_lab_install.log && echo "isaac_lab: ready" || echo "isaac_lab: installing"
             fi
             video_tools_ready && echo "video_tools: ready (ffmpeg/ffprobe with libx264)" || echo "video_tools: MISSING (ffmpeg/ffprobe/libx264)"
+            if pgrep -f '^socat -T 60 UDP4-LISTEN:{DEFAULT_WEBRTC_RELAY_PORT},' >/dev/null; then
+                echo "webrtc relay: running (UDP; confirm video in the browser)"
+            fi
             for p in {DEFAULT_AGENT_CONTROL_PORT} {DEFAULT_ISAAC_SIGNAL_PORT} {DEFAULT_RTSP_PORT} {DEFAULT_NOVNC_PORT}; do
                 (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null && echo "port $p: open" || echo "port $p: closed"
             done
@@ -1307,6 +1524,8 @@ class VastProvider(Provider):
                 "sleep infinity",
                 "--ssh",
                 "--direct",
+                *(["--env", f"-p {DEFAULT_WEBRTC_RELAY_PORT}:{DEFAULT_WEBRTC_RELAY_PORT}/udp"]
+                  if self.config.webrtc_enabled else []),
             ],
             timeout_seconds=120,
         )
@@ -1411,6 +1630,45 @@ def run_aws_json(config: AppConfig, args: list[str], *, timeout_seconds: int = 1
 class AwsProvider(Provider):
     name = "aws"
 
+    def open_webrtc_access(self, info: InstanceInfo, client_ip: str) -> Callable[[], None]:
+        # Use an attached group, never change group membership or expose signaling.
+        client_ip = str(ipaddress.IPv4Address(client_ip))
+        groups = info.raw.get("SecurityGroups") or []
+        if not groups:
+            _raise("AWS instance has no attached security group for WebRTC UDP access.")
+        group_id = groups[0]["GroupId"]
+        permissions = json.dumps([{
+            "IpProtocol": "udp",
+            "FromPort": DEFAULT_WEBRTC_RELAY_PORT,
+            "ToPort": DEFAULT_WEBRTC_RELAY_PORT,
+            "IpRanges": [{"CidrIp": f"{client_ip}/32",
+                          "Description": f"isaac-cloud WebRTC {info.instance_id}"}],
+        }])
+        try:
+            result = run_aws_json(self.config, [
+                "ec2", "authorize-security-group-ingress", "--group-id", group_id,
+                "--ip-permissions", permissions,
+            ])
+        except IsaacCloudError as exc:
+            if "InvalidPermission.Duplicate" in str(exc):
+                raise IsaacCloudError(
+                    f"UDP {DEFAULT_WEBRTC_RELAY_PORT} from {client_ip}/32 already exists in {group_id}. "
+                    "Stop the other viewer or remove a stale rule before retrying; "
+                    "existing rules are not modified."
+                ) from exc
+            raise
+        rule_ids = [rule["SecurityGroupRuleId"] for rule in result.get("SecurityGroupRules", [])]
+        typer.echo(f"AWS WebRTC ingress: {group_id}, UDP {DEFAULT_WEBRTC_RELAY_PORT} from {client_ip}/32.")
+
+        def close() -> None:
+            selector = (["--security-group-rule-ids", *rule_ids] if rule_ids
+                        else ["--ip-permissions", permissions])
+            run_aws_json(self.config, [
+                "ec2", "revoke-security-group-ingress", "--group-id", group_id, *selector,
+            ])
+
+        return close
+
     def resolve_ami(self) -> str:
         result = run_aws_json(
             self.config,
@@ -1436,9 +1694,7 @@ class AwsProvider(Provider):
                     "--key-name",
                     name,
                     "--public-key-material",
-                    subprocess.run(  # base64 without newlines
-                        ["base64", "-w", "0"], input=pub, capture_output=True, text=True
-                    ).stdout,
+                    base64.b64encode(pub.encode()).decode("ascii"),
                 ],
             )
         return name
@@ -1556,6 +1812,8 @@ class AwsProvider(Provider):
                             "Tags": [
                                 {"Key": "Name", "Value": name},
                                 {"Key": AWS_TAG_MANAGED, "Value": "true"},
+                                *([{"Key": AWS_TAG_WEBRTC, "Value": "true"}]
+                                  if self.config.webrtc_enabled else []),
                             ],
                         }
                     ]
@@ -1710,6 +1968,10 @@ def setup_isaac(config: AppConfig, info: InstanceInfo) -> None:
     """Start Isaac on the box: the GUI stack (foreground, verified) or the
     headless streaming kit (background)."""
     assert info.ssh
+    if config.webrtc_enabled:
+        validate_webrtc_config(config, info.provider)
+        webrtc_connection(info)  # Fail before restarting Isaac if the mapping is absent.
+        run_ssh_script(config, info.ssh, build_webrtc_check_script(), in_container=True, timeout_seconds=180)
     if not config.gui_enabled:
         output = run_ssh_script(
             config, info.ssh, build_isaac_container_launch_script(config),
@@ -1744,6 +2006,8 @@ def setup_isaac(config: AppConfig, info: InstanceInfo) -> None:
 
 def print_access(config: AppConfig, info: InstanceInfo) -> None:
     assert info.ssh
+    if uses_webrtc(info):
+        config = replace(config, gui_enabled=False)
     t = info.ssh
     typer.echo("")
     typer.echo(f"Instance: {info.provider}:{info.instance_id}  status={info.status}")
@@ -1756,7 +2020,8 @@ def print_access(config: AppConfig, info: InstanceInfo) -> None:
     if config.gui_enabled:
         forwards.append((DEFAULT_NOVNC_PORT, DEFAULT_NOVNC_PORT))
     typer.echo(
-        f"Tunnel (recommended): uv run python isaac_cloud.py tunnel "
+        f"Tunnel ({'agent/RTSP only' if uses_webrtc(info) else 'recommended'}): "
+        f"uv run python isaac_cloud.py tunnel "
         f"--instance-id {info.instance_id} --provider {info.provider}"
     )
     typer.echo(f"Tunnel (raw ssh):     {format_tunnel_command(config, t, forwards)}")
@@ -1772,7 +2037,15 @@ def print_access(config: AppConfig, info: InstanceInfo) -> None:
             f"  GUI stack: {GUI_STACK_PATH} on the box (re-run to repair; `check` for the "
             "probes); `status` reports the gui_* checks."
         )
-    typer.echo("All ports are localhost-only on the remote side; SSH is the only ingress.")
+    if uses_webrtc(info):
+        typer.echo(
+            f"WebRTC browser: uv run python isaac_cloud.py webrtc "
+            f"--provider {info.provider} --instance-id {info.instance_id}"
+        )
+        typer.echo("WebRTC uses SSH signaling + direct, source-IP-restricted UDP media.")
+        typer.echo("Use the WebRTC command instead of running a separate tunnel.")
+    else:
+        typer.echo("All ports are localhost-only on the remote side; SSH is the only ingress.")
 
 
 # ---------------------------------------------------------------------------
@@ -2024,7 +2297,7 @@ def resolve_project(config: AppConfig, info: InstanceInfo | None = None, overrid
 
 app = typer.Typer(
     name=APP_NAME,
-    help="Launch and manage NVIDIA Isaac Sim on Vast.ai or AWS EC2, accessed over SSH only.",
+    help="Launch and manage NVIDIA Isaac Sim on Vast.ai or AWS EC2, with SSH access and optional WebRTC.",
     no_args_is_help=True,
 )
 sync_app = typer.Typer(help="Save/restore project snapshots (append-only) between the instance and S3.")
@@ -2125,6 +2398,7 @@ def launch(
         help="Rent a specific Vast offer (from `catalog` output) instead of the top-ranked one.",
     ),
     gui: bool = typer.Option(None, "--gui/--no-gui", help="Also start the noVNC GUI stack."),
+    webrtc: bool = typer.Option(None, "--webrtc/--no-webrtc", help="Enable native WebRTC with direct UDP media on Vast or AWS."),
     agent: bool = typer.Option(None, "--agent/--no-agent", help="Enable the agent control socket."),
     curobo: bool = typer.Option(
         None,
@@ -2144,6 +2418,10 @@ def launch(
     config = _config()
     if gui is not None:
         config = replace(config, gui_enabled=gui)
+    if webrtc is not None:
+        config = replace(config, webrtc_enabled=webrtc)
+        if webrtc and gui is None:
+            config = replace(config, gui_enabled=False)
     if agent is not None:
         config = replace(config, agent_enabled=agent)
     if curobo is not None:
@@ -2153,6 +2431,7 @@ def launch(
     prov = get_provider(config, provider)
     live_instance_id: str | None = None
     try:
+        validate_webrtc_config(config, prov.name, selecting_offer=True)
         launch_project = resolve_project(config, override=project)
         info = prov.launch(offer_id=offer_id)
         live_instance_id = info.instance_id
@@ -2266,16 +2545,27 @@ def resume(
         config = replace(config, agent_enabled=agent)
     prov = get_provider(config, provider)
     info = prov.get(instance_id)
+    if config.webrtc_enabled or uses_webrtc(info):
+        config = replace(config, webrtc_enabled=True, gui_enabled=bool(gui))
+        validate_webrtc_config(config, prov.name)
     if info.status != "running":
         prov.start(instance_id)
     info = wait_for_ssh(config, prov, instance_id)
+    # Provider metadata preserves WebRTC mode across stop/start, even when
+    # --webrtc was only supplied at launch.
+    if uses_webrtc(info):
+        config = replace(config, webrtc_enabled=True, gui_enabled=False)
     wait_for_container(config, info)
     if gui is None:
-        gui = remote_gui_stack_installed(config, info)
-        typer.echo(
-            f"GUI stack {'found' if gui else 'not found'} on the box "
-            f"({GUI_STACK_PATH}); resuming {'with the GUI' if gui else 'headless'}."
-        )
+        if config.webrtc_enabled:
+            gui = False
+            typer.echo("Resuming with WebRTC headless streaming.")
+        else:
+            gui = remote_gui_stack_installed(config, info)
+            typer.echo(
+                f"GUI stack {'found' if gui else 'not found'} on the box "
+                f"({GUI_STACK_PATH}); resuming {'with the GUI' if gui else 'headless'}."
+            )
     config = replace(config, gui_enabled=gui)
     setup_isaac(config, info)
     print_access(config, info)
@@ -2358,6 +2648,82 @@ def tunnel(
         DEFAULT_NOVNC_PORT: novnc_port,
     }
     run_supervised_tunnel(config, prov, instance_id, local_ports)
+
+
+@app.command()
+@cli_errors
+def webrtc(
+    instance_id: str = INSTANCE_ID_OPTION,
+    provider: str = PROVIDER_OPTION,
+    viewer_port: int = typer.Option(DEFAULT_WEBRTC_VIEWER_PORT, min=1024, max=65535),
+    client_ip: str = typer.Option(None, help="Public IPv4 allowed for UDP (default: address seen by SSH)."),
+) -> None:
+    """Serve the local WebRTC browser viewer and tunnel signaling; Ctrl-C to stop.
+
+    Requires an instance launched with --webrtc. Video travels directly over
+    UDP, not through SSH. Close any existing tunnel before running this command.
+    """
+    config = _config()
+    prov = get_provider(config, provider)
+    ports = [(p, label) for p, label in SERVICE_PORTS if p != DEFAULT_NOVNC_PORT]
+    ports.append((DEFAULT_ISAAC_SIGNAL_PORT, "WebRTC signal"))
+    if viewer_port in {p for p, _ in ports}:
+        _raise("--viewer-port conflicts with an SSH forwarded service port.")
+    if client_ip is not None:
+        build_webrtc_relay_script(client_ip)  # Validate before any remote mutations.
+    for port, _ in ports:
+        if check_tcp_connectivity("127.0.0.1", port, timeout_seconds=0.2):
+            _raise(f"Local port {port} is already in use. Stop the existing tunnel/viewer before connecting.")
+    info = prov.get(instance_id)
+    current_connection = webrtc_connection(info)
+    if info.status != "running" or not info.ssh:
+        _raise("Instance must be running and SSH reachable; resume it first.")
+    relay: tuple[SshTarget, int] | None = None
+    close_access: Callable[[], None] | None = None
+
+    def prepare(current: InstanceInfo) -> None:
+        nonlocal current_connection, relay, close_access
+        current_connection = webrtc_connection(current)
+        assert current.ssh
+        address = client_ip or run_ssh(config, current.ssh, 'printf "%s" "${SSH_CONNECTION%% *}"')
+        build_webrtc_relay_script(address)  # Validate before changing provider ingress.
+        if close_access is not None:
+            close_access()
+            close_access = None
+        close_access = prov.open_webrtc_access(current, address)
+        pid = start_webrtc_relay(config, current, address)
+        relay = (current.ssh, pid)
+
+    server = make_webrtc_http_server(viewer_port, lambda: current_connection)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    typer.echo(f"Open http://127.0.0.1:{viewer_port} in Chrome or Edge after signaling is ready.")
+    typer.echo("First boot may take 5–10 minutes. Click Connect once Isaac has loaded.")
+    typer.echo("After an instance restart/address change, reload the browser page.")
+    try:
+        run_supervised_tunnel(
+            config, prov, instance_id,
+            service_ports=ports,
+            on_connect=prepare,
+        )
+    except KeyboardInterrupt:
+        typer.echo("WebRTC viewer stopped.")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _raise(f"WebRTC connection failed: {exc}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        if relay is not None:
+            try:
+                stop_webrtc_relay(config, *relay)
+            except (IsaacCloudError, OSError, subprocess.TimeoutExpired) as exc:
+                typer.echo(f"Could not stop the remote UDP relay: {exc}. It remains source-IP-restricted.")
+        if close_access is not None:
+            try:
+                close_access()
+            except (IsaacCloudError, OSError, subprocess.TimeoutExpired) as exc:
+                typer.echo(f"Could not remove WebRTC ingress: {exc}. Remove the reported UDP rule manually.")
 
 
 @sync_app.command("pull")

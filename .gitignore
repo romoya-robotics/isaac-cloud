@@ -16,3 +16,4 @@ build/
 *.local
 config.toml
 .codex
+web-viewer/node_modules/

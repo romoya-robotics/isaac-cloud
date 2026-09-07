@@ -1,6 +1,7 @@
 # isaac-cloud
 
-Launch and manage NVIDIA Isaac Sim 6 on cloud GPUs, accessed **over SSH only**.
+Launch and manage NVIDIA Isaac Sim 6 on cloud GPUs, with **SSH access** and
+optional **WebRTC viewing on Vast.ai and AWS EC2**.
 
 Two providers:
 
@@ -11,9 +12,8 @@ Two providers:
 | Startup | instant marketplace, hosts vary | slower, but consistent |
 | Best for | day-to-day dev, experiments | must-not-flake runs, AWS-native persistence |
 
-Every access path binds to localhost on the remote side and is reached through
-an SSH tunnel the CLI prints for you — nothing Isaac-related is exposed to the
-internet, and your SSH key is the only authentication that exists:
+By default, access paths bind to localhost on the remote side and are reached
+through an SSH tunnel the CLI prints for you:
 
 - **Agent control** (`127.0.0.1:8226`) — Isaac 6's built-in
   `isaacsim.code_editor.python_server`. Drive the live sim with Python from
@@ -27,6 +27,10 @@ internet, and your SSH key is the only authentication that exists:
   single TCP port. Works on any host; NVENC not required. Needs a host whose
   driver can present Vulkan on an X display (driver >= 590 in practice; see
   [The GUI stack](#the-gui-stack)).
+- **Native WebRTC** (`http://127.0.0.1:8210`, `--webrtc`, Vast or AWS) — Isaac's
+  built-in streaming rendered on the remote GPU, displayed and controlled in
+  a local Chromium browser. Signaling uses SSH; media uses a public UDP relay
+  restricted to your client IP. See the experimental workflow below.
 
 ## Setup
 
@@ -47,6 +51,7 @@ cp config.example.toml config.toml   # then fill in [ngc] and [ssh]
 uv run python isaac_cloud.py catalog [--gui]             # browse offers (--gui ranks driver >= 590 first)
 uv run python isaac_cloud.py launch                      # headless + agent socket
 uv run python isaac_cloud.py launch --gui                # + noVNC GUI
+uv run python isaac_cloud.py launch --provider vast --webrtc  # native streaming + UDP mapping
 uv run python isaac_cloud.py launch --curobo             # + cuRobo motion planning (bg install)
 uv run python isaac_cloud.py launch --lab                # + Isaac Lab (bg install)
 uv run python isaac_cloud.py launch --provider aws
@@ -54,6 +59,8 @@ uv run python isaac_cloud.py instances
 uv run python isaac_cloud.py status  --instance-id <ID>
 uv run python isaac_cloud.py tunnel  --instance-id <ID>   # supervised, auto-reconnecting
 uv run python isaac_cloud.py tunnel  --instance-id <ID2> --novnc-port 16080 --agent-port 18226   # second box
+
+uv run python isaac_cloud.py webrtc  --provider vast --instance-id <ID>  # viewer + signaling tunnel
 uv run python isaac_cloud.py sync list                   # saved projects + snapshots
 uv run python isaac_cloud.py sync pull --instance-id <ID> [--project P] [--snapshot TS]
 uv run python isaac_cloud.py sync push --instance-id <ID> [--project P]
@@ -130,6 +137,112 @@ Set `GUI_STACK_TIMEOUT` (default 600 s) on the box to change how long the
 script waits for the kit. Two boxes at once: give the second tunnel its own
 local ports (`tunnel --novnc-port 16080 --agent-port 18226`; `status
 --agent-port 18226` probes that tunnel).
+
+## WebRTC browser viewing (experimental)
+
+Simulation, rendering, and video encoding run in Isaac Sim on the remote GPU.
+Your local computer decodes the video and sends input using NVIDIA's
+Omniverse WebRTC SDK. This does not require a local Isaac Sim installation.
+
+Build the local viewer once, using Node.js 22.12+ and npm:
+
+```bash
+npm --prefix web-viewer ci --ignore-scripts
+npm --prefix web-viewer run build
+```
+
+Launch a **new** instance, then connect using its printed ID (use `--provider aws` in both commands for AWS):
+
+```bash
+UV_CACHE=/home/keenb/projects/gpu-orchestrator/.venv uv run python isaac_cloud.py launch --provider vast --webrtc
+UV_CACHE=/home/keenb/projects/gpu-orchestrator/.venv uv run python isaac_cloud.py webrtc --provider vast --instance-id <ID>
+```
+
+Open **http://127.0.0.1:8210** in Chrome or Edge and click **Connect** once
+Isaac has loaded. `status --provider vast --instance-id <ID>` reports the
+Isaac log readiness and signaling port. Only one streaming client should be
+connected at a time. The viewer reports **Connected** when video starts
+playing, rather than treating a signaling handshake as working video.
+
+The `webrtc` command includes the agent/RTSP SSH forwards, so stop an existing
+`tunnel` command before running it. Use `--viewer-port <PORT>` if 8210 is busy.
+Ctrl-C closes the local viewer server and tunnel and attempts to stop its
+remote media relay; the GPU instance continues running and billing. Stop or
+destroy it with the existing lifecycle commands when finished.
+
+The topology adapts native Isaac streaming to Vast's container networking:
+
+```text
+Local browser --TCP signaling via SSH--> Isaac 127.0.0.1:49100
+Local browser <--UDP--> Vast public IP:mapped UDP port
+                       -> container UDP relay :47999
+                       <-> Isaac 127.0.0.1:47998
+```
+
+`launch --webrtc` requests only the relay's UDP mapping. Isaac stays bound to
+loopback, avoiding the NVIDIA SDK's attempt to bind a host public IP that is
+absent inside the Vast container. The browser SDK's `mediaServer` and
+`mediaPort` overrides target the mapped UDP endpoint. The relay carries UDP
+directly; it does not encapsulate video in TCP or SSH.
+
+The relay allows only the public IPv4 seen by SSH. If a VPN or different UDP
+route changes that address, pass `webrtc --client-ip <YOUR_PUBLIC_IPV4>`.
+The relay is started when you connect, and the endpoint is refreshed on SSH
+reconnect. After stopping/resuming the instance or changing networks, restart
+the `webrtc` command and reload the browser page. A WebRTC instance's UDP
+mapping also preserves its mode across `resume`, even if `--webrtc` was only
+specified at launch.
+
+On AWS, the existing Docker container uses host networking. The viewer sends
+UDP to the instance's public IPv4 on port `47999`; the same container relay
+forwards it to Isaac on `127.0.0.1:47998`. Signaling still uses SSH.
+
+The AWS `webrtc` command temporarily adds UDP `47999` ingress for your public
+IPv4 (`/32`) to the first attached security group. It removes the rule it
+created on exit, including if relay startup fails, and refreshes access on
+reconnect. Your local AWS credentials need `ec2:AuthorizeSecurityGroupIngress`
+and `ec2:RevokeSecurityGroupIngress`, in addition to the existing instance
+permissions. No AWS credentials are copied to the instance.
+
+Security group rules apply to every instance sharing that group. Use a
+separate `[aws].security_group` for isolated deployments. An existing identical
+rule is left untouched and reported as a conflict; stop another viewer using
+that group and client IP, or remove a stale rule before retrying. If the process
+is forcibly killed or AWS cleanup fails, remove the reported UDP rule manually.
+The relay also restricts traffic to the same client IP. Network ACLs and host
+firewalls must allow the traffic; this command does not modify them.
+
+AWS records WebRTC mode in the `IsaacCloudWebRTC=true` instance tag, so `resume`
+preserves it even when the local config has WebRTC disabled. A public IPv4 and
+an NVIDIA GPU with working video encoding are required (the default AWS
+instance type is `g6e.xlarge`).
+
+Requirements and limits:
+
+- On Vast, `[vast].whole_machine = true`; setup checks for host GPU minor 0, required
+  for NVENC on the previously tested hosts. This check does not guarantee
+  that every host has working hardware encoding.
+- WebRTC and `--gui` are alternative Isaac app modes. `--webrtc` overrides a
+  configured GUI default; explicitly requesting both flags is rejected.
+- Existing Vast SSH-only instances lack the UDP mapping and need a new instance.
+  AWS instances must be launched with `--webrtc` so setup and resume use streaming mode.
+- The browser's network must permit UDP to the mapped port. There is no TURN
+  fallback. A black screen can mean blocked UDP, an incorrect client IP,
+  incomplete shader compilation, or an NVENC failure. Inspect
+  `/root/isaac.log`, `/root/isaac_webrtc_relay.log`, and Chrome's
+  `chrome://webrtc-internals` for diagnostics.
+- **Not yet validated with a live video session on either provider.** Local CLI tests,
+  connection routing tests, HTTP serving tests, and the production viewer
+  build pass. This is an experimental networking adaptation; the repo's
+  earlier noVNC workflow remains the one confirmed interactively on Vast.
+
+NVIDIA recommends the [WebRTC browser viewer for cloud deployments](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/installation/manual_livestream_clients.html).
+Its standard Docker Compose deployment uses host networking. This repo uses
+the same [NVIDIA WebRTC SDK](https://github.com/isaac-sim/IsaacSim/blob/main/tools/docker/web-viewer/Dockerfile)
+in a locally served viewer to accommodate
+[Vast's assigned port mappings](https://docs.vast.ai/guides/instances/docker-environment).
+The pinned SDK dependency is distributed under NVIDIA's license, included in
+its npm package. Browser assets are built locally rather than vendored here.
 
 ## Driving Isaac from Claude Code
 
@@ -246,6 +359,8 @@ See `config.example.toml`. Highlights:
 - `[isaac].agent` — agent control socket (default true).
 - `[gui].enabled` / `resolution` — noVNC GUI stack (default off; `--gui` per launch;
   see [The GUI stack](#the-gui-stack)).
+- `[webrtc].enabled` — experimental native WebRTC on Vast and AWS (default off;
+  `--webrtc` per launch; mutually exclusive with GUI mode).
 - `[isaac].curobo` — install cuRobo into Isaac's python after launch (default off;
   `--curobo` per launch). Background, ~5 min; `status` probe reports `curobo: ready`.
 - `[isaac].lab` — install Isaac Lab into Isaac's python after launch (default off;
@@ -265,6 +380,6 @@ See `config.example.toml`. Highlights:
 
 This tool previously targeted TensorDock, whose marketplace emptied out after
 the Voltage Park acquisition (2025–2026). The experiment logs from the
-migration — including why WebRTC browser streaming over SSH tunnels was
-abandoned in favor of noVNC, and the NVENC device-index discovery — live in
+migration — including why TCP-tunneled WebRTC video was abandoned in favor
+of noVNC, and the NVENC device-index discovery — live in
 `docs/VAST_EXPERIMENT_RESULTS.md` and `docs/GUI_TUNNEL_EXPERIMENT_PLAN.md`.
