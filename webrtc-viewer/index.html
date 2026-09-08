@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Isaac Sim · WebRTC</title>
+  </head>
+  <body>
+    <header>
+      <strong>Isaac Sim</strong><span>WebRTC</span>
+      <p id="status" role="status">Ready to connect</p>
+      <button id="connect">Connect</button>
+      <button id="disconnect" disabled>Disconnect</button>
+      <button id="fullscreen">Fullscreen</button>
+    </header>
+    <main id="stream-container">
+      <video id="remote-video" autoplay playsinline muted tabindex="0"></video>
+      <audio id="remote-audio" autoplay></audio>
+    </main>
+    <footer>Simulation and rendering run on your remote GPU. Close other streaming tabs before connecting.</footer>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

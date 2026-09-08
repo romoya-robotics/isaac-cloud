@@ -7,12 +7,18 @@ snapshot semantics, and project resolution precedence.
 """
 
 import sys
+import json
+import base64
 import time
+import subprocess
+import threading
+from http.client import HTTPConnection
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import typer
+from typer.testing import CliRunner
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import isaac_cloud as ic
@@ -83,6 +89,8 @@ def test_config_defaults(tmp_path):
     assert cfg.isaac_version == ic.DEFAULT_ISAAC_VERSION
     assert cfg.lab_enabled is False
     assert cfg.lab_ref == ic.DEFAULT_ISAAC_LAB_REF
+
+    assert cfg.webrtc_enabled is False
 
 
 def test_config_isaac_section(tmp_path):
@@ -584,3 +592,393 @@ def test_remote_gui_stack_installed(config, monkeypatch):
     assert ic.remote_gui_stack_installed(config, info) is True
     monkeypatch.setattr(ic, "run_ssh", lambda *a, **k: "no")
     assert ic.remote_gui_stack_installed(config, info) is False
+
+# WebRTC: separate SSH signaling and mapped UDP media on Vast.
+
+@pytest.fixture()
+def webrtc_info():
+    return ic.InstanceInfo(
+        "vast", "123", "running", "", ic.SshTarget("203.0.113.42", 30022, "root"),
+        {"public_ipaddr": "203.0.113.42", "ports": {
+            "22/tcp": [{"HostPort": "30022"}],
+            "47999/udp": [{"HostPort": "31234"}],
+        }},
+    )
+
+
+def test_webrtc_config(tmp_path):
+    path = tmp_path / "stream.toml"
+    path.write_text("[webrtc]\nenabled = true\n")
+    assert ic.load_app_config(path).webrtc_enabled
+
+
+def test_webrtc_uses_mapped_media_port(webrtc_info):
+    assert ic.webrtc_connection(webrtc_info) == {
+        "signalingServer": "127.0.0.1", "signalingPort": 49100,
+        "mediaServer": "203.0.113.42", "mediaPort": 31234,
+    }
+
+
+@pytest.mark.parametrize("raw", [
+    {}, {"ports": {"47999/tcp": [{"HostPort": "31234"}]}},
+    {"public_ipaddr": "$(touch /tmp/oops)", "ports": {"47999/udp": [{"HostPort": "31234"}]}},
+    {"public_ipaddr": "203.0.113.42", "ports": {"47999/udp": [{"HostPort": "70000"}]}},
+    {"public_ipaddr": "203.0.113.42", "ports": {"47999/udp": [{}]}},
+])
+def test_webrtc_rejects_missing_or_invalid_mapping(webrtc_info, raw):
+    with pytest.raises(ic.IsaacCloudError):
+        ic.webrtc_connection(replace(webrtc_info, raw=raw))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_vast_requests_only_udp_for_webrtc(config, monkeypatch, enabled):
+    calls = []
+    cfg = replace(config, ngc_api_key="fake", webrtc_enabled=enabled)
+    prov = ic.VastProvider(cfg)
+
+    def vast(args, **kwargs):
+        calls.append(args)
+        return {"success": True, "new_contract": 123}
+
+    monkeypatch.setattr(ic, "run_vastai_json", vast)
+    monkeypatch.setattr(prov, "_ensure_account_ssh_key", lambda: None)
+    prov.launch(offer_id="42")
+    args = calls[0]
+    if enabled:
+        assert args[args.index("--env") + 1] == "-p 47999:47999/udp"
+    else:
+        assert "--env" not in args
+    assert "49100" not in " ".join(args)
+    assert "8226" not in " ".join(args)
+
+
+@pytest.mark.parametrize("options,overrides,message", [
+    (["--webrtc", "--gui"], {}, "Choose --webrtc --no-gui"),
+    (["--webrtc"], {"vast_whole_machine": False}, "whole_machine"),
+])
+def test_webrtc_invalid_launch_fails_before_rental(config, monkeypatch, options, overrides, message):
+    monkeypatch.setattr(ic, "_config", lambda: replace(config, **overrides))
+    monkeypatch.setattr(ic.VastProvider, "launch", lambda *a, **k: pytest.fail("rented an instance"))
+    monkeypatch.setattr(ic.AwsProvider, "launch", lambda *a, **k: pytest.fail("rented an instance"))
+    result = CliRunner().invoke(ic.app, ["launch", *options])
+    assert result.exit_code == 1, result.output
+    assert message in result.output
+
+
+def test_webrtc_launch_overrides_config_gui(config, monkeypatch, webrtc_info):
+    cfg = replace(config, gui_enabled=True, persistence_enabled=False)
+    monkeypatch.setattr(ic, "_config", lambda: cfg)
+    monkeypatch.setattr(ic.VastProvider, "launch", lambda *a, **k: webrtc_info)
+    monkeypatch.setattr(ic, "wait_for_ssh", lambda *a, **k: webrtc_info)
+    monkeypatch.setattr(ic, "wait_for_container", lambda *a: None)
+    setups = []
+    monkeypatch.setattr(ic, "setup_isaac", lambda c, i: setups.append(c))
+    result = CliRunner().invoke(ic.app, ["launch", "--webrtc"])
+    assert result.exit_code == 0, result.output
+    assert setups[0].webrtc_enabled and not setups[0].gui_enabled
+    assert "isaac_cloud.py webrtc-view" in result.output
+    assert "SSH is the only ingress" not in result.output
+
+
+def test_webrtc_resume_remembers_launch_flag(config, monkeypatch, webrtc_info):
+    monkeypatch.setattr(ic, "_config", lambda: config)
+    monkeypatch.setattr(ic.VastProvider, "get", lambda *a: webrtc_info)
+    monkeypatch.setattr(ic.VastProvider, "start", lambda *a: None)
+    monkeypatch.setattr(ic, "wait_for_ssh", lambda *a: webrtc_info)
+    monkeypatch.setattr(ic, "wait_for_container", lambda *a: None)
+    monkeypatch.setattr(ic, "remote_gui_stack_installed", lambda *a: pytest.fail("WebRTC must skip GUI autodetection"))
+    setups = []
+    monkeypatch.setattr(ic, "setup_isaac", lambda c, i: setups.append(c))
+    result = CliRunner().invoke(ic.app, ["resume", "--instance-id", "123"])
+    assert result.exit_code == 0, result.output
+    assert setups[0].webrtc_enabled
+    assert not setups[0].gui_enabled
+
+
+def test_webrtc_resume_rejects_gui_before_start(config, monkeypatch, webrtc_info):
+    monkeypatch.setattr(ic, "_config", lambda: config)
+    monkeypatch.setattr(ic.VastProvider, "get", lambda *a: replace(webrtc_info, status="stopped"))
+    monkeypatch.setattr(ic.VastProvider, "start", lambda *a: pytest.fail("started an incompatible instance"))
+    result = CliRunner().invoke(ic.app, ["resume", "--instance-id", "123", "--gui"])
+    assert result.exit_code == 1, result.output
+    assert "Choose --webrtc --no-gui" in result.output
+
+
+def test_webrtc_relay_is_udp_only_and_restricted():
+    script = ic.build_webrtc_relay_script("198.51.100.10")
+    assert "range=198.51.100.10/32" in script
+    assert "UDP4:127.0.0.1:47998" in script
+    assert "UDP4-LISTEN:47999" in script
+    assert "TCP" not in script
+    assert "kill -0" in script
+    with pytest.raises(ic.IsaacCloudError):
+        ic.build_webrtc_relay_script("0.0.0.0/0")
+    with pytest.raises(ic.IsaacCloudError):
+        ic.build_webrtc_relay_script("1.2.3.4; echo injected")
+
+
+def test_webrtc_shell_syntax(config):
+    assert "--/exts/omni.services.livestream.session/quitOnSessionEnded=false" in (
+        ic.build_isaac_container_launch_script(config)
+    )
+    for script in [ic.build_webrtc_check_script(), ic.build_webrtc_relay_script("198.51.100.10"),
+                   ic.build_container_probe_script(config), ic.build_isaac_container_launch_script(config),
+                   ic.build_lab_install_script(config.lab_ref)]:
+        result = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
+        assert result.returncode == 0, result.stderr
+
+
+def test_webrtc_relay_uses_ssh_client_ip(config, webrtc_info, monkeypatch):
+    scripts = []
+    monkeypatch.setattr(ic, "run_ssh", lambda *a, **k: "198.51.100.10")
+    monkeypatch.setattr(ic, "run_ssh_script", lambda c, t, s, **k: scripts.append(s) or "1234")
+    assert ic.start_webrtc_relay(config, webrtc_info, None) == 1234
+    assert "range=198.51.100.10/32" in scripts[0]
+
+
+@pytest.mark.parametrize("local_signal_port", [49100, 49101])
+def test_webrtc_tunnel_refreshes_mapping_and_keeps_local_bind(config, webrtc_info, monkeypatch, local_signal_port):
+    calls, mapped = [], []
+    second = replace(webrtc_info, raw={"public_ipaddr": "203.0.113.43", "ports": {
+        "47999/udp": [{"HostPort": "32123"}],
+    }})
+    infos = iter([webrtc_info, second])
+    prov = ic.VastProvider(config)
+    monkeypatch.setattr(prov, "get", lambda _: next(infos))
+    monkeypatch.setattr(ic.time, "sleep", lambda _: None)
+
+    def run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 1 if len(calls) == 1 else 130)
+
+    monkeypatch.setattr(ic.subprocess, "run", run)
+    ic.run_supervised_tunnel(config, prov, "123", local_ports={49100: local_signal_port},
+                            service_ports=[(49100, "signal")],
+                            on_connect=lambda i: mapped.append(ic.webrtc_connection(i)))
+    assert [c["mediaPort"] for c in mapped] == [31234, 32123]
+    assert f"127.0.0.1:{local_signal_port}:127.0.0.1:49100" in calls[0]
+    assert "47999" not in " ".join(calls[0])
+
+
+def test_webrtc_http_serves_assets_and_updated_config(tmp_path):
+    (tmp_path / "index.html").write_text("viewer only")
+    (tmp_path / "assets").mkdir()
+    current = {"mediaPort": 31234}
+    server = ic.make_webrtc_http_server(0, lambda: current, tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    conn = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        conn.request("GET", "/")
+        response = conn.getresponse()
+        assert response.status == 200
+        assert response.read() == b"viewer only"
+        current = {"mediaPort": 32123}
+        conn.request("GET", "/connection.json")
+        response = conn.getresponse()
+        assert response.getheader("Cache-Control") == "no-store"
+        assert b"32123" in response.read()
+        conn.request("GET", "/connection.json", headers={"Host": "untrusted.example"})
+        response = conn.getresponse()
+        assert response.status == 403
+        response.read()
+        conn.request("HEAD", "/connection.json", headers={"Host": "untrusted.example"})
+        response = conn.getresponse()
+        assert response.status == 403
+        assert response.read() == b""
+        conn.request("HEAD", "/connection.json")
+        response = conn.getresponse()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "application/json"
+        assert int(response.getheader("Content-Length")) > 0
+        assert response.read() == b""
+        conn.request("GET", "/assets/")
+        response = conn.getresponse()
+        assert response.status == 404
+        response.read()
+        with pytest.raises(ic.IsaacCloudError, match="Cannot start viewer"):
+            ic.make_webrtc_http_server(server.server_port, lambda: current, tmp_path)
+    finally:
+        conn.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_webrtc_missing_viewer_build(tmp_path):
+    with pytest.raises(ic.IsaacCloudError, match="Build the browser viewer first"):
+        ic.make_webrtc_http_server(0, lambda: {}, tmp_path)
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt(), OSError("tunnel failed"),
+                                     ic.IsaacCloudError("relay failed")])
+@pytest.mark.parametrize("command", ["webrtc-view", "view", "webrtc"])
+def test_webrtc_command_cleans_up_relay(config, monkeypatch, webrtc_info, tmp_path, failure, command):
+    (tmp_path / "index.html").write_text("viewer")
+    monkeypatch.setattr(ic, "_config", lambda: config)
+    monkeypatch.setattr(ic, "check_tcp_connectivity", lambda *a, **k: False)
+    monkeypatch.setattr(ic.VastProvider, "get", lambda *a: webrtc_info)
+    monkeypatch.setattr(ic, "start_webrtc_relay", lambda *a: 1234)
+    stopped = []
+    monkeypatch.setattr(ic, "stop_webrtc_relay", lambda *a: stopped.append(a))
+    original = ic.make_webrtc_http_server
+    monkeypatch.setattr(ic, "make_webrtc_http_server", lambda p, c: original(0, c, tmp_path))
+
+    def tunnel(*a, **kw):
+        kw["on_connect"](webrtc_info)
+        assert (49100, "WebRTC signal") in kw["service_ports"]
+        assert all(port != ic.DEFAULT_NOVNC_PORT for port, _ in kw["service_ports"])
+        raise failure
+
+    monkeypatch.setattr(ic, "run_supervised_tunnel", tunnel)
+    result = CliRunner().invoke(ic.app, [command, "--instance-id", "123", "--client-ip", "198.51.100.10"])
+    assert result.exit_code == (0 if isinstance(failure, KeyboardInterrupt) else 1), result.output
+    assert stopped == [(config, webrtc_info.ssh, 1234)]
+
+
+@pytest.fixture()
+def aws_webrtc_info(config):
+    return ic.AwsProvider(config)._to_info({
+        "InstanceId": "i-test", "State": {"Name": "running"},
+        "PublicIpAddress": "203.0.113.42",
+        "Tags": [{"Key": ic.AWS_TAG_WEBRTC, "Value": "true"}],
+        "SecurityGroups": [{"GroupId": "sg-test"}],
+    })
+
+
+def test_aws_webrtc_endpoint_and_validation(config, aws_webrtc_info):
+    ic.validate_webrtc_config(replace(config, webrtc_enabled=True, vast_whole_machine=False),
+                              "aws", selecting_offer=True)
+    assert ic.webrtc_connection(aws_webrtc_info) == {
+        "signalingServer": "127.0.0.1", "signalingPort": 49100,
+        "mediaServer": "203.0.113.42", "mediaPort": 47999,
+    }
+    for changes in [{"PublicIpAddress": None}, {"Tags": []}]:
+        with pytest.raises(ic.IsaacCloudError):
+            ic.webrtc_connection(replace(aws_webrtc_info, raw={**aws_webrtc_info.raw, **changes}))
+
+
+def test_aws_webrtc_ingress_is_restricted_and_cleanup_owned(config, aws_webrtc_info, monkeypatch):
+    calls = []
+
+    def aws(c, args, **kwargs):
+        calls.append(args)
+        return {"SecurityGroupRules": [{"SecurityGroupRuleId": "sgr-owned"}]}
+
+    monkeypatch.setattr(ic, "run_aws_json", aws)
+    close = ic.AwsProvider(config).open_webrtc_access(aws_webrtc_info, "198.51.100.10")
+    permission = json.loads(calls[0][calls[0].index("--ip-permissions") + 1])[0]
+    assert permission["IpProtocol"] == "udp"
+    assert permission["FromPort"] == permission["ToPort"] == 47999
+    assert permission["IpRanges"][0]["CidrIp"] == "198.51.100.10/32"
+    close()
+    assert calls[1] == ["ec2", "revoke-security-group-ingress", "--group-id", "sg-test",
+                        "--security-group-rule-ids", "sgr-owned"]
+
+
+def test_aws_webrtc_duplicate_rule_is_not_modified(config, aws_webrtc_info, monkeypatch):
+    calls = []
+
+    def aws(c, args, **kwargs):
+        calls.append(args)
+        raise ic.IsaacCloudError("InvalidPermission.Duplicate")
+
+    monkeypatch.setattr(ic, "run_aws_json", aws)
+    with pytest.raises(ic.IsaacCloudError, match="existing rules are not modified"):
+        ic.AwsProvider(config).open_webrtc_access(aws_webrtc_info, "198.51.100.10")
+    assert len(calls) == 1
+
+
+def test_aws_webrtc_setup_and_relay_run_inside_container(config, aws_webrtc_info, monkeypatch):
+    scripts = []
+    monkeypatch.setattr(ic, "run_ssh_script", lambda c, t, s, **kw: scripts.append((s, kw)) or "1234")
+    ic.setup_isaac(replace(config, webrtc_enabled=True), aws_webrtc_info)
+    ic.start_webrtc_relay(config, aws_webrtc_info, "198.51.100.10")
+    assert len(scripts) == 3
+    assert all(kw["in_container"] for _, kw in scripts)
+    calls = []
+    monkeypatch.setattr(ic, "run_ssh", lambda *a, **kw: calls.append(kw))
+    ic.stop_webrtc_relay(config, aws_webrtc_info.ssh, 1234)
+    assert calls[0]["in_container"]
+    assert ic.wrap_container_command(aws_webrtc_info.ssh, "bash -s") == (
+        "sudo docker exec -i isaac-sim bash -c 'bash -s'"
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_aws_launch_records_webrtc_mode(config, monkeypatch, enabled):
+    provider = ic.AwsProvider(replace(config, ngc_api_key="fake", webrtc_enabled=enabled))
+    monkeypatch.setattr(provider, "resolve_ami", lambda: "ami-test")
+    monkeypatch.setattr(provider, "_ensure_key_pair", lambda: "key-test")
+    monkeypatch.setattr(provider, "_ensure_security_group", lambda: "sg-test")
+    calls = []
+    monkeypatch.setattr(ic, "run_aws_json", lambda c, a, **kw: calls.append(a) or {
+        "Instances": [{"InstanceId": "i-test"}],
+    })
+    provider.launch()
+    tags = json.loads(calls[0][calls[0].index("--tag-specifications") + 1])[0]["Tags"]
+    assert ({"Key": ic.AWS_TAG_WEBRTC, "Value": "true"} in tags) == enabled
+    assert "--network=host" in provider._build_user_data()
+
+
+def test_aws_resume_preserves_webrtc_mode(config, aws_webrtc_info, monkeypatch):
+    monkeypatch.setattr(ic, "_config", lambda: config)
+    monkeypatch.setattr(ic.AwsProvider, "get", lambda *a: aws_webrtc_info)
+    monkeypatch.setattr(ic, "wait_for_ssh", lambda *a: aws_webrtc_info)
+    monkeypatch.setattr(ic, "wait_for_container", lambda *a: None)
+    setups = []
+    monkeypatch.setattr(ic, "setup_isaac", lambda c, i: setups.append(c))
+    result = CliRunner().invoke(ic.app, ["resume", "--provider", "aws", "--instance-id", "i-test"])
+    assert result.exit_code == 0, result.output
+    assert setups[0].webrtc_enabled and not setups[0].gui_enabled
+    assert "--provider aws --instance-id i-test" in result.output
+
+
+def test_aws_key_import_is_portable(config, tmp_path, monkeypatch):
+    key = tmp_path / "key.pub"
+    key.write_text("ssh-ed25519 test public key\n")
+    calls = []
+    monkeypatch.setattr(ic, "run_aws_json", lambda c, a, **kw: calls.append(a) or {})
+    ic.AwsProvider(replace(config, ssh_public_key_path=str(key)))._ensure_key_pair()
+    encoded = calls[1][calls[1].index("--public-key-material") + 1]
+    assert base64.b64decode(encoded) == b"ssh-ed25519 test public key"
+
+
+@pytest.mark.parametrize("stage", ["exit", "relay_start", "relay_stop", "reconnect"])
+def test_aws_viewer_cleans_ingress_on_failures(config, aws_webrtc_info, tmp_path, monkeypatch, stage):
+    (tmp_path / "index.html").write_text("viewer")
+    monkeypatch.setattr(ic, "_config", lambda: config)
+    monkeypatch.setattr(ic, "check_tcp_connectivity", lambda *a, **kw: False)
+    monkeypatch.setattr(ic.AwsProvider, "get", lambda *a: aws_webrtc_info)
+    original = ic.make_webrtc_http_server
+    monkeypatch.setattr(ic, "make_webrtc_http_server", lambda p, c: original(0, c, tmp_path))
+    events = []
+
+    def access(self, info, ip):
+        events.append(("open", ip))
+        return lambda: events.append(("close", ip))
+
+    def start(*a):
+        if stage == "relay_start":
+            raise ic.IsaacCloudError("relay startup failed")
+        return 1234
+
+    def stop(*a):
+        if stage == "relay_stop":
+            raise ic.IsaacCloudError("SSH unavailable during cleanup")
+
+    def tunnel(*a, **kw):
+        kw["on_connect"](aws_webrtc_info)
+        if stage == "reconnect":
+            kw["on_connect"](aws_webrtc_info)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ic.AwsProvider, "open_webrtc_access", access)
+    monkeypatch.setattr(ic, "start_webrtc_relay", start)
+    monkeypatch.setattr(ic, "stop_webrtc_relay", stop)
+    monkeypatch.setattr(ic, "run_supervised_tunnel", tunnel)
+    result = CliRunner().invoke(ic.app, ["webrtc-view", "--provider", "aws", "--instance-id", "i-test",
+                                       "--client-ip", "198.51.100.10"])
+    assert result.exit_code == (1 if stage == "relay_start" else 0), result.output
+    expected = [("open", "198.51.100.10"), ("close", "198.51.100.10")]
+    assert events == expected * (2 if stage == "reconnect" else 1)

@@ -43,6 +43,15 @@ lab = false
 enabled = false
 resolution = "1920x1080"
 
+# Native Isaac WebRTC in a local Chromium browser (Vast or AWS).
+# Use `launch --webrtc` for one launch, or enable here with [gui].enabled=false.
+# Launch a NEW instance with --webrtc. Vast also requires whole_machine=true.
+# `webrtc-view --instance-id ID` serves the browser client, tunnels signaling, and
+# restricts direct UDP media to your public IPv4. Build webrtc-viewer first;
+# see README.md. This is an experimental streaming workflow.
+[webrtc]
+enabled = false
+
 [vast]
 # Requires the vastai CLI: uv tool install vastai && vastai set api-key <KEY>
 # whole_machine=true guarantees host GPU 0, which NVENC (RTSP/WebRTC video)
