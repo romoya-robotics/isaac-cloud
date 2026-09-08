@@ -233,10 +233,14 @@ Requirements and limits:
   incomplete shader compilation, or an NVENC failure. Inspect
   `/root/isaac.log`, `/root/isaac_webrtc_relay.log`, and Chrome's
   `chrome://webrtc-internals` for diagnostics.
-- **Not yet validated with a live video session on either provider.** Local CLI tests,
-  connection routing tests, HTTP serving tests, and the production viewer
-  build pass. This is an experimental networking adaptation; the repo's
-  earlier noVNC workflow remains the one confirmed interactively on Vast.
+- **Live video verified on Vast, 2026-09-08:** an isolated Chrome session
+  received 1920×1080 video from Isaac 6.0.1 on an RTX 5080, decoding 962 frames
+  in approximately 18 seconds. Some frames dropped and brief freezes occurred;
+  this establishes video delivery, not sustained performance or input validation.
+  AWS live video remains unverified.
+- Isaac is launched with `quitOnSessionEnded=false`, so closing or reloading
+  the viewer leaves the simulation running. The upstream streaming app defaults
+  to quitting when its viewer session ends.
 
 NVIDIA recommends the [WebRTC browser viewer for cloud deployments](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/installation/manual_livestream_clients.html).
 Its standard Docker Compose deployment uses host networking. This repo uses

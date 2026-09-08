@@ -1202,7 +1202,9 @@ def build_isaac_container_launch_script(config: AppConfig) -> str:
             ensure_video_tools || true
             ensure_nvidia_userland
             pkill -f "[k]it/kit" 2>/dev/null; sleep 2
-            nohup /isaac-sim/runheadless.sh -v{agent_flag} > /root/isaac.log 2>&1 &
+            nohup /isaac-sim/runheadless.sh -v{agent_flag} \\
+                --/exts/omni.services.livestream.session/quitOnSessionEnded=false \\
+                > /root/isaac.log 2>&1 &
             echo LAUNCHED
             """
         )

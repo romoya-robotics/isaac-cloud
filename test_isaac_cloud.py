@@ -718,6 +718,9 @@ def test_webrtc_relay_is_udp_only_and_restricted():
 
 
 def test_webrtc_shell_syntax(config):
+    assert "--/exts/omni.services.livestream.session/quitOnSessionEnded=false" in (
+        ic.build_isaac_container_launch_script(config)
+    )
     for script in [ic.build_webrtc_check_script(), ic.build_webrtc_relay_script("198.51.100.10"),
                    ic.build_container_probe_script(config), ic.build_isaac_container_launch_script(config),
                    ic.build_lab_install_script(config.lab_ref)]:
