@@ -69,8 +69,9 @@ uv run python isaac_cloud.py resume  --instance-id <ID>  # relaunches the GUI st
 uv run python isaac_cloud.py destroy --instance-id <ID> --yes
 ```
 
-`launch` prints an SSH command plus a ready-made tunnel command; run the
-tunnel in a spare terminal and every service above is on `localhost`.
+`launch` prints an SSH command plus a ready-made tunnel command (`webrtc-view`
+for a `--webrtc` instance); run it in a spare terminal and every service above
+is on `localhost`.
 
 First boot compiles RTX shaders — allow 5–10 minutes before the sim is
 responsive. Warm restarts take under a minute.
@@ -154,8 +155,8 @@ npm --prefix webrtc-viewer run build
 Launch a **new** instance, then connect using its printed ID (use `--provider aws` in both commands for AWS):
 
 ```bash
-UV_CACHE=/home/keenb/projects/gpu-orchestrator/.venv uv run python isaac_cloud.py launch --provider vast --webrtc
-UV_CACHE=/home/keenb/projects/gpu-orchestrator/.venv uv run python isaac_cloud.py webrtc-view --provider vast --instance-id <ID>
+uv run python isaac_cloud.py launch --provider vast --webrtc
+uv run python isaac_cloud.py webrtc-view --provider vast --instance-id <ID>
 ```
 
 Open **http://127.0.0.1:8210** in Chrome or Edge and click **Connect** once
@@ -164,10 +165,9 @@ Isaac log readiness and signaling port. Only one streaming client should be
 connected at a time. The viewer reports **Connected** when video starts
 playing, rather than treating a signaling handshake as working video.
 
-The previous command names, `webrtc` and `view`, remain available as compatibility aliases.
-
-The `webrtc-view` command includes the agent/RTSP SSH forwards, so stop an existing
-`tunnel` command before running it. Use `--viewer-port <PORT>` if 8210 is busy.
+`webrtc-view` replaces `tunnel` for a WebRTC instance: it also forwards agent
+control and RTSP, so stop an existing `tunnel` before running it. Use
+`--viewer-port <PORT>` if 8210 is busy.
 Ctrl-C closes the local viewer server and tunnel and attempts to stop its
 remote media relay; the GPU instance continues running and billing. Stop or
 destroy it with the existing lifecycle commands when finished.
@@ -189,39 +189,47 @@ directly; it does not encapsulate video in TCP or SSH.
 
 The relay allows only the public IPv4 seen by SSH. If a VPN or different UDP
 route changes that address, pass `webrtc-view --client-ip <YOUR_PUBLIC_IPV4>`.
-The relay is started when you connect, and the endpoint is refreshed on SSH
-reconnect. After stopping/resuming the instance or changing networks, restart
-the `webrtc-view` command and reload the browser page. A WebRTC instance's UDP
-mapping also preserves its mode across `resume`, even if `--webrtc` was only
-specified at launch.
+The relay is started when you connect. Media does not travel over SSH, so an
+SSH reconnect keeps the running relay and ingress rule, and replaces them only
+if your public IPv4 changed; failed reconnect steps are retried with backoff.
+After stopping/resuming the instance or changing networks, reload the browser
+page.
+
+WebRTC mode is fixed at launch: `resume` reads it from the instance (Vast's
+recorded UDP port option, AWS's instance tag), not from `[webrtc].enabled`,
+which only sets the default for `launch`.
 
 On AWS, the existing Docker container uses host networking. The viewer sends
 UDP to the instance's public IPv4 on port `47999`; the same container relay
 forwards it to Isaac on `127.0.0.1:47998`. Signaling still uses SSH.
 
 The AWS `webrtc-view` command temporarily adds UDP `47999` ingress for your public
-IPv4 (`/32`) to the first attached security group. It removes the rule it
-created on exit, including if relay startup fails, and refreshes access on
-reconnect. Your local AWS credentials need `ec2:AuthorizeSecurityGroupIngress`
-and `ec2:RevokeSecurityGroupIngress`, in addition to the existing instance
+IPv4 (`/32`) to the first attached security group (instances launched by this
+tool have exactly one: `[aws].security_group`). It removes the rule on exit,
+including if relay startup fails. Your local AWS credentials need
+`ec2:AuthorizeSecurityGroupIngress`, `ec2:RevokeSecurityGroupIngress`, and
+`ec2:DescribeSecurityGroupRules`, in addition to the existing instance
 permissions. No AWS credentials are copied to the instance.
 
 Security group rules apply to every instance sharing that group. Use a
-separate `[aws].security_group` for isolated deployments. An existing identical
-rule is left untouched and reported as a conflict; stop another viewer using
-that group and client IP, or remove a stale rule before retrying. If the process
-is forcibly killed or AWS cleanup fails, remove the reported UDP rule manually.
-The relay also restricts traffic to the same client IP. Network ACLs and host
-firewalls must allow the traffic; this command does not modify them.
+separate `[aws].security_group` for isolated deployments. If the viewer is
+killed before cleanup, its rule (description `isaac-cloud WebRTC <instance>`)
+stays until the next `webrtc-view` from the same IP adopts it and removes it on
+exit; remove it manually if you will not reconnect from that IP. An identical
+rule with any other description is used as-is and never modified. AWS treats
+identical rules as one, so two viewers from one IP through one group share it,
+and the first to exit removes it. The relay also restricts traffic to the same
+client IP. Network ACLs and host firewalls must allow the traffic; this command
+does not modify them.
 
-AWS records WebRTC mode in the `IsaacCloudWebRTC=true` instance tag, so `resume`
-preserves it even when the local config has WebRTC disabled. A public IPv4 and
+AWS records WebRTC mode in the `IsaacCloudWebRTC=true` instance tag. A public IPv4 and
 an NVIDIA GPU with working video encoding are required (the default AWS
 instance type is `g6e.xlarge`).
 
 Requirements and limits:
 
-- On Vast, `[vast].whole_machine = true`; setup checks for host GPU minor 0, required
+- On Vast, offer search requires `[vast].whole_machine = true`; an explicit
+  `--offer-id` is allowed, and setup checks every host for GPU minor 0, required
   for NVENC on the previously tested hosts. This check does not guarantee
   that every host has working hardware encoding.
 - WebRTC and `--gui` are alternative Isaac app modes. `--webrtc` overrides a
