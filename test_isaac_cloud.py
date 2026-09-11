@@ -527,6 +527,14 @@ def test_headless_script_side_loads_and_kills_previous_kit(config):
     assert "ensure_nvidia_userland()" in script
     assert 'pkill -f "[k]it/kit"' in script
     assert "runheadless.sh -v --enable isaacsim.code_editor.python_server" in script
+    # The side-loaded userland must match the host driver exactly: keyed on the
+    # full version, with NVIDIA's own installer as the fallback when Ubuntu's
+    # archive has moved past it (seen live: host 595.71.05, archive 595.84).
+    assert '[ ! -f "$LIBDIR/libGLX_nvidia.so.$DRIVER" ]' in script
+    assert 'index($3, d) == 1' in script
+    assert "NVIDIA-Linux-x86_64-$DRIVER.run" in script and "--extract-only" in script
+    assert "NVIDIA userland side-load failed" in script
+    assert subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True, check=False).returncode == 0
 
 
 def test_video_tools_installed_on_every_launch_path(config):

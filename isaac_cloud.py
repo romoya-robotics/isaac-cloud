@@ -868,18 +868,40 @@ GUI_MIN_DRIVER_MAJOR = 590
 NVIDIA_USERLAND_SH = """\
 ensure_nvidia_userland() {
     # A minority of Vast hosts inject compute-only NVIDIA libraries (no
-    # Vulkan/GLX/NVENC userland). Side-load the exact driver-matched libs from
-    # the Ubuntu archive once, and re-export the env on every run.
+    # Vulkan/GLX/NVENC userland). Side-load them once for the host's EXACT
+    # driver version (a userland that differs even in the minor version fails
+    # vkCreateInstance), and re-export the env on every run.
     ls /usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0 >/dev/null 2>&1 && return 0
-    local LIBDIR=/opt/nvgl/usr/lib/x86_64-linux-gnu
-    if [ ! -f /opt/nvgl/icd.json ]; then
-        local DRIVER MAJOR deb
-        DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d " ")
-        MAJOR=${DRIVER%%.*}
+    local LIBDIR=/opt/nvgl/usr/lib/x86_64-linux-gnu DRIVER
+    DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d " ")
+    if [ ! -f "$LIBDIR/libGLX_nvidia.so.$DRIVER" ]; then
+        # Absent, or a previous side-load for a driver the host has since replaced.
+        echo "side-loading NVIDIA userland $DRIVER (host injected compute-only libraries)"
+        rm -rf /opt/nvgl && mkdir -p "$LIBDIR"
+        local MAJOR=${DRIVER%%.*} pin deb
         apt-get update -qq >/dev/null 2>&1
-        (cd /tmp && apt-get download -qq libnvidia-gl-$MAJOR libnvidia-encode-$MAJOR libnvidia-decode-$MAJOR 2>/dev/null)
-        mkdir -p /opt/nvgl
-        for deb in /tmp/libnvidia-*-$MAJOR*.deb; do dpkg -x "$deb" /opt/nvgl; done
+        # Ubuntu's archive only ever carries one build per driver major; use it if it is ours.
+        pin=$(apt-cache madison "libnvidia-gl-$MAJOR" 2>/dev/null | awk -v d="$DRIVER-" 'index($3, d) == 1 {print $3; exit}')
+        if [ -n "$pin" ]; then
+            (cd /tmp && apt-get download -qq "libnvidia-gl-$MAJOR=$pin" "libnvidia-encode-$MAJOR=$pin" \\
+                "libnvidia-decode-$MAJOR=$pin" >/dev/null 2>&1; apt-get download -qq "libnvidia-gpucomp-$MAJOR=$pin" >/dev/null 2>&1 || true)
+            for deb in /tmp/libnvidia-*-"$MAJOR"_*.deb; do dpkg -x "$deb" /opt/nvgl; done
+            rm -f /tmp/libnvidia-*-"$MAJOR"_*.deb
+        else
+            # The archive has moved past this driver. NVIDIA's installer for the
+            # exact version carries every userland library; extract, never install.
+            local run=/tmp/nvidia-$DRIVER.run lib name
+            curl -fsSL -o "$run" "https://us.download.nvidia.com/XFree86/Linux-x86_64/$DRIVER/NVIDIA-Linux-x86_64-$DRIVER.run"
+            sh "$run" --extract-only --target "/tmp/nvidia-$DRIVER" >/dev/null
+            # Fill in only what the host did not inject; its CUDA/NVML libs stay authoritative.
+            for lib in "/tmp/nvidia-$DRIVER"/lib*.so."$DRIVER"; do
+                name=$(basename "$lib")
+                [ -e "/usr/lib/x86_64-linux-gnu/$name" ] || cp "$lib" "$LIBDIR/"
+            done
+            rm -rf "$run" "/tmp/nvidia-$DRIVER"
+        fi
+        [ -f "$LIBDIR/libGLX_nvidia.so.$DRIVER" ] || { echo "NVIDIA userland side-load failed for driver $DRIVER"; return 1; }
+        ln -sf "libGLX_nvidia.so.$DRIVER" "$LIBDIR/libGLX_nvidia.so.0"
         printf '{"file_format_version":"1.0.0","ICD":{"library_path":"%s/libGLX_nvidia.so.0","api_version":"1.3.194"}}' "$LIBDIR" > /opt/nvgl/icd.json
         echo "$LIBDIR" > /etc/ld.so.conf.d/zz-nvgl.conf && ldconfig
     fi
