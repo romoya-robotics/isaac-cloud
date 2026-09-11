@@ -8,7 +8,7 @@ export function streamConnection(value) {
   const octets = typeof value.mediaServer === "string" ? value.mediaServer.split(".") : [];
   if (octets.length !== 4 || octets.some((v) => !/^\d{1,3}$/.test(v) || Number(v) > 255)
       || !validPort(value.mediaPort) || !validPort(value.signalingPort)) {
-    throw new Error("Invalid media address or streaming port. Restart the viewer command.");
+    throw new Error("Invalid media address or streaming port. Restart the tunnel command.");
   }
   return {
     signalingServer: "127.0.0.1",

@@ -1,24 +1,26 @@
-import { AppStreamer, StreamType, eStatus, type StreamEvent } from '@nvidia/omniverse-webrtc-streaming-library';
-import { streamConnection } from './connection.mjs';
-import './style.css';
+// Browser client for Isaac's native WebRTC stream. Served from the Isaac
+// container on loopback (like noVNC) and reached through the SSH tunnel; the
+// SDK module next to this file is downloaded onto the box by isaac_cloud.py.
+import { AppStreamer, StreamType, eStatus } from './omniverse-webrtc-streaming-library.js';
+import { streamConnection } from './connection.js';
 
-const status = document.querySelector<HTMLParagraphElement>('#status')!;
-const connect = document.querySelector<HTMLButtonElement>('#connect')!;
-const disconnect = document.querySelector<HTMLButtonElement>('#disconnect')!;
-const video = document.querySelector<HTMLVideoElement>('#remote-video')!;
+const status = document.querySelector('#status');
+const connect = document.querySelector('#connect');
+const disconnect = document.querySelector('#disconnect');
+const video = document.querySelector('#remote-video');
 let requested = false;
-let timer: ReturnType<typeof setTimeout> | undefined;
+let timer;
 
-function report(message: string) {
+function report(message) {
   status.textContent = message;
 }
 
-function reportEnded(message: string) {
+function reportEnded(message) {
   clearTimeout(timer);
   report(message);
 }
 
-function onEvent(event: StreamEvent) {
+function onEvent(event) {
   console.info('Isaac stream:', event);
   if (event.status === eStatus.error) {
     reportEnded('Connection failed. Check Isaac readiness and UDP access, then disconnect and reconnect.');
@@ -32,8 +34,9 @@ connect.addEventListener('click', async () => {
   disconnect.disabled = false;
   report('Connecting to Isaac Sim…');
   try {
-    const response = await fetch('/connection.json', { cache: 'no-store' });
-    if (!response.ok) throw new Error('Connection settings are unavailable. Restart the viewer command.');
+    // Written by the tunnel command on every (re)connect; never cached.
+    const response = await fetch('connection.json', { cache: 'no-store' });
+    if (!response.ok) throw new Error('Connection settings are unavailable. Restart the tunnel command.');
     const connection = streamConnection(await response.json());
     timer = setTimeout(() => {
       report('Still waiting for video. Check that Isaac has loaded and your network allows UDP.');
@@ -74,15 +77,15 @@ video.addEventListener('playing', () => {
 disconnect.addEventListener('click', () => {
   clearTimeout(timer);
   // Reload resets the SDK singleton and fetches any changed provider endpoint.
-  void AppStreamer.stop().catch(() => {});
+  AppStreamer.stop().catch(() => {});
   window.location.reload();
 });
 
-document.querySelector('#fullscreen')!.addEventListener('click', () => {
+document.querySelector('#fullscreen').addEventListener('click', () => {
   const action = document.fullscreenElement
     ? document.exitFullscreen()
-    : document.querySelector<HTMLElement>('#stream-container')!.requestFullscreen();
-  void action.catch(() => report('Fullscreen is unavailable in this browser.'));
+    : document.querySelector('#stream-container').requestFullscreen();
+  action.catch(() => report('Fullscreen is unavailable in this browser.'));
 });
 
 // Keep browser refresh and developer tools usable while the stream has focus.
@@ -99,5 +102,5 @@ document.addEventListener('keydown', (event) => {
 }, true);
 
 window.addEventListener('pagehide', () => {
-  if (requested) void AppStreamer.stop().catch(() => {});
+  if (requested) AppStreamer.stop().catch(() => {});
 });

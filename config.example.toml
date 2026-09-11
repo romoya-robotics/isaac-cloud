@@ -33,26 +33,24 @@ curobo = false
 lab = false
 # lab_ref = "v3.0.0-beta2.patch1"   # default; the release built for Isaac Sim 6.0.1
 
-# Full interactive GUI via noVNC (Isaac GUI -> Xvfb -> x11vnc -> one TCP port).
-# Works on any host with a driver that can present Vulkan on an X display
-# (driver >= 590; `catalog --gui` ranks those first, the launch preflight
-# aborts otherwise). NVENC not required. Brought up by /root/gui_stack.sh on
-# the box (idempotent; `status` reports its gui_* checks). Open
-# http://localhost:6080/vnc.html through the tunnel.
+# Browser GUI for the Isaac UI. `mode` is the default for `launch --gui`:
+#   "none"   headless: agent control and RTSP only.
+#   "vnc"    Isaac GUI -> Xvfb -> x11vnc -> noVNC on one TCP port through the
+#            tunnel (http://localhost:6080/vnc.html). Works on any host whose
+#            driver can present Vulkan on an X display (driver >= 590;
+#            `catalog --gui vnc` ranks those first, the launch preflight aborts
+#            otherwise). NVENC not required. Brought up by /root/gui_stack.sh
+#            on the box (idempotent; `status` reports its gui_* checks).
+#   "webrtc" Isaac's native WebRTC stream in a local Chromium browser (Vast or
+#            AWS). The viewer page is served from the container; the usual
+#            `tunnel` forwards it (http://localhost:8210/) plus signaling and
+#            restricts direct UDP media to your public IPv4. Needs host GPU 0
+#            for NVENC, so Vast offer search is limited to whole machines.
+#            Fixed at launch: `resume` keeps the mode the instance was launched
+#            with. Experimental; see README.md.
 [gui]
-enabled = false
-resolution = "1920x1080"
-
-# Native Isaac WebRTC in a local Chromium browser (Vast or AWS).
-# Use `launch --webrtc` for one launch, or enable here with [gui].enabled=false.
-# Launch a NEW instance with --webrtc; this setting only affects launch, and
-# resume keeps the mode the instance was launched with. Vast offer search also
-# requires whole_machine=true (an explicit --offer-id is checked at boot).
-# `webrtc-view --instance-id ID` serves the browser client, tunnels signaling, and
-# restricts direct UDP media to your public IPv4. Build webrtc-viewer first;
-# see README.md. This is an experimental streaming workflow.
-[webrtc]
-enabled = false
+mode = "none"
+resolution = "1920x1080"   # vnc only
 
 [vast]
 # Requires the vastai CLI: uv tool install vastai && vastai set api-key <KEY>
