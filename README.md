@@ -22,15 +22,20 @@ through an SSH tunnel the CLI prints for you:
 - **RTSP cameras** (`rtsp://127.0.0.1:8554/stream`) — TCP camera feeds via
   `isaacsim.streaming.rtsp`; watch in VLC/ffplay. Requires NVENC (see GPU
   notes below).
-- **Full GUI** (`http://localhost:6080/vnc.html`, `--gui`) — the native Isaac
-  Sim application rendered into a virtual display and served with noVNC over a
-  single TCP port. Works on any host; NVENC not required. Needs a host whose
-  driver can present Vulkan on an X display (driver >= 590 in practice; see
-  [The GUI stack](#the-gui-stack)).
-- **Native WebRTC** (`http://127.0.0.1:8210`, `--webrtc`, Vast or AWS) — Isaac's
-  built-in streaming rendered on the remote GPU, displayed and controlled in
-  a local Chromium browser. Signaling uses SSH; media uses a public UDP relay
-  restricted to your client IP. See the experimental workflow below.
+- **GUI over VNC** (`http://localhost:6080/vnc.html`, `--gui vnc`) — the native
+  Isaac Sim application rendered into a virtual display and served with noVNC
+  over a single TCP port. Works on any host; NVENC not required. Needs a host
+  whose driver can present Vulkan on an X display (driver >= 590 in practice;
+  see [The GUI stack](#the-gui-stack)).
+- **GUI over WebRTC** (`http://localhost:8210/`, `--gui webrtc`, Vast or AWS) —
+  the same Isaac UI via its built-in streaming: encoded on the remote GPU,
+  displayed and controlled in a local Chromium browser. The viewer page is
+  served from the container on loopback like noVNC; signaling uses SSH; media
+  uses a public UDP relay restricted to your client IP. Needs host GPU 0 for
+  NVENC (whole-machine Vast offers). See the experimental workflow below.
+
+`--gui` takes one of `none` (headless, the default), `vnc`, or `webrtc`; see
+[GUI modes](#gui-modes) for how to choose.
 
 ## Setup
 
@@ -48,10 +53,10 @@ cp config.example.toml config.toml   # then fill in [ngc] and [ssh]
 ## Usage
 
 ```bash
-uv run python isaac_cloud.py catalog [--gui]             # browse offers (--gui ranks driver >= 590 first)
+uv run python isaac_cloud.py catalog [--gui vnc|webrtc]  # browse offers (vnc ranks driver >= 590 first; webrtc = whole machines)
 uv run python isaac_cloud.py launch                      # headless + agent socket
-uv run python isaac_cloud.py launch --gui                # + noVNC GUI
-uv run python isaac_cloud.py launch --provider vast --webrtc  # native streaming + UDP mapping
+uv run python isaac_cloud.py launch --gui vnc            # + noVNC GUI
+uv run python isaac_cloud.py launch --gui webrtc         # + native WebRTC streaming (UDP mapping reserved at launch)
 uv run python isaac_cloud.py launch --curobo             # + cuRobo motion planning (bg install)
 uv run python isaac_cloud.py launch --lab                # + Isaac Lab (bg install)
 uv run python isaac_cloud.py launch --provider aws
@@ -59,8 +64,6 @@ uv run python isaac_cloud.py instances
 uv run python isaac_cloud.py status  --instance-id <ID>
 uv run python isaac_cloud.py tunnel  --instance-id <ID>   # supervised, auto-reconnecting
 uv run python isaac_cloud.py tunnel  --instance-id <ID2> --novnc-port 16080 --agent-port 18226   # second box
-
-uv run python isaac_cloud.py webrtc-view  --provider vast --instance-id <ID>  # viewer + signaling tunnel
 uv run python isaac_cloud.py sync list                   # saved projects + snapshots
 uv run python isaac_cloud.py sync pull --instance-id <ID> [--project P] [--snapshot TS]
 uv run python isaac_cloud.py sync push --instance-id <ID> [--project P]
@@ -69,16 +72,50 @@ uv run python isaac_cloud.py resume  --instance-id <ID>  # relaunches the GUI st
 uv run python isaac_cloud.py destroy --instance-id <ID> --yes
 ```
 
-`launch` prints an SSH command plus a ready-made tunnel command (`webrtc-view`
-for a `--webrtc` instance); run it in a spare terminal and every service above
-is on `localhost`.
+`launch` prints an SSH command plus a ready-made tunnel command; run the
+tunnel in a spare terminal and every service above is on `localhost`.
 
 First boot compiles RTX shaders — allow 5–10 minutes before the sim is
 responsive. Warm restarts take under a minute.
 
+## GUI modes
+
+Both GUI modes show the same Isaac Sim editor in your browser through the SSH
+tunnel; they differ in how the picture gets to you and what the host must
+provide. An instance runs exactly one of them (they are different Isaac
+kits), chosen with `--gui` at `launch` or `[gui].mode` in `config.toml`.
+
+| Mode | Open | How the video travels | Host needs | What it feels like |
+| --- | --- | --- | --- | --- |
+| `none` (default) | nothing | none: agent control and RTSP only | any | headless |
+| `vnc` | `http://localhost:6080/vnc.html` | Isaac draws on a virtual X display; x11vnc + noVNC send screen updates over TCP inside the SSH tunnel | driver >= 590 (must present Vulkan on X); **any GPU slot** | noticeably lower framerate and higher latency, since each update is a lossless screen diff squeezed through SSH; fine for editing scenes and inspecting state, not for watching motion smoothly |
+| `webrtc` | `http://localhost:8210/` | Isaac encodes H.264 on the GPU (NVENC) and streams it over direct UDP to your browser; only the page and signaling go through SSH | **host GPU 0** (whole-machine Vast offers; any AWS `g6e`), UDP reachable from your network; experimental | smooth video at up to 60 fps with low latency |
+
+Rules of thumb:
+
+- `vnc` is the proven path and works on cheap fractional Vast hosts. Start
+  there if you just need to look at and edit a scene.
+- `webrtc` is for watching the robot move. It is fixed at launch: Vast must
+  reserve the UDP port when the instance is created, so `resume` keeps the mode
+  the box was launched with and `--gui webrtc` cannot be added to an existing
+  instance. `catalog --gui webrtc` and `launch --gui webrtc` search
+  whole-machine offers only.
+- `resume` without `--gui` picks the mode the box already has: `webrtc` if it
+  was launched that way, else `vnc` if the GUI stack is installed, else `none`.
+
+**Why WebRTC needs host GPU 0.** The stream is encoded by NVENC, and NVIDIA's
+encoder library assumes that `/dev/nvidiaN` is the GPU with index N. On a
+fractional Vast rental the container's only GPU is index 0 but its device
+node keeps the host's slot number, so the encoder opens the wrong device and
+fails with `OpenEncodeSessionEx failed: unsupported device`. Rendering, CUDA,
+agent control, and noVNC are unaffected. A fractional offer that happens to
+sit in slot 0 works, which is why an explicit `--offer-id` is allowed and the
+GPU minor number is checked at boot before Isaac starts. Details and the
+upstream issue are in [GPU notes](#gpu-notes-important-for-video).
+
 ## The GUI stack
 
-`launch --gui` (and `resume` on a box that had it) writes `/root/gui_stack.sh`
+`launch --gui vnc` (and `resume` on a box that had it) writes `/root/gui_stack.sh`
 into the container and runs it in the foreground. The script is idempotent
 and strictly ordered — each step is guarded by its own process or port check,
 so re-running it (a repair, `resume`, a project's own relaunch hook) only
@@ -129,8 +166,8 @@ Failure modes the script encodes (all observed on Vast hosts, 2026-09-01..03):
   names, and guards with `pgrep -x`. Keep it that way if you edit it.
 - **Driver 580 hosts cannot present Vulkan on the X display** (kit logs
   "vkCreateSwapchainKHR failed", GUI black, headless fine). The preflight
-  aborts with `GUI_STACK_VULKAN_PRESENT_FAILED`; `catalog --gui` and
-  `launch --gui` rank driver >= 590 offers first and warn otherwise.
+  aborts with `GUI_STACK_VULKAN_PRESENT_FAILED`; `catalog --gui vnc` and
+  `launch --gui vnc` rank driver >= 590 offers first and warn otherwise.
 - **Headless and GUI kits cannot coexist**; the stack stops the headless kit
   before starting the GUI one.
 
@@ -145,32 +182,32 @@ Simulation, rendering, and video encoding run in Isaac Sim on the remote GPU.
 Your local computer decodes the video and sends input using NVIDIA's
 Omniverse WebRTC SDK. This does not require a local Isaac Sim installation.
 
-Build the local viewer once, using Node.js 22.12+ and npm:
+Nothing is built or installed locally. Launch a **new** instance with
+`--gui webrtc`, then run the usual tunnel (use `--provider aws` in both
+commands for AWS):
 
 ```bash
-npm --prefix webrtc-viewer ci --ignore-scripts
-npm --prefix webrtc-viewer run build
+uv run python isaac_cloud.py launch --provider vast --gui webrtc
+uv run python isaac_cloud.py tunnel --provider vast --instance-id <ID>
 ```
 
-Launch a **new** instance, then connect using its printed ID (use `--provider aws` in both commands for AWS):
-
-```bash
-uv run python isaac_cloud.py launch --provider vast --webrtc
-uv run python isaac_cloud.py webrtc-view --provider vast --instance-id <ID>
-```
-
-Open **http://127.0.0.1:8210** in Chrome or Edge and click **Connect** once
+Open **http://localhost:8210/** in Chrome or Edge and click **Connect** once
 Isaac has loaded. `status --provider vast --instance-id <ID>` reports the
-Isaac log readiness and signaling port. Only one streaming client should be
-connected at a time. The viewer reports **Connected** when video starts
-playing, rather than treating a signaling handshake as working video.
+Isaac log readiness and the signaling and viewer ports. Only one streaming
+client should be connected at a time. The viewer reports **Connected** when
+video starts playing, rather than treating a signaling handshake as working
+video.
 
-`webrtc-view` replaces `tunnel` for a WebRTC instance: it also forwards agent
-control and RTSP, so stop an existing `tunnel` before running it. Use
-`--viewer-port <PORT>` if 8210 is busy.
-Ctrl-C closes the local viewer server and tunnel and attempts to stop its
-remote media relay; the GPU instance continues running and billing. Stop or
-destroy it with the existing lifecycle commands when finished.
+The viewer page lives in the container, exactly like noVNC: `launch`/`resume`
+install `webrtc-viewer/` from this repo into `/root/webrtc-viewer/` on the box,
+download NVIDIA's streaming SDK module next to it (pinned by SHA-256), and
+serve the directory on `127.0.0.1:8210` with the container's own Python. For a
+WebRTC instance, `tunnel` forwards that page and the signaling port instead of
+noVNC (agent control and RTSP as usual), starts the remote UDP media relay for
+your IP, and writes the media endpoint into the page's `connection.json` on
+every (re)connect. Ctrl-C attempts to stop the relay; the page keeps being
+served and the GPU instance continues running and billing. Stop or destroy it
+with the existing lifecycle commands when finished.
 
 The topology adapts native Isaac streaming to Vast's container networking:
 
@@ -181,14 +218,14 @@ Local browser <--UDP--> Vast public IP:mapped UDP port
                        <-> Isaac 127.0.0.1:47998
 ```
 
-`launch --webrtc` requests only the relay's UDP mapping. Isaac stays bound to
+`launch --gui webrtc` requests only the relay's UDP mapping. Isaac stays bound to
 loopback, avoiding the NVIDIA SDK's attempt to bind a host public IP that is
 absent inside the Vast container. The browser SDK's `mediaServer` and
 `mediaPort` overrides target the mapped UDP endpoint. The relay carries UDP
 directly; it does not encapsulate video in TCP or SSH.
 
 The relay allows only the public IPv4 seen by SSH. If a VPN or different UDP
-route changes that address, pass `webrtc-view --client-ip <YOUR_PUBLIC_IPV4>`.
+route changes that address, pass `tunnel --client-ip <YOUR_PUBLIC_IPV4>`.
 The relay is started when you connect. Media does not travel over SSH, so an
 SSH reconnect keeps the running relay and ingress rule, and replaces them only
 if your public IPv4 changed; failed reconnect steps are retried with backoff.
@@ -196,14 +233,15 @@ After stopping/resuming the instance or changing networks, reload the browser
 page.
 
 WebRTC mode is fixed at launch: `resume` reads it from the instance (Vast's
-recorded UDP port option, AWS's instance tag), not from `[webrtc].enabled`,
-which only sets the default for `launch`.
+recorded UDP port option, AWS's instance tag), not from `[gui].mode`, which
+only sets the default for `launch`. `resume --gui vnc` on such a box is
+rejected, and `resume --gui webrtc` on a box launched without it is too.
 
 On AWS, the existing Docker container uses host networking. The viewer sends
 UDP to the instance's public IPv4 on port `47999`; the same container relay
 forwards it to Isaac on `127.0.0.1:47998`. Signaling still uses SSH.
 
-The AWS `webrtc-view` command temporarily adds UDP `47999` ingress for your public
+On AWS the `tunnel` command temporarily adds UDP `47999` ingress for your public
 IPv4 (`/32`) to the first attached security group (instances launched by this
 tool have exactly one: `[aws].security_group`). It removes the rule on exit,
 including if relay startup fails. Your local AWS credentials need
@@ -214,7 +252,7 @@ permissions. No AWS credentials are copied to the instance.
 Security group rules apply to every instance sharing that group. Use a
 separate `[aws].security_group` for isolated deployments. If the viewer is
 killed before cleanup, its rule (description `isaac-cloud WebRTC <instance>`)
-stays until the next `webrtc-view` from the same IP adopts it and removes it on
+stays until the next `tunnel` from the same IP adopts it and removes it on
 exit; remove it manually if you will not reconnect from that IP. An identical
 rule with any other description is used as-is and never modified. AWS treats
 identical rules as one, so two viewers from one IP through one group share it,
@@ -228,24 +266,26 @@ instance type is `g6e.xlarge`).
 
 Requirements and limits:
 
-- On Vast, offer search requires `[vast].whole_machine = true`; an explicit
-  `--offer-id` is allowed, and setup checks every host for GPU minor 0, required
-  for NVENC on the previously tested hosts. This check does not guarantee
-  that every host has working hardware encoding.
-- WebRTC and `--gui` are alternative Isaac app modes. `--webrtc` overrides a
-  configured GUI default; explicitly requesting both flags is rejected.
+- On Vast, `--gui webrtc` searches whole-machine offers only (`gpu_frac=1`,
+  regardless of `[vast].whole_machine`) so the GPU is host GPU 0 for NVENC; an
+  explicit `--offer-id` is allowed, and setup checks every host for GPU minor 0.
+  This check does not guarantee that every host has working hardware encoding.
+- `vnc` and `webrtc` run different Isaac kits, so `--gui` picks exactly one.
 - Existing Vast SSH-only instances lack the UDP mapping and need a new instance.
-  AWS instances must be launched with `--webrtc` so setup and resume use streaming mode.
+  AWS instances must be launched with `--gui webrtc` so setup and resume use streaming mode.
 - The browser's network must permit UDP to the mapped port. There is no TURN
   fallback. A black screen can mean blocked UDP, an incorrect client IP,
   incomplete shader compilation, or an NVENC failure. Inspect
-  `/root/isaac.log`, `/root/isaac_webrtc_relay.log`, and Chrome's
-  `chrome://webrtc-internals` for diagnostics.
-- **Live video verified on Vast, 2026-09-08:** an isolated Chrome session
-  received 1920×1080 video from Isaac 6.0.1 on an RTX 5080, decoding 962 frames
-  in approximately 18 seconds. Some frames dropped and brief freezes occurred;
-  this establishes video delivery, not sustained performance or input validation.
-  AWS live video remains unverified.
+  `/root/isaac.log`, `/root/isaac_webrtc_relay.log`,
+  `/root/isaac_webrtc_viewer.log`, and Chrome's `chrome://webrtc-internals`
+  for diagnostics.
+- **Live video verified on Vast:** 2026-09-08 with the original locally built
+  viewer (Isaac 6.0.1, RTX 5080: 1920×1080, 962 frames in about 18 s, some
+  drops and brief freezes), and 2026-09-11 with the container-served viewer
+  described above (Isaac 6.0.1, whole-machine RTX 4090, driver 595.71.05, a
+  compute-only host that needed the exact-version library side-load). These
+  establish video delivery, not sustained performance. AWS live video remains
+  unverified.
 - Isaac is launched with `quitOnSessionEnded=false`, so closing or reloading
   the viewer leaves the simulation running. The upstream streaming app defaults
   to quitting when its viewer session ends.
@@ -253,10 +293,12 @@ Requirements and limits:
 NVIDIA recommends the [WebRTC browser viewer for cloud deployments](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/installation/manual_livestream_clients.html).
 Its standard Docker Compose deployment uses host networking. This repo uses
 the same [NVIDIA WebRTC SDK](https://github.com/isaac-sim/IsaacSim/blob/main/tools/docker/web-viewer/Dockerfile)
-in a locally served viewer to accommodate
+in a container-served viewer to accommodate
 [Vast's assigned port mappings](https://docs.vast.ai/guides/instances/docker-environment).
-The pinned SDK dependency is distributed under NVIDIA's license, included in
-its npm package. Browser assets are built locally rather than vendored here.
+The SDK is a single self-contained ES module, so the viewer needs no bundler:
+`isaac_cloud.py` downloads the pinned package from NVIDIA's npm registry onto
+the box at setup and verifies its SHA-256. It is distributed under NVIDIA's
+license and is never vendored here.
 
 ## Driving Isaac from Claude Code
 
@@ -317,14 +359,20 @@ through the skill.
 ## GPU notes (important for video)
 
 **NVENC (hardware H.264) only works when the rented GPU is host GPU 0.**
-This is an NVIDIA driver limitation
+NVIDIA's encoder library assumes `/dev/nvidiaN` is GPU index N, so a container
+whose single GPU is really the host's slot 3 opens the wrong device and NVENC
+fails (`OpenEncodeSessionEx failed: unsupported device`). This is an NVIDIA
+driver limitation
 ([k8s-device-plugin#1282](https://github.com/NVIDIA/k8s-device-plugin/issues/1282)),
-not a provider quirk. Consequences:
+not a provider quirk, and there is no container-side workaround; the repo's
+probe reproduced it (`docs/VAST_EXPERIMENT_RESULTS.md`). Consequences:
 
 - The default Vast query rents **whole machines** (`gpu_frac=1`), which
   guarantees GPU 0. Set `[vast].whole_machine = false` to allow cheaper
   fractional hosts — agent control and the noVNC GUI still work there, but
-  RTSP/WebRTC video will fail if you draw the wrong GPU slot.
+  RTSP/WebRTC video will fail if you draw the wrong GPU slot. `--gui webrtc`
+  therefore searches whole machines regardless of that setting, and every
+  WebRTC setup checks `nvidia-smi`'s minor number at boot.
 - EC2 instances always see their GPU as device 0; NVENC always works there.
 
 A minority of Vast hosts inject compute-only NVIDIA libraries (no
@@ -371,10 +419,10 @@ See `config.example.toml`. Highlights:
 - `[defaults].provider` — `vast` or `aws`; `--provider` overrides per command.
 - `[isaac].version` — Isaac Sim image tag (default `6.0.1`).
 - `[isaac].agent` — agent control socket (default true).
-- `[gui].enabled` / `resolution` — noVNC GUI stack (default off; `--gui` per launch;
-  see [The GUI stack](#the-gui-stack)).
-- `[webrtc].enabled` — experimental native WebRTC on Vast and AWS (default off;
-  `--webrtc` per launch; mutually exclusive with GUI mode).
+- `[gui].mode` — `none` (default), `vnc` (noVNC GUI stack; see
+  [The GUI stack](#the-gui-stack)), or `webrtc` (experimental native streaming
+  on Vast and AWS); `--gui` overrides per launch. `[gui].resolution` applies to
+  `vnc`.
 - `[isaac].curobo` — install cuRobo into Isaac's python after launch (default off;
   `--curobo` per launch). Background, ~5 min; `status` probe reports `curobo: ready`.
 - `[isaac].lab` — install Isaac Lab into Isaac's python after launch (default off;
