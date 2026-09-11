@@ -63,7 +63,8 @@ uv run python isaac_cloud.py launch --provider aws
 uv run python isaac_cloud.py instances
 uv run python isaac_cloud.py status  --instance-id <ID>
 uv run python isaac_cloud.py tunnel  --instance-id <ID>   # supervised, auto-reconnecting
-uv run python isaac_cloud.py tunnel  --instance-id <ID2> --novnc-port 16080 --agent-port 18226   # second box
+uv run python isaac_cloud.py tunnel  --instance-id <ID2> --gui-port 16080 --agent-port 18226 --rtsp-port 18554   # second box
+uv run python isaac_cloud.py tunnel  --instance-id <ID3> --gui-port 18210 --webrtc-signal-port 59100 --agent-port 18226 --rtsp-port 18554   # second WebRTC box
 uv run python isaac_cloud.py sync list                   # saved projects + snapshots
 uv run python isaac_cloud.py sync pull --instance-id <ID> [--project P] [--snapshot TS]
 uv run python isaac_cloud.py sync push --instance-id <ID> [--project P]
@@ -173,8 +174,11 @@ Failure modes the script encodes (all observed on Vast hosts, 2026-09-01..03):
 
 Set `GUI_STACK_TIMEOUT` (default 600 s) on the box to change how long the
 script waits for the kit. Two boxes at once: give the second tunnel its own
-local ports (`tunnel --novnc-port 16080 --agent-port 18226`; `status
---agent-port 18226` probes that tunnel).
+local ports (`tunnel --gui-port 16080 --agent-port 18226 --rtsp-port 18554`;
+`status --agent-port 18226` probes that tunnel). `--gui-port` is the browser
+page in either GUI mode (noVNC, default 6080; the WebRTC viewer, default 8210).
+`tunnel` refuses to start on a local port that is already taken, and rejects
+the `--webrtc-*` options on an instance not launched with `--gui webrtc`.
 
 ## WebRTC browser viewing (experimental)
 
@@ -205,7 +209,10 @@ serve the directory on `127.0.0.1:8210` with the container's own Python. For a
 WebRTC instance, `tunnel` forwards that page and the signaling port instead of
 noVNC (agent control and RTSP as usual), starts the remote UDP media relay for
 your IP, and writes the media endpoint into the page's `connection.json` on
-every (re)connect. Ctrl-C attempts to stop the relay; the page keeps being
+every (re)connect. A second WebRTC tunnel on the same machine needs its own
+local ports (`--gui-port`, `--webrtc-signal-port`, `--agent-port`,
+`--rtsp-port`); the page then lives at that GUI port and `connection.json`
+carries the local signaling port the browser dials. Ctrl-C attempts to stop the relay; the page keeps being
 served and the GPU instance continues running and billing. Stop or destroy it
 with the existing lifecycle commands when finished.
 
@@ -225,7 +232,7 @@ absent inside the Vast container. The browser SDK's `mediaServer` and
 directly; it does not encapsulate video in TCP or SSH.
 
 The relay allows only the public IPv4 seen by SSH. If a VPN or different UDP
-route changes that address, pass `tunnel --client-ip <YOUR_PUBLIC_IPV4>`.
+route changes that address, pass `tunnel --webrtc-client-ip <YOUR_PUBLIC_IPV4>`.
 The relay is started when you connect. Media does not travel over SSH, so an
 SSH reconnect keeps the running relay and ingress rule, and replaces them only
 if your public IPv4 changed; failed reconnect steps are retried with backoff.
