@@ -16,3 +16,4 @@ build/
 *.local
 config.toml
 .codex
+webrtc-viewer/node_modules/
