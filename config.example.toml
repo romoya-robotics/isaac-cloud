@@ -26,12 +26,16 @@ public_key_path = "/home/you/.ssh/id_ed25519.pub"
 #           /isaac-sim/project so snapshots capture them.
 #   lab_ref: IsaacLab git ref (tag or branch) to install. Lab releases are
 #           paired with Isaac Sim versions — bump together with `version`.
+#   lab_install: what `isaaclab.sh --install` installs (core, rl, rl[rsl-rl],
+#           visualizer, teleop, mimic, ... comma-separated).
 [isaac]
-version = "6.0.1"
+version = "6.1.0"
 agent = true
 curobo = false
 lab = false
-# lab_ref = "v3.0.0-beta2.patch1"   # default; the release built for Isaac Sim 6.0.1
+# lab_ref = "release/3.0.0"   # default; the Lab branch built for Isaac Sim 6.1.0 (no tag targets 6.1 yet)
+# lab_install = "rl"          # default; isaaclab.sh --install <set>: core + RL frameworks. "all" adds
+#                             # teleop/mimic, which breaks WebRTC streaming on the 6.1.0 container.
 
 # Browser GUI for the Isaac UI. `mode` is the default for `launch --gui`:
 #   "none"   headless: agent control and RTSP only.

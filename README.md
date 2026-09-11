@@ -297,7 +297,7 @@ Requirements and limits:
   the viewer leaves the simulation running. The upstream streaming app defaults
   to quitting when its viewer session ends.
 
-NVIDIA recommends the [WebRTC browser viewer for cloud deployments](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/installation/manual_livestream_clients.html).
+NVIDIA recommends the [WebRTC browser viewer for cloud deployments](https://docs.isaacsim.omniverse.nvidia.com/6.1.0/installation/manual_livestream_clients.html).
 Its standard Docker Compose deployment uses host networking. This repo uses
 the same [NVIDIA WebRTC SDK](https://github.com/isaac-sim/IsaacSim/blob/main/tools/docker/web-viewer/Dockerfile)
 in a container-served viewer to accommodate
@@ -424,7 +424,7 @@ additionally survives container restarts.
 See `config.example.toml`. Highlights:
 
 - `[defaults].provider` — `vast` or `aws`; `--provider` overrides per command.
-- `[isaac].version` — Isaac Sim image tag (default `6.0.1`).
+- `[isaac].version` — Isaac Sim image tag (default `6.1.0`).
 - `[isaac].agent` — agent control socket (default true).
 - `[gui].mode` — `none` (default), `vnc` (noVNC GUI stack; see
   [The GUI stack](#the-gui-stack)), or `webrtc` (experimental native streaming
@@ -435,11 +435,34 @@ See `config.example.toml`. Highlights:
 - `[isaac].lab` — install Isaac Lab into Isaac's python after launch (default off;
   `--lab` per launch). Background, ~15 min; `status` probe reports `isaac_lab: ready`.
 - `[isaac].lab_ref` — IsaacLab git ref (tag or branch) to install (default
-  `v3.0.0-beta2.patch1`, the release built for Isaac Sim 6.0.1). Lab releases are
+  `release/3.0.0`, the branch built for Isaac Sim 6.1.0; no tag targets 6.1 yet). Lab releases are
   paired with Isaac Sim versions — bump together with `[isaac].version`.
   Lab scripts launch their own SimulationApp: stop the streaming Isaac first
   (`pkill -f kit/kit` in the container), and keep outputs under `/isaac-sim/project`
   so stop/destroy snapshots capture them.
+- `[isaac].lab_install` — the set passed to `isaaclab.sh --install` (default `rl`:
+  the core Lab packages plus the rsl-rl, skrl, sb3 and rl-games extras; other
+  tokens: `core`, `rl[rsl-rl]`, `visualizer`, `teleop`, `mimic`, comma-separated).
+  `status` reports `isaac_lab: FAILED` when the installer exits without its OK
+  marker (same for `curobo`). Known on Isaac 6.1.0 with `release/3.0.0`
+  (verified 2026-09-11 on Vast and AWS): Lab's installer ends by checking that
+  no pip step broke the container's prebundled packages, and that check fails
+  because the install removes the prebundled `packaging` copy that two Kit pip
+  extensions symlink into. Lab itself works (`import isaaclab`, tutorials run,
+  physics steps) and the streaming Isaac relaunches cleanly, so the launcher
+  reports it as `isaac_lab: ready (installer reported prebundle breakage; see
+  README)`; the log's `RuntimeError` line names the broken prebundle. Upstream
+  knows this class of breakage (IsaacLab #6329 added the check; #7405 moved
+  Lab's own Docker images to a uv venv on Kit's interpreter on `develop`, not
+  yet on `release/3.0.0`). Do not use
+  `lab_install = "all"`: its teleop extra replaces the prebundled `isaacteleop`
+  that Isaac 6.1.0's WebRTC livestream extension links `libNvStreamBase.so`
+  and `libcudart.so.12` into, and the next relaunch of the streaming Isaac
+  (`resume`, or a manual relaunch) then cannot create its stream server. If
+  that has already happened, re-point the two dangling links in
+  `/isaac-sim/extscache/omni.kit.livestream.webrtc-*/bin/` at
+  `/isaac-sim/kit/python/lib/python3.12/site-packages/isaacteleop/cloudxr/native/`
+  and relaunch (verified to restore streaming).
 - `[vast].whole_machine` / `min_reliability` / `query` — offer selection.
 - `[aws].region` / `instance_type` — defaults `us-west-2` / `g6e.xlarge`.
 - `[persistence].s3_uri` — `s3://bucket/path/` base for snapshot storage.
