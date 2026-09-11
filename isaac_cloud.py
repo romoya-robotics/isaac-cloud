@@ -2125,7 +2125,7 @@ def setup_isaac(config: AppConfig, info: InstanceInfo) -> None:
                 "This host cannot present Vulkan on an X display (vulkaninfo: "
                 "vkGetPhysicalDeviceSurfacePresentModesKHR failed) -- a dud for GUI work; "
                 f"headless would still run. Destroy it and relaunch on a driver >= "
-                f"{GUI_MIN_DRIVER_MAJOR} host (`catalog --gui` ranks those first)."
+                f"{GUI_MIN_DRIVER_MAJOR} host (`catalog --gui vnc` ranks those first)."
             ) from exc
         raise IsaacCloudError(
             f"GUI stack failed to come up: {exc}\n"
@@ -2620,7 +2620,7 @@ def status(
 ) -> None:
     """Show instance state plus in-container readiness probes.
 
-    On a box brought up with --gui the probe also runs the GUI stack's checks
+    On a box brought up with --gui vnc the probe also runs the GUI stack's checks
     (gui_x, gui_vulkan, gui_vnc, gui_novnc, gui_kit, gui_agent, gui_screen)."""
     config = _config()
     prov = get_provider(config, provider)
