@@ -573,13 +573,6 @@ def test_video_tools_installed_on_every_launch_path(config):
     assert 'echo "video_tools: ready' in probe
 
 
-def test_driver_major():
-    assert ic.driver_major("580.95.05") == 580
-    assert ic.driver_major("590.10") == 590
-    assert ic.driver_major(None) == 0
-    assert ic.driver_major("garbage") == 0
-
-
 def test_driver_floor_is_shared_by_vast_query_and_aws_bootstrap(config):
     """Isaac 6.1 needs driver >= 595.58.03. Both providers must enforce the same
     floor: a Vast host below it is rented and billed, then fails inside Isaac
@@ -606,6 +599,31 @@ def test_catalog_keeps_price_order_for_gui(config, monkeypatch):
     # cheapest first in every mode (reliability filter still applies)
     assert [o["id"] for o in ic.VastProvider(config).catalog()] == [1, 2]
     assert [o["id"] for o in ic.VastProvider(replace(config, gui_mode="vnc")).catalog()] == [1, 2]
+
+
+def test_wait_for_container_fails_fast_on_a_bootstrap_fatal(config, monkeypatch):
+    """The AWS bootstrap writes `FATAL: ...` within seconds on an AMI below the
+    driver floor. The container poll must surface that on its next round,
+    not after the full 600 s timeout on a billing instance."""
+    target = ic.SshTarget(host="203.0.113.5", port=22, user="ubuntu", container_via_docker=True)
+    info = ic.InstanceInfo(provider="aws", instance_id="i-1", status="running", label="x", ssh=target)
+    polls = []
+    monkeypatch.setattr(ic.time, "sleep", lambda _s: None)
+
+    def ssh(_config, _target, command, **_kw):
+        polls.append(command)
+        assert "docker inspect" in command and "grep -m1 '^FATAL:'" in command
+        return "FATAL: AMI driver 580.95.05 < 595.58.03 (Isaac 6.1.0 minimum). Pin a newer AMI ([aws].ami_ssm_param).\n"
+
+    monkeypatch.setattr(ic, "run_ssh", ssh)
+    with pytest.raises(ic.IsaacCloudError, match=r"Bootstrap failed on the VM: FATAL: AMI driver 580\.95\.05"):
+        ic.wait_for_container(config, info, timeout_seconds=600)
+    assert len(polls) == 1
+
+    # the normal path is untouched: absent, then running
+    answers = iter(["absent\n", "true\n"])
+    monkeypatch.setattr(ic, "run_ssh", lambda *_a, **_k: next(answers))
+    ic.wait_for_container(config, info, timeout_seconds=600)
 
 
 def test_tunnel_forwards_remap_local_ports():

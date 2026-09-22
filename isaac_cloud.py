@@ -1636,12 +1636,6 @@ class VastProvisionMonitor(ProvisionMonitor):
         self._auth_denied_since = None
 
 
-def driver_major(version: Any) -> int:
-    """'580.95.05' -> 580; unparseable -> 0."""
-    match = re.match(r"\s*(\d+)", str(version or ""))
-    return int(match.group(1)) if match else 0
-
-
 class VastProvider(Provider):
     name = "vast"
 
@@ -2174,8 +2168,14 @@ def wait_for_ssh(
     raise AssertionError  # unreachable
 
 
+AWS_BOOTSTRAP_LOG = "/var/log/isaac-cloud-bootstrap.log"
+
+
 def wait_for_container(config: AppConfig, info: InstanceInfo, timeout_seconds: int = 600) -> None:
-    """AWS only: wait for user-data to finish pulling and starting the container."""
+    """AWS only: wait for user-data to finish pulling and starting the container.
+    The same poll reads the bootstrap's `FATAL:` line (e.g. an AMI below the
+    driver floor) so that failure surfaces on the next poll, not after the
+    full timeout on a billing instance."""
     if not info.ssh or not info.ssh.container_via_docker:
         return
     deadline = time.time() + timeout_seconds
@@ -2183,13 +2183,18 @@ def wait_for_container(config: AppConfig, info: InstanceInfo, timeout_seconds: i
         out = run_ssh(
             config,
             info.ssh,
-            "sudo docker inspect -f '{{.State.Running}}' isaac-sim 2>/dev/null || echo absent",
+            "sudo docker inspect -f '{{.State.Running}}' isaac-sim 2>/dev/null "
+            f"|| sudo grep -m1 '^FATAL:' {AWS_BOOTSTRAP_LOG} 2>/dev/null "
+            "|| echo absent",
             check=False,
         )
-        if out.strip() == "true":
+        out = out.strip()
+        if out == "true":
             return
+        if out.startswith("FATAL:"):
+            _raise(f"Bootstrap failed on the VM: {out} (see {AWS_BOOTSTRAP_LOG}).")
         time.sleep(15)
-    _raise("Isaac container did not start on the VM (check /var/log/isaac-cloud-bootstrap.log).")
+    _raise(f"Isaac container did not start on the VM (check {AWS_BOOTSTRAP_LOG}).")
 
 
 def setup_isaac(config: AppConfig, info: InstanceInfo) -> None:
@@ -2602,6 +2607,8 @@ def catalog(
             raise typer.Exit(1)
         if config.webrtc_enabled:
             typer.echo("(--gui webrtc: whole-machine offers only, so the GPU is host GPU 0 for NVENC)")
+        elif config.vnc_enabled:
+            typer.echo("(--gui vnc: needs no filtering; every offer above the driver floor qualifies)")
         for o in offers:
             typer.echo(
                 f"offer={o['id']} machine={o.get('machine_id')} {o.get('gpu_name')} "
