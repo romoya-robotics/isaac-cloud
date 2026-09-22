@@ -474,6 +474,12 @@ See `config.example.toml`. Highlights:
   and relaunch (verified to restore streaming).
 - `[vast].whole_machine` / `min_reliability` / `query` — offer selection.
 - `[aws].region` / `instance_type` — defaults `us-west-2` / `g6e.xlarge`.
+- `[aws].key_name` — EC2 key pair name (default `isaac-cloud`). The launcher
+  imports `[ssh].public_key_path` under that name only if no pair exists yet;
+  an existing pair is used as-is. If the box comes up but SSH says
+  `Permission denied (publickey)`, `[ssh]` points at a different key than the
+  one the pair was imported from: compare `aws ec2 describe-key-pairs` with
+  `ssh-keygen -lf <pub>`, then fix `[ssh]` or pick a new `key_name`.
 - `[persistence].s3_uri` — `s3://bucket/path/` base for snapshot storage.
 - `[persistence].project` / `keep_last` — default namespace, snapshots kept.
 

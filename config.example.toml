@@ -72,7 +72,8 @@ min_reliability = 0.99
 region = "us-west-2"
 instance_type = "g6e.xlarge"
 # security_group = "isaac-cloud-ssh"
-# key_name = "isaac-cloud"
+# key_name = "isaac-cloud"   # EC2 key pair; imported from [ssh].public_key_path only
+#                            # if absent. An existing pair must match [ssh] or SSH is refused.
 # ami_ssm_param = "/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id"
 
 # Save/restore your Isaac project directory as append-only snapshots in S3:
