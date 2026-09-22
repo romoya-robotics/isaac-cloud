@@ -16,7 +16,7 @@ ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 
 class Handler(SimpleHTTPRequestHandler):
     def send_head(self):  # shared by GET and HEAD
-        # Hostname only, so a remapped local tunnel port (--viewer-port) still works.
+        # Hostname only, so a remapped local tunnel port (--gui-port) still works.
         if (self.headers.get("Host") or "").rsplit(":", 1)[0] not in ALLOWED_HOSTS:
             self.send_error(403)
             return None

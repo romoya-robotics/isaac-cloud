@@ -60,6 +60,6 @@ parts when noVNC exists. Not productized.
 
 ## Productization
 
-`isaac_cloud.py launch --gui` now provisions this stack automatically and
+`isaac_cloud.py launch --gui vnc` now provisions this stack automatically and
 prints the tunnel command; open `http://localhost:6080/vnc.html`. Resolution
 is `[gui].resolution` in config.toml.

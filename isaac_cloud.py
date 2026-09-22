@@ -2721,7 +2721,7 @@ def status(
 ) -> None:
     """Show instance state plus in-container readiness probes.
 
-    On a box brought up with --gui the probe also runs the GUI stack's checks
+    On a box brought up with --gui vnc the probe also runs the GUI stack's checks
     (gui_x, gui_vulkan, gui_vnc, gui_novnc, gui_kit, gui_agent, gui_screen)."""
     config = _config()
     prov = get_provider(config, provider)
