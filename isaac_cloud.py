@@ -96,6 +96,18 @@ DEFAULT_ISAAC_LAB_REF = "release/3.0.0"
 # 6.1.0 container's prebundled isaacteleop and breaks the WebRTC livestream
 # extension that symlinks into it (see README, "[isaac].lab_install").
 DEFAULT_ISAAC_LAB_INSTALL = "rl"
+# Fixed text of the RuntimeError raised by Lab's final prebundle-integrity
+# check ("Installation broke N prebundled package(s) in Isaac Sim ...",
+# isaaclab/cli/commands/install.py, IsaacLab #6329): the only installer
+# failure reported as degraded rather than failed.
+ISAAC_LAB_PREBUNDLE_ERROR = "prebundled package(s) in Isaac Sim"
+# Isaac Sim 6.1's documented minimum NVIDIA driver. Feeds the default Vast
+# query and the AWS bootstrap check so the two providers cannot desync: a host
+# below it is rented, billed, and then fails inside Isaac (the userland
+# side-load matches the host's driver, it does not raise it). Bump together
+# with [isaac].version.
+ISAAC_MIN_DRIVER = "595.58.03"
+ISAAC_MIN_DRIVER_MAJOR = int(ISAAC_MIN_DRIVER.split(".")[0])
 
 # Container-side paths (identical on both providers: same Isaac image).
 CONTAINER_PERSISTENCE_DIR = "/isaac-sim/project"
@@ -113,7 +125,7 @@ AWS_TAG_PROJECT = "IsaacCloudProject"
 # Vast provider defaults. NVENC requires the rented GPU to be host GPU 0
 # (see docs/VAST_EXPERIMENT_RESULTS.md), which whole-machine offers guarantee.
 DEFAULT_VAST_QUERY = (
-    'gpu_name in ["RTX_4090","L40S"] driver_version >= 580.95.05 '
+    f'gpu_name in ["RTX_4090","L40S"] driver_version >= {ISAAC_MIN_DRIVER} '
     "verified=true rentable=true num_gpus=1 disk_space >= 80 inet_down >= 300"
 )
 DEFAULT_VAST_WHOLE_MACHINE = True
@@ -807,8 +819,8 @@ def build_webrtc_install_script() -> str:
                 exit 1
             fi
             if ! command -v socat >/dev/null || ! command -v curl >/dev/null; then
-                apt-get update -qq
-                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat curl
+                apt-get -o DPkg::Lock::Timeout=60 update -qq
+                DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 install -y -qq socat curl
             fi
             mkdir -p "$VIEWER_DIR"
             # Fetch the SDK module once; re-fetch only when the pinned version changes.
@@ -926,8 +938,23 @@ GUI_SCREENSHOT_PATH = "/root/gui_screen.png"
 GUI_STACK_TIMEOUT_S = 600
 GUI_WINDOW_TIMEOUT_S = 240
 # Hosts on driver 580 could not present Vulkan on the X display (measured
-# 2026-09-01: kit "vkCreateSwapchainKHR failed", black GUI, headless fine).
-GUI_MIN_DRIVER_MAJOR = 590
+# 2026-09-01: kit "vkCreateSwapchainKHR failed", black GUI, headless fine);
+# ISAAC_MIN_DRIVER now excludes them, so the preflight below is the backstop.
+
+# Shared by the cuRobo and Isaac Lab installers, which start together: the other
+# may hold the apt lock, so wait for it instead of skipping git.
+ENSURE_GIT_SH = """\
+ensure_git() {
+    for i in $(seq 1 40); do
+        command -v git >/dev/null 2>&1 && return 0
+        apt-get -o DPkg::Lock::Timeout=60 update -qq >/dev/null 2>&1 \\
+            && apt-get -o DPkg::Lock::Timeout=60 install -y -qq git >/dev/null 2>&1 && return 0
+        sleep 5
+    done
+    echo "git could not be installed (apt lock held or offline)"; return 1
+}
+ensure_git
+"""
 
 NVIDIA_USERLAND_SH = """\
 ensure_nvidia_userland() {
@@ -1151,7 +1178,7 @@ gui_stack_up() {
     case $? in
         1)
             log "FAIL: Vulkan cannot present on this host's X display (vulkaninfo: vkGetPhysicalDeviceSurfacePresentModesKHR failed)."
-            log "Seen on driver 580 hosts: headless works, the GUI stays black. Relaunch on a driver >= 590 host."
+            log "Seen on driver 580 hosts: headless works, the GUI stays black. Relaunch on another host."
             echo GUI_STACK_VULKAN_PRESENT_FAILED
             return 2;;
         2) log "warning: vulkaninfo enumerated no GPU; continuing";;
@@ -1354,17 +1381,9 @@ def build_curobo_install_script() -> str:
             echo CUROBO_ALREADY_INSTALLED
             exit 0
         fi
-        ensure_git() {
-            # cuRobo and Lab installers start together; the other may hold the apt lock.
-            for i in $(seq 1 40); do
-                command -v git >/dev/null 2>&1 && return 0
-                apt-get -o DPkg::Lock::Timeout=60 update -qq >/dev/null 2>&1 \
-                    && apt-get -o DPkg::Lock::Timeout=60 install -y -qq git >/dev/null 2>&1 && return 0
-                sleep 5
-            done
-            echo "git could not be installed (apt lock held or offline)"; return 1
-        }
-        ensure_git
+        """
+    ) + ENSURE_GIT_SH + dedent_script(
+        """\
         /isaac-sim/python.sh -m pip install --quiet ninja wheel
         /isaac-sim/python.sh -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cu128
         rm -rf /root/curobo
@@ -1404,47 +1423,46 @@ def build_lab_install_script(lab_ref: str, lab_install: str = DEFAULT_ISAAC_LAB_
     /isaac-sim (found via the _isaac_sim symlink). Note the usage model: Lab scripts launch their own SimulationApp,
     so stop the streaming kit process (pkill -f kit/kit) before running Lab
     workloads, and keep outputs under /isaac-sim/project to be snapshotted.
-    Writes /root/isaac_lab_install.log; ISAAC_LAB_INSTALL_OK on success,
-    ISAAC_LAB_INSTALL_DEGRADED when Lab's installer exited non-zero but Lab
-    imports (its prebundle-integrity check; see README), and the last line is
-    always ISAAC_LAB_INSTALL_EXIT=<code> (the status probe reports `failed` for
-    a non-zero exit without either marker).
+    Writes /root/isaac_lab_install.log (with ISAAC_LAB_COMMIT=<sha> of the
+    clone); ISAAC_LAB_INSTALL_OK on success, ISAAC_LAB_INSTALL_DEGRADED only
+    when Lab's installer failed its prebundle-integrity check yet Lab imports
+    (see README), and the last line is always ISAAC_LAB_INSTALL_EXIT=<code>
+    (the status probe reports `failed` for a non-zero exit without either
+    marker). The `import isaaclab` short-circuit makes a degraded install
+    sticky; the README documents the forced-reinstall escape hatch.
     """
     return dedent_script(
         f"""\
         #!/bin/bash
         cat > /root/isaac_lab_install.sh << 'EOS'
         #!/bin/bash
-        set -e
+        set -eo pipefail
         trap 'echo "ISAAC_LAB_INSTALL_EXIT=$?"' EXIT
         if /isaac-sim/python.sh -c "import isaaclab" >/dev/null 2>&1; then
             echo ISAAC_LAB_ALREADY_INSTALLED
             exit 0
         fi
-        ensure_git() {{
-            # cuRobo and Lab installers start together; the other may hold the apt lock.
-            for i in $(seq 1 40); do
-                command -v git >/dev/null 2>&1 && return 0
-                apt-get -o DPkg::Lock::Timeout=60 update -qq >/dev/null 2>&1 \\
-                    && apt-get -o DPkg::Lock::Timeout=60 install -y -qq git >/dev/null 2>&1 && return 0
-                sleep 5
-            done
-            echo "git could not be installed (apt lock held or offline)"; return 1
-        }}
-        ensure_git
+        """
+    ) + ENSURE_GIT_SH + dedent_script(
+        f"""\
         rm -rf /root/IsaacLab
         git clone --depth 1 --branch {shell_quote(lab_ref)} \\
             https://github.com/isaac-sim/IsaacLab.git /root/IsaacLab
+        # lab_ref may be a moving branch: record what this box actually got.
+        echo "ISAAC_LAB_COMMIT=$(git -C /root/IsaacLab rev-parse HEAD)"
         ln -sfn /isaac-sim /root/IsaacLab/_isaac_sim
         cd /root/IsaacLab
         export ISAACSIM_PATH=/isaac-sim
-        if ./isaaclab.sh --install {shell_quote(lab_install)}; then
+        if ./isaaclab.sh --install {shell_quote(lab_install)} 2>&1 | tee /root/isaac_lab_installer.out; then
             /isaac-sim/python.sh -c "import isaaclab; print('ISAAC_LAB_INSTALL_OK')"
-        elif /isaac-sim/python.sh -c "import isaaclab" >/dev/null 2>&1; then
+        elif grep -qF "{ISAAC_LAB_PREBUNDLE_ERROR}" /root/isaac_lab_installer.out \\
+                && /isaac-sim/python.sh -c "import isaaclab" >/dev/null 2>&1; then
             # Isaac 6.1.0 + release/3.0.0: Lab's final prebundle-integrity check
             # fails (pip removes `packaging` from a Kit prebundle; IsaacLab #6329)
             # although Lab works and, with the default lab_install, streaming
-            # survives. Report it as degraded rather than failed.
+            # survives. Only that specific failure is degraded; an extras install
+            # that fails after the core packages landed still imports, and is
+            # a real failure (exit 1 below).
             echo "ISAAC_LAB_INSTALL_DEGRADED (installer exited non-zero; Lab imports; see README [isaac].lab_install)"
         else
             exit 1
@@ -1641,11 +1659,6 @@ class VastProvider(Provider):
             for o in offers
             if float(o.get("reliability2", 0)) >= self.config.vast_min_reliability
         ]
-        if self.config.vnc_enabled:
-            # GUI work needs Vulkan presentation on the X display, which driver
-            # 580 hosts could not do; rank driver >= 590 first (price order kept
-            # within each group).
-            offers.sort(key=lambda o: driver_major(o.get("driver_version")) < GUI_MIN_DRIVER_MAJOR)
         return offers[:limit]
 
     def launch(self, offer_id: str | None = None) -> InstanceInfo:
@@ -1668,15 +1681,6 @@ class VastProvider(Provider):
                 f"driver {offer.get('driver_version')} at ${offer.get('dph_total', 0):.3f}/hr "
                 f"({offer.get('geolocation')})"
             )
-            if (
-                self.config.vnc_enabled
-                and driver_major(offer.get("driver_version")) < GUI_MIN_DRIVER_MAJOR
-            ):
-                typer.echo(
-                    f"Warning: no driver >= {GUI_MIN_DRIVER_MAJOR} offer matched; driver "
-                    f"{offer.get('driver_version')} hosts may be unable to present the GUI "
-                    "(the Vulkan preflight will abort the launch if so)."
-                )
         image = build_isaac_image_ref(self.config.isaac_version)
         result = run_vastai_json(
             [
@@ -1937,13 +1941,16 @@ class AwsProvider(Provider):
             exec > >(tee -a /var/log/isaac-cloud-bootstrap.log) 2>&1
 
             # DL Base AMI ships driver+docker+nvidia-container-toolkit (595 since
-            # the 2026-09-07 image). Isaac 6.1 lists driver >= 595.58.03 as its
-            # minimum; upgrade if the resolved AMI is behind.
-            DRIVER_MAJOR=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)
-            if [ "${{DRIVER_MAJOR:-0}}" -lt 595 ]; then
-                export DEBIAN_FRONTEND=noninteractive
-                apt-get update -qq && apt-get install -y nvidia-driver-595
-                reboot
+            # the 2026-09-07 image). Isaac 6.1 needs driver >= {ISAAC_MIN_DRIVER};
+            # an older AMI (pinned aws_ami_ssm_param, lagging region) fails here,
+            # fast and in the bootstrap log, rather than after wait_for_container
+            # times out. Upgrading in place would need a post-reboot resume
+            # (user-data runs once per instance), which this bootstrap lacks.
+            DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+            DRIVER_MAJOR=${{DRIVER_VERSION%%.*}}
+            if [ "${{DRIVER_MAJOR:-0}}" -lt {ISAAC_MIN_DRIVER_MAJOR} ]; then
+                echo "FATAL: AMI driver ${{DRIVER_VERSION:-unknown}} < {ISAAC_MIN_DRIVER} (Isaac {self.config.isaac_version} minimum). Pin a newer AMI ([aws].ami_ssm_param)." >&2
+                exit 1
             fi
 
             mkdir -p {persist_dir}
@@ -2032,16 +2039,21 @@ class AwsProvider(Provider):
         zones = sorted((s["AvailabilityZone"], s["SubnetId"]) for s in subnets)
         if not zones:
             raise first_error
+        typer.echo(f"No {self.config.aws_instance_type} capacity where EC2 placed it.")
         for zone, subnet in zones:
-            typer.echo(f"No {self.config.aws_instance_type} capacity where EC2 placed it; retrying in {zone}...")
+            typer.echo(f"Retrying in {zone}...")
             try:
                 return run_aws_json(self.config, [*run_args, "--subnet-id", subnet], timeout_seconds=180)
             except IsaacCloudError as exc:
-                if "InsufficientInstanceCapacity" not in str(exc):
-                    raise
+                # Pinning a subnet is what surfaces `Unsupported` (this zone does
+                # not offer the type at all; unpinned, EC2 only places in zones
+                # that do). That, more no-capacity, or a quota error all mean
+                # "next zone"; the capacity error is the honest summary if none works.
+                typer.echo(f"  {zone}: {exc}")
         _raise(
             f"No {self.config.aws_instance_type} capacity in any {self.config.aws_region} zone right now "
-            f"({', '.join(z for z, _ in zones)}). Retry later, or set [aws].instance_type to another size."
+            f"({', '.join(z for z, _ in zones)}); first error: {first_error}. "
+            "Retry later, or set [aws].instance_type to another size."
         )
 
     def list_instances(self) -> list[InstanceInfo]:
@@ -2209,8 +2221,7 @@ def setup_isaac(config: AppConfig, info: InstanceInfo) -> None:
             raise IsaacCloudError(
                 "This host cannot present Vulkan on an X display (vulkaninfo: "
                 "vkGetPhysicalDeviceSurfacePresentModesKHR failed) -- a dud for GUI work; "
-                f"headless would still run. Destroy it and relaunch on a driver >= "
-                f"{GUI_MIN_DRIVER_MAJOR} host (`catalog --gui` ranks those first)."
+                "headless would still run. Destroy it and relaunch on another host."
             ) from exc
         raise IsaacCloudError(
             f"GUI stack failed to come up: {exc}\n"
@@ -2525,8 +2536,8 @@ INSTANCE_ID_OPTION = typer.Option(..., "--instance-id")
 CATALOG_GUI_OPTION = typer.Option(
     None,
     "--gui",
-    help=f"Rank offers for a GUI mode: vnc puts driver >= {GUI_MIN_DRIVER_MAJOR} hosts first, "
-    "webrtc lists whole machines only (GPU 0 for NVENC).",
+    help="Filter offers for a GUI mode: webrtc lists whole machines only (GPU 0 for NVENC); "
+    "vnc runs on any host.",
 )
 LAUNCH_GUI_OPTION = typer.Option(
     None,
@@ -2589,9 +2600,7 @@ def catalog(
         if not offers:
             typer.echo("No matching offers.")
             raise typer.Exit(1)
-        if config.vnc_enabled:
-            typer.echo(f"(--gui vnc: driver >= {GUI_MIN_DRIVER_MAJOR} hosts ranked first)")
-        elif config.webrtc_enabled:
+        if config.webrtc_enabled:
             typer.echo("(--gui webrtc: whole-machine offers only, so the GPU is host GPU 0 for NVENC)")
         for o in offers:
             typer.echo(

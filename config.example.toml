@@ -40,10 +40,10 @@ lab = false
 # Browser GUI for the Isaac UI. `mode` is the default for `launch --gui`:
 #   "none"   headless: agent control and RTSP only.
 #   "vnc"    Isaac GUI -> Xvfb -> x11vnc -> noVNC on one TCP port through the
-#            tunnel (http://localhost:6080/vnc.html). Works on any host whose
-#            driver can present Vulkan on an X display (driver >= 590;
-#            `catalog --gui vnc` ranks those first, the launch preflight aborts
-#            otherwise). NVENC not required. Brought up by /root/gui_stack.sh
+#            tunnel (http://localhost:6080/vnc.html). Works on any host (the
+#            default query's driver floor already excludes the 580 hosts that
+#            could not present Vulkan on an X display; the launch preflight
+#            aborts otherwise). NVENC not required. Brought up by /root/gui_stack.sh
 #            on the box (idempotent; `status` reports its gui_* checks).
 #   "webrtc" Isaac's native WebRTC stream in a local Chromium browser (Vast or
 #            AWS). The viewer page is served from the container; the usual
@@ -62,7 +62,9 @@ resolution = "1920x1080"   # vnc only
 # requires. Fractional hosts are fine for agent-only or noVNC GUI work.
 whole_machine = true
 min_reliability = 0.99
-# query = 'gpu_name in ["RTX_4090","L40S"] driver_version >= 580.95.05 verified=true rentable=true num_gpus=1 disk_space >= 80 inet_down >= 300'
+# The driver floor is Isaac Sim's documented minimum (595.58.03 for 6.1); a host
+# below it is rented and billed, then fails inside Isaac. Keep it when editing.
+# query = 'gpu_name in ["RTX_4090","L40S"] driver_version >= 595.58.03 verified=true rentable=true num_gpus=1 disk_space >= 80 inet_down >= 300'
 
 [aws]
 # Requires: aws login. Also requires G-instance vCPU quota > 0 in the region

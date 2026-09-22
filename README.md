@@ -24,9 +24,9 @@ through an SSH tunnel the CLI prints for you:
   notes below).
 - **GUI over VNC** (`http://localhost:6080/vnc.html`, `--gui vnc`) — the native
   Isaac Sim application rendered into a virtual display and served with noVNC
-  over a single TCP port. Works on any host; NVENC not required. Needs a host
-  whose driver can present Vulkan on an X display (driver >= 590 in practice;
-  see [The GUI stack](#the-gui-stack)).
+  over a single TCP port. Works on any host; NVENC not required. The host's
+  driver must present Vulkan on an X display (driver 580 could not; the default
+  query's Isaac 6.1 floor of 595 excludes those; see [The GUI stack](#the-gui-stack)).
 - **GUI over WebRTC** (`http://localhost:8210/`, `--gui webrtc`, Vast or AWS) —
   the same Isaac UI via its built-in streaming: encoded on the remote GPU,
   displayed and controlled in a local Chromium browser. The viewer page is
@@ -53,7 +53,7 @@ cp config.example.toml config.toml   # then fill in [ngc] and [ssh]
 ## Usage
 
 ```bash
-uv run python isaac_cloud.py catalog [--gui vnc|webrtc]  # browse offers (vnc ranks driver >= 590 first; webrtc = whole machines)
+uv run python isaac_cloud.py catalog [--gui vnc|webrtc]  # browse offers (webrtc = whole machines only)
 uv run python isaac_cloud.py launch                      # headless + agent socket
 uv run python isaac_cloud.py launch --gui vnc            # + noVNC GUI
 uv run python isaac_cloud.py launch --gui webrtc         # + native WebRTC streaming (UDP mapping reserved at launch)
@@ -89,7 +89,7 @@ kits), chosen with `--gui` at `launch` or `[gui].mode` in `config.toml`.
 | Mode | Open | How the video travels | Host needs | What it feels like |
 | --- | --- | --- | --- | --- |
 | `none` (default) | nothing | none: agent control and RTSP only | any | headless |
-| `vnc` | `http://localhost:6080/vnc.html` | Isaac draws on a virtual X display; x11vnc + noVNC send screen updates over TCP inside the SSH tunnel | driver >= 590 (must present Vulkan on X); **any GPU slot** | noticeably lower framerate and higher latency, since each update is a lossless screen diff squeezed through SSH; fine for editing scenes and inspecting state, not for watching motion smoothly |
+| `vnc` | `http://localhost:6080/vnc.html` | Isaac draws on a virtual X display; x11vnc + noVNC send screen updates over TCP inside the SSH tunnel | must present Vulkan on X (every host above the query's driver floor does); **any GPU slot** | noticeably lower framerate and higher latency, since each update is a lossless screen diff squeezed through SSH; fine for editing scenes and inspecting state, not for watching motion smoothly |
 | `webrtc` | `http://localhost:8210/` | Isaac encodes H.264 on the GPU (NVENC) and streams it over direct UDP to your browser; only the page and signaling go through SSH | **host GPU 0** (whole-machine Vast offers; any AWS `g6e`), UDP reachable from your network; experimental | smooth video at up to 60 fps with low latency |
 
 Rules of thumb:
@@ -166,9 +166,10 @@ Failure modes the script encodes (all observed on Vast hosts, 2026-09-01..03):
   stack runs from a script file whose argv contains none of the service
   names, and guards with `pgrep -x`. Keep it that way if you edit it.
 - **Driver 580 hosts cannot present Vulkan on the X display** (kit logs
-  "vkCreateSwapchainKHR failed", GUI black, headless fine). The preflight
-  aborts with `GUI_STACK_VULKAN_PRESENT_FAILED`; `catalog --gui vnc` and
-  `launch --gui vnc` rank driver >= 590 offers first and warn otherwise.
+  "vkCreateSwapchainKHR failed", GUI black, headless fine). The default Vast
+  query's driver floor (Isaac 6.1's minimum, 595.58.03, shared with the AWS
+  bootstrap check) excludes them; the preflight still aborts with
+  `GUI_STACK_VULKAN_PRESENT_FAILED` on a host that clears the floor but cannot present.
 - **Headless and GUI kits cannot coexist**; the stack stops the headless kit
   before starting the GUI one.
 
@@ -444,14 +445,22 @@ See `config.example.toml`. Highlights:
   the core Lab packages plus the rsl-rl, skrl, sb3 and rl-games extras; other
   tokens: `core`, `rl[rsl-rl]`, `visualizer`, `teleop`, `mimic`, comma-separated).
   `status` reports `isaac_lab: FAILED` when the installer exits without its OK
-  marker (same for `curobo`). Known on Isaac 6.1.0 with `release/3.0.0`
+  marker (same for `curobo`); the install log also records `ISAAC_LAB_COMMIT=<sha>`,
+  since `lab_ref` may be a moving branch. Known on Isaac 6.1.0 with `release/3.0.0`
   (verified 2026-09-11 on Vast and AWS): Lab's installer ends by checking that
   no pip step broke the container's prebundled packages, and that check fails
   because the install removes the prebundled `packaging` copy that two Kit pip
   extensions symlink into. Lab itself works (`import isaaclab`, tutorials run,
   physics steps) and the streaming Isaac relaunches cleanly, so the launcher
   reports it as `isaac_lab: ready (installer reported prebundle breakage; see
-  README)`; the log's `RuntimeError` line names the broken prebundle. Upstream
+  README)`; only that check's error ("Installation broke N prebundled
+  package(s) in Isaac Sim") is treated this way, and the `RuntimeError` line
+  in the log names the broken prebundle. Any other installer failure, such as
+  an RL extra failing after the core packages landed, is `FAILED`. Either way
+  the installer skips itself once `import isaaclab` works, so to repair a
+  degraded or failed install run `rm -rf /root/IsaacLab` and
+  `/isaac-sim/python.sh -m pip uninstall -y isaaclab` in the container, then
+  `resume` (or re-run `/root/isaac_lab_install.sh`). Upstream
   knows this class of breakage (IsaacLab #6329 added the check; #7405 moved
   Lab's own Docker images to a uv venv on Kit's interpreter on `develop`, not
   yet on `release/3.0.0`). Do not use
