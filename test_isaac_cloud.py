@@ -90,6 +90,7 @@ def test_config_defaults(tmp_path):
     assert cfg.isaac_version == ic.DEFAULT_ISAAC_VERSION
     assert cfg.lab_enabled is False
     assert cfg.lab_ref == ic.DEFAULT_ISAAC_LAB_REF
+    assert cfg.lab_install == ic.DEFAULT_ISAAC_LAB_INSTALL == "rl"
 
     assert cfg.gui_mode == "none"
     assert cfg.vnc_enabled is False and cfg.webrtc_enabled is False
@@ -99,7 +100,7 @@ def test_config_isaac_section(tmp_path):
     toml = tmp_path / "config.toml"
     toml.write_text(
         "[isaac]\nversion = \"7.1.0\"\nagent = false\ncurobo = true\n"
-        "lab = true\nlab_ref = \"v4.0.0\"\n"
+        "lab = true\nlab_ref = \"v4.0.0\"\nlab_install = \"core,rl[rsl-rl]\"\n"
     )
     cfg = ic.load_app_config(toml)
     assert cfg.isaac_version == "7.1.0"
@@ -107,6 +108,7 @@ def test_config_isaac_section(tmp_path):
     assert cfg.curobo_enabled is True
     assert cfg.lab_enabled is True
     assert cfg.lab_ref == "v4.0.0"
+    assert cfg.lab_install == "core,rl[rsl-rl]"
 
 
 def test_config_project_env_override(tmp_path, monkeypatch):
@@ -571,27 +573,57 @@ def test_video_tools_installed_on_every_launch_path(config):
     assert 'echo "video_tools: ready' in probe
 
 
-def test_driver_major():
-    assert ic.driver_major("580.95.05") == 580
-    assert ic.driver_major("590.10") == 590
-    assert ic.driver_major(None) == 0
-    assert ic.driver_major("garbage") == 0
+def test_driver_floor_is_shared_by_vast_query_and_aws_bootstrap(config):
+    """Isaac 6.1 needs driver >= 595.58.03. Both providers must enforce the same
+    floor: a Vast host below it is rented and billed, then fails inside Isaac
+    (the userland side-load matches the host driver, it does not raise it)."""
+    assert ic.ISAAC_MIN_DRIVER == "595.58.03" and ic.ISAAC_MIN_DRIVER_MAJOR == 595
+    assert f"driver_version >= {ic.ISAAC_MIN_DRIVER} " in ic.DEFAULT_VAST_QUERY
+    assert f"driver_version >= {ic.ISAAC_MIN_DRIVER} " in ic.VastProvider(config)._query()
+    user_data = ic.AwsProvider(replace(config, ngc_api_key="nvapi-test"))._build_user_data()
+    assert f'-lt {ic.ISAAC_MIN_DRIVER_MAJOR} ]; then' in user_data
+    # An AMI behind the floor fails fast and legibly; user-data runs once per
+    # instance, so an in-place driver upgrade plus reboot would never resume.
+    assert "FATAL: AMI driver" in user_data and "exit 1" in user_data
+    assert "\n    reboot" not in user_data and "apt-get install -y nvidia-driver-" not in user_data
+    assert "GUI_MIN_DRIVER_MAJOR" not in dir(ic)  # every host above the floor clears the old GUI rank
 
 
-def test_catalog_prefers_new_drivers_for_gui(config, monkeypatch):
+def test_catalog_keeps_price_order_for_gui(config, monkeypatch):
     offers = [
-        {"id": 1, "driver_version": "580.95.05", "dph_total": 0.30, "reliability2": 0.999},
-        {"id": 2, "driver_version": "590.10.01", "dph_total": 0.35, "reliability2": 0.999},
-        {"id": 3, "driver_version": "575.64", "dph_total": 0.20, "reliability2": 0.5},
-        {"id": 4, "driver_version": "595.00", "dph_total": 0.40, "reliability2": 0.999},
+        {"id": 1, "driver_version": "595.71.05", "dph_total": 0.30, "reliability2": 0.999},
+        {"id": 2, "driver_version": "596.10.01", "dph_total": 0.35, "reliability2": 0.999},
+        {"id": 3, "driver_version": "595.64", "dph_total": 0.20, "reliability2": 0.5},
     ]
     monkeypatch.setattr(ic, "run_vastai_json", lambda args, **kw: list(offers))
-    # headless: cheapest first (reliability filter still applies)
-    ids = [o["id"] for o in ic.VastProvider(config).catalog()]
-    assert ids == [1, 2, 4]
-    # gui: driver >= 590 first, price order kept within each group
-    gui = ic.VastProvider(replace(config, gui_mode="vnc")).catalog()
-    assert [o["id"] for o in gui] == [2, 4, 1]
+    # cheapest first in every mode (reliability filter still applies)
+    assert [o["id"] for o in ic.VastProvider(config).catalog()] == [1, 2]
+    assert [o["id"] for o in ic.VastProvider(replace(config, gui_mode="vnc")).catalog()] == [1, 2]
+
+
+def test_wait_for_container_fails_fast_on_a_bootstrap_fatal(config, monkeypatch):
+    """The AWS bootstrap writes `FATAL: ...` within seconds on an AMI below the
+    driver floor. The container poll must surface that on its next round,
+    not after the full 600 s timeout on a billing instance."""
+    target = ic.SshTarget(host="203.0.113.5", port=22, user="ubuntu", container_via_docker=True)
+    info = ic.InstanceInfo(provider="aws", instance_id="i-1", status="running", label="x", ssh=target)
+    polls = []
+    monkeypatch.setattr(ic.time, "sleep", lambda _s: None)
+
+    def ssh(_config, _target, command, **_kw):
+        polls.append(command)
+        assert "docker inspect" in command and "grep -m1 '^FATAL:'" in command
+        return "FATAL: AMI driver 580.95.05 < 595.58.03 (Isaac 6.1.0 minimum). Pin a newer AMI ([aws].ami_ssm_param).\n"
+
+    monkeypatch.setattr(ic, "run_ssh", ssh)
+    with pytest.raises(ic.IsaacCloudError, match=r"Bootstrap failed on the VM: FATAL: AMI driver 580\.95\.05"):
+        ic.wait_for_container(config, info, timeout_seconds=600)
+    assert len(polls) == 1
+
+    # the normal path is untouched: absent, then running
+    answers = iter(["absent\n", "true\n"])
+    monkeypatch.setattr(ic, "run_ssh", lambda *_a, **_k: next(answers))
+    ic.wait_for_container(config, info, timeout_seconds=600)
 
 
 def test_tunnel_forwards_remap_local_ports():
@@ -963,7 +995,7 @@ def test_webrtc_shell_syntax(config):
     )
     for script in [ic.build_webrtc_install_script(), ic.build_webrtc_session_script("198.51.100.10", CONNECTION),
                    ic.build_container_probe_script(config), ic.build_isaac_container_launch_script(config),
-                   ic.build_lab_install_script(config.lab_ref)]:
+                   ic.build_lab_install_script(config.lab_ref), ic.build_curobo_install_script()]:
         result = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
         assert result.returncode == 0, result.stderr
 
@@ -1267,7 +1299,7 @@ def test_aws_webrtc_setup_and_relay_run_inside_container(config, aws_webrtc_info
     ic.stop_webrtc_relay(config, aws_webrtc_info.ssh, 1234)
     assert calls[0]["in_container"]
     assert ic.wrap_container_command(aws_webrtc_info.ssh, "bash -s") == (
-        "sudo docker exec -i isaac-sim bash -c 'bash -s'"
+        "sudo docker exec -u root -i isaac-sim bash -c 'bash -s'"
     )
 
 
@@ -1395,3 +1427,156 @@ def test_aws_tunnel_cleans_ingress_on_failures(config, aws_webrtc_info, monkeypa
                                        "--webrtc-client-ip", "198.51.100.10"])
     assert result.exit_code == (1 if stage == "relay_start" else 0), result.output
     assert events == [("open", "198.51.100.10"), ("close", "198.51.100.10")]
+
+
+def test_install_scripts_record_exit_and_probe_reports_failed(config):
+    """A background installer that exits without its OK marker (e.g. Isaac Lab's
+    installer failing its own prebundle check) must show as FAILED, not as
+    installing forever."""
+    curobo, lab = ic.build_curobo_install_script(), ic.build_lab_install_script(config.lab_ref)
+    assert "trap 'echo \"CUROBO_INSTALL_EXIT=$?\"' EXIT" in curobo
+    assert "trap 'echo \"ISAAC_LAB_INSTALL_EXIT=$?\"' EXIT" in lab
+    probe = ic.build_container_probe_script(config)
+    for name, ok, exit_marker in [("curobo", "CUROBO_INSTALL_OK", "CUROBO_INSTALL_EXIT="),
+                                  ("isaac_lab", "ISAAC_LAB_INSTALL_OK", "ISAAC_LAB_INSTALL_EXIT=")]:
+        assert f'echo "{name}: ready"' in probe and f'echo "{name}: installing"' in probe
+        assert f'{name}: FAILED' in probe
+        assert probe.index(ok) < probe.index(exit_marker)  # OK wins over the exit marker
+    assert "ISAAC_LAB_INSTALL_DEGRADED" in lab and "isaac_lab: ready (installer reported prebundle breakage" in probe
+    assert probe.index("ISAAC_LAB_INSTALL_DEGRADED") < probe.index("ISAAC_LAB_INSTALL_EXIT=")
+    assert "if ./isaaclab.sh --install rl 2>&1 | tee /root/isaac_lab_installer.out; then" in lab
+    assert "set -eo pipefail" in lab  # the tee pipe must report the installer's exit, not tee's
+    assert "exit 1" in lab
+
+
+def test_lab_degraded_needs_the_prebundle_error_not_just_an_import(config):
+    """`isaaclab.sh --install rl` lands the core packages before the RL extras,
+    so `import isaaclab` succeeds even when an extra failed. Only the
+    prebundle-integrity RuntimeError is degraded; anything else is FAILED."""
+    lab = ic.build_lab_install_script(config.lab_ref)
+    assert ic.ISAAC_LAB_PREBUNDLE_ERROR == "prebundled package(s) in Isaac Sim"
+    gate = (f'elif grep -qF "{ic.ISAAC_LAB_PREBUNDLE_ERROR}" /root/isaac_lab_installer.out \\\n'
+            '        && /isaac-sim/python.sh -c "import isaaclab" >/dev/null 2>&1; then')
+    assert gate in lab
+    # the moving-branch clone is recorded so the log says which Lab it got
+    assert 'echo "ISAAC_LAB_COMMIT=$(git -C /root/IsaacLab rev-parse HEAD)"' in lab
+    assert _index(lab, "git clone") < _index(lab, "ISAAC_LAB_COMMIT") < _index(lab, "isaaclab.sh --install")
+
+
+def test_lab_install_script_passes_the_install_set(config):
+    default = ic.build_lab_install_script(config.lab_ref)
+    assert "if ./isaaclab.sh --install rl 2>&1 | tee" in default
+    custom = ic.build_lab_install_script("release/3.0.0", "core,rl[rsl-rl]")
+    assert "if ./isaaclab.sh --install 'core,rl[rsl-rl]' 2>&1 | tee" in custom
+    assert "--branch release/3.0.0" in custom
+
+
+def _aws_launch_stubs(monkeypatch):
+    for name, value in [("resolve_ami", "ami-1"), ("_ensure_key_pair", "key"),
+                        ("_ensure_security_group", "sg-1"), ("_build_user_data", "#!/bin/bash")]:
+        monkeypatch.setattr(ic.AwsProvider, name, lambda self, _v=value: _v)
+
+
+def test_aws_launch_retries_zones_on_insufficient_capacity(config, monkeypatch):
+    """EC2's own zone choice can be out of GPU capacity; the launcher then tries
+    each default subnet (zone) in order and returns the first success."""
+    import dataclasses
+    cfg = dataclasses.replace(config, ngc_api_key="nvapi-test")
+    calls = []
+
+    def aws(_config, args, **_kw):
+        calls.append(args)
+        if args[:2] == ["ec2", "describe-subnets"]:
+            return {"Subnets": [{"AvailabilityZone": "us-west-2b", "SubnetId": "subnet-b"},
+                                {"AvailabilityZone": "us-west-2a", "SubnetId": "subnet-a"}]}
+        assert args[:2] == ["ec2", "run-instances"]
+        if "--subnet-id" in args and args[args.index("--subnet-id") + 1] == "subnet-b":
+            return {"Instances": [{"InstanceId": "i-123"}]}
+        raise ic.IsaacCloudError("aws ec2 run-instances --image-id failed: An error occurred "
+                                 "(InsufficientInstanceCapacity) when calling the RunInstances operation")
+
+    monkeypatch.setattr(ic, "run_aws_json", aws)
+    _aws_launch_stubs(monkeypatch)
+    info = ic.AwsProvider(cfg).launch()
+    assert (info.provider, info.instance_id, info.status) == ("aws", "i-123", "pending")
+    runs = [a for a in calls if a[:2] == ["ec2", "run-instances"]]
+    assert "--subnet-id" not in runs[0]
+    assert [a[a.index("--subnet-id") + 1] for a in runs[1:]] == ["subnet-a", "subnet-b"]
+
+
+def test_aws_launch_skips_zones_that_do_not_offer_the_type(config, monkeypatch):
+    """Pinning a subnet makes EC2 answer `Unsupported` for a zone that lacks the
+    instance type at all (unpinned, EC2 only ever places in supporting zones).
+    G-family coverage is uneven per zone, so that must mean "next zone", not
+    abort -- zones are tried alphabetically and the first one may be the dud."""
+    import dataclasses
+    cfg = dataclasses.replace(config, ngc_api_key="nvapi-test")
+    _aws_launch_stubs(monkeypatch)
+    tried = []
+
+    def aws(_config, args, **_kw):
+        if args[:2] == ["ec2", "describe-subnets"]:
+            return {"Subnets": [{"AvailabilityZone": "us-west-2a", "SubnetId": "subnet-a"},
+                                {"AvailabilityZone": "us-west-2b", "SubnetId": "subnet-b"},
+                                {"AvailabilityZone": "us-west-2c", "SubnetId": "subnet-c"}]}
+        if "--subnet-id" not in args:
+            raise ic.IsaacCloudError("(InsufficientInstanceCapacity) Insufficient capacity.")
+        subnet = args[args.index("--subnet-id") + 1]
+        tried.append(subnet)
+        if subnet == "subnet-a":
+            raise ic.IsaacCloudError("An error occurred (Unsupported) when calling the RunInstances "
+                                     "operation: Your requested instance type (g6e.xlarge) is not "
+                                     "supported in your requested Availability Zone (us-west-2a).")
+        if subnet == "subnet-b":
+            raise ic.IsaacCloudError("(InsufficientInstanceCapacity) Insufficient capacity.")
+        return {"Instances": [{"InstanceId": "i-c"}]}
+
+    monkeypatch.setattr(ic, "run_aws_json", aws)
+    assert ic.AwsProvider(cfg).launch().instance_id == "i-c"
+    assert tried == ["subnet-a", "subnet-b", "subnet-c"]
+
+
+def test_aws_launch_gives_up_after_every_zone_and_keeps_other_errors(config, monkeypatch):
+    import dataclasses
+    cfg = dataclasses.replace(config, ngc_api_key="nvapi-test")
+    _aws_launch_stubs(monkeypatch)
+
+    def no_capacity(_config, args, **_kw):
+        if args[:2] == ["ec2", "describe-subnets"]:
+            return {"Subnets": [{"AvailabilityZone": "us-west-2a", "SubnetId": "subnet-a"}]}
+        raise ic.IsaacCloudError("(InsufficientInstanceCapacity) Insufficient capacity.")
+
+    monkeypatch.setattr(ic, "run_aws_json", no_capacity)
+    with pytest.raises(ic.IsaacCloudError, match="any us-west-2 zone.*us-west-2a"):
+        ic.AwsProvider(cfg).launch()
+
+    def other_error(_config, args, **_kw):
+        raise ic.IsaacCloudError("(VcpuLimitExceeded) You have requested more vCPU capacity")
+
+    monkeypatch.setattr(ic, "run_aws_json", other_error)
+    with pytest.raises(ic.IsaacCloudError, match="VcpuLimitExceeded"):
+        ic.AwsProvider(cfg).launch()
+
+
+def test_aws_container_commands_run_as_root(config):
+    """The Isaac images default to uid 1234 (isaac-sim); the launcher's scripts
+    need root inside the container on AWS just like on Vast."""
+    target = ic.SshTarget(host="203.0.113.5", port=22, user="ubuntu", container_via_docker=True)
+    assert ic.wrap_container_command(target, "apt-get update").startswith("sudo docker exec -u root -i isaac-sim bash -c ")
+    assert ic.wrap_container_command(ic.SshTarget(host="h", port=1, user="root"), "id") == "id"
+    import dataclasses
+    user_data = ic.AwsProvider(dataclasses.replace(config, ngc_api_key="nvapi-test"))._build_user_data()
+    assert "-u root --entrypoint bash" in user_data
+
+
+def test_install_scripts_wait_for_the_apt_lock_before_installing_git(config):
+    """--curobo and --lab start their installers together; the second one used to
+    lose the apt lock, skip git, and die with `git: command not found` (seen on
+    AWS 2026-09-11)."""
+    for script in (ic.build_curobo_install_script(), ic.build_lab_install_script(config.lab_ref)):
+        assert "ensure_git()" in script and "DPkg::Lock::Timeout=60" in script
+        assert script.count("command -v git") >= 1 and "ensure_git\n" in script
+        assert ic.ENSURE_GIT_SH in script  # one shared copy, so the two cannot drift
+    # the WebRTC installer's apt-get calls contend for the same lock
+    webrtc = ic.build_webrtc_install_script()
+    assert webrtc.count("apt-get -o DPkg::Lock::Timeout=60") == 2
